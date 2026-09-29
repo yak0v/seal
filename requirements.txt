@@ -1,0 +1,6 @@
+angr>=9.2
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2
+# for the test suite:
+pytest>=8

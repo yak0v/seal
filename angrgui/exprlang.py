@@ -1,0 +1,322 @@
+"""
+A tiny expression language that turns strings like
+
+    count < 0x1000
+    arg1 != 0 && arg1 s< 100
+    [rbp - 8]:4 == total + 1
+    u32(rax) >= len(buf)
+
+into claripy ASTs over a given angr state.  It is used for
+
+  * assumptions on the initial state ("constraints"),
+  * assert checks at an instruction or at return,
+  * ad-hoc evaluation from custom Python checks.
+
+Identifiers resolve, in this order, to
+  1. names bound by the run (function arguments, buffers, stdin) - state.globals['angrgui_vars']
+  2. DWARF local variables of the function - state.globals['angrgui_locals'] (loaded from the frame)
+  3. CPU registers (rax, edi, ...)
+  4. `ret` - the return value register (rax/eax/...)
+
+Comparisons are unsigned by default; prefix the operator with `s` for signed (s<, s<=, s>, s>=).
+Widths are matched automatically by zero-extending the narrower side.
+"""
+from __future__ import annotations
+
+import re
+from typing import Any, Callable
+
+import claripy
+
+# Order matters: the signed comparison operators start with 's', so they must be
+# tried BEFORE the identifier rule, and they require a following <,>,= so a name
+# like `size` or `s` is never mistaken for an operator.
+TOKEN_RE = re.compile(
+    r"\s*(?:(?P<num>0x[0-9a-fA-F]+|0b[01]+|\d+)"
+    r"|(?P<op>s<=|s>=|s<|s>|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^~!<>()\[\]:,])"
+    r"|(?P<id>[A-Za-z_][A-Za-z0-9_.]*))"
+)
+
+CMP_OPS = {"<", "<=", ">", ">=", "==", "!=", "s<", "s<=", "s>", "s>="}
+
+
+class ExprError(ValueError):
+    pass
+
+
+def tokenize(src: str):
+    pos = 0
+    out = []
+    while pos < len(src):
+        if src[pos:].strip() == "":
+            break
+        m = TOKEN_RE.match(src, pos)
+        if not m:
+            raise ExprError(f"unexpected character {src[pos]!r} at {pos}")
+        pos = m.end()
+        if m.group("num") is not None:
+            out.append(("num", int(m.group("num"), 0)))
+        elif m.group("id") is not None:
+            out.append(("id", m.group("id")))
+        else:
+            out.append(("op", m.group("op")))
+    out.append(("eof", None))
+    return out
+
+
+def _bv(x, bits=64):
+    if isinstance(x, int):
+        return claripy.BVV(x & ((1 << bits) - 1), bits)
+    return x
+
+
+def _match(a, b, signed=False):
+    """Bring two operands to a common width."""
+    if isinstance(a, int) and isinstance(b, int):
+        return a, b
+    if isinstance(a, int):
+        a = _const_like(a, b.size(), signed)
+    if isinstance(b, int):
+        b = _const_like(b, a.size(), signed)
+    if isinstance(a, claripy.ast.Bool) or isinstance(b, claripy.ast.Bool):
+        return a, b
+    if a.size() < b.size():
+        a = a.sign_extend(b.size() - a.size()) if signed else a.zero_extend(b.size() - a.size())
+    elif b.size() < a.size():
+        b = b.sign_extend(a.size() - b.size()) if signed else b.zero_extend(a.size() - b.size())
+    return a, b
+
+
+def _const_like(v: int, bits: int, signed: bool):
+    if v < 0:
+        v &= (1 << bits) - 1
+    return claripy.BVV(v & ((1 << bits) - 1), bits)
+
+
+def _truth(x):
+    if isinstance(x, claripy.ast.Bool):
+        return x
+    if isinstance(x, int):
+        return claripy.true if x else claripy.false
+    return x != 0
+
+
+class Parser:
+    def __init__(self, src: str, resolver: Callable[[str], Any], funcs: dict[str, Callable] | None = None):
+        self.toks = tokenize(src)
+        self.i = 0
+        self.resolve = resolver
+        self.funcs = funcs or {}
+
+    # -- helpers --------------------------------------------------------
+    def peek(self):
+        return self.toks[self.i]
+
+    def take(self, kind=None, val=None):
+        t = self.toks[self.i]
+        if kind and t[0] != kind or (val is not None and t[1] != val):
+            raise ExprError(f"expected {val or kind}, got {t[1]!r}")
+        self.i += 1
+        return t
+
+    def is_op(self, *vals):
+        t = self.peek()
+        return t[0] == "op" and t[1] in vals
+
+    # -- grammar --------------------------------------------------------
+    def parse(self):
+        e = self.p_or()
+        if self.peek()[0] != "eof":
+            raise ExprError(f"unexpected {self.peek()[1]!r}")
+        return e
+
+    def p_or(self):
+        a = self.p_and()
+        while self.is_op("||"):
+            self.take()
+            a = claripy.Or(_truth(a), _truth(self.p_and()))
+        return a
+
+    def p_and(self):
+        a = self.p_not()
+        while self.is_op("&&"):
+            self.take()
+            a = claripy.And(_truth(a), _truth(self.p_not()))
+        return a
+
+    def p_not(self):
+        if self.is_op("!"):
+            self.take()
+            return claripy.Not(_truth(self.p_not()))
+        return self.p_cmp()
+
+    def p_cmp(self):
+        a = self.p_bor()
+        if self.peek()[0] == "op" and self.peek()[1] in CMP_OPS:
+            op = self.take()[1]
+            b = self.p_bor()
+            signed = op.startswith("s")
+            a, b = _match(a, b, signed)
+            if isinstance(a, int):
+                return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}[op.lstrip("s")]
+            table = {
+                "<": claripy.ULT, "<=": claripy.ULE, ">": claripy.UGT, ">=": claripy.UGE,
+                "s<": claripy.SLT, "s<=": claripy.SLE, "s>": claripy.SGT, "s>=": claripy.SGE,
+            }
+            if op == "==":
+                return a == b
+            if op == "!=":
+                return a != b
+            return table[op](a, b)
+        return a
+
+    def _binary(self, sub, ops: dict):
+        a = sub()
+        while self.peek()[0] == "op" and self.peek()[1] in ops:
+            op = self.take()[1]
+            b = sub()
+            a, b = _match(a, b)
+            a = ops[op](a, b)
+        return a
+
+    def p_bor(self):
+        return self._binary(self.p_bxor, {"|": lambda a, b: a | b})
+
+    def p_bxor(self):
+        return self._binary(self.p_band, {"^": lambda a, b: a ^ b})
+
+    def p_band(self):
+        return self._binary(self.p_shift, {"&": lambda a, b: a & b})
+
+    def p_shift(self):
+        return self._binary(self.p_add, {"<<": lambda a, b: a << b, ">>": lambda a, b: claripy.LShR(a, b) if not isinstance(a, int) else a >> b})
+
+    def p_add(self):
+        return self._binary(self.p_mul, {"+": lambda a, b: a + b, "-": lambda a, b: a - b})
+
+    def p_mul(self):
+        return self._binary(self.p_unary, {
+            "*": lambda a, b: a * b,
+            "/": lambda a, b: a // b if isinstance(a, int) else a / b,
+            "%": lambda a, b: a % b,
+        })
+
+    def p_unary(self):
+        if self.is_op("-"):
+            self.take()
+            return -self.p_unary()
+        if self.is_op("~"):
+            self.take()
+            return ~self.p_unary()
+        return self.p_atom()
+
+    def p_atom(self):
+        t = self.peek()
+        if t[0] == "num":
+            self.take()
+            return t[1]
+        if t[0] == "id":
+            self.take()
+            name = t[1]
+            if self.is_op("("):
+                self.take()
+                args = []
+                if not self.is_op(")"):
+                    args.append(self.p_or())
+                    while self.is_op(","):
+                        self.take()
+                        args.append(self.p_or())
+                self.take("op", ")")
+                if name not in self.funcs:
+                    raise ExprError(f"unknown function {name}()")
+                return self.funcs[name](*args)
+            return self.resolve(name)
+        if self.is_op("("):
+            self.take()
+            e = self.p_or()
+            self.take("op", ")")
+            return e
+        if self.is_op("["):
+            self.take()
+            addr = self.p_or()
+            self.take("op", "]")
+            size = 8
+            if self.is_op(":"):
+                self.take()
+                size = self.take("num")[1]
+            return self.funcs["mem"](addr, size)
+        raise ExprError(f"unexpected {t[1]!r}")
+
+
+def make_evaluator(state):
+    """Return eval(expr_string) -> claripy AST for the given state."""
+    arch = state.arch
+    variables = state.globals.get("angrgui_vars", {})
+    locals_ = state.globals.get("angrgui_locals", {})
+    try:
+        bp = state.regs.bp
+    except Exception:  # architectures without a frame pointer alias
+        bp = None
+
+    def mem(addr, size=8):
+        addr = _bv(addr, arch.bits)
+        if isinstance(size, claripy.ast.Base):
+            size = state.solver.eval_one(size)
+        return state.memory.load(addr, size, endness=arch.memory_endness)
+
+    def resolve(name: str):
+        if name in variables:
+            return variables[name]
+        if name in locals_ and bp is not None:
+            off, size = locals_[name]["offset"], locals_[name]["size"]
+            return state.memory.load(bp + off, size, endness=arch.memory_endness)
+        if name == "ret":
+            return getattr(state.regs, arch.register_names[arch.ret_offset])
+        if name in arch.registers:
+            return getattr(state.regs, name)
+        if name.startswith("arg") and name[3:].isdigit():
+            key = name
+            if key in variables:
+                return variables[key]
+        raise ExprError(f"unknown name {name!r}")
+
+    def width(bits):
+        def f(x):
+            x = _bv(x, bits)
+            if x.size() > bits:
+                return x[bits - 1:0]
+            if x.size() < bits:
+                return x.zero_extend(bits - x.size())
+            return x
+        return f
+
+    def swidth(bits):
+        def f(x):
+            x = _bv(x, bits)
+            if x.size() > bits:
+                return x[bits - 1:0]
+            if x.size() < bits:
+                return x.sign_extend(bits - x.size())
+            return x
+        return f
+
+    funcs = {
+        "mem": mem,
+        "u8": width(8), "u16": width(16), "u32": width(32), "u64": width(64),
+        "s8": swidth(8), "s16": swidth(16), "s32": swidth(32), "s64": swidth(64),
+        "zext": lambda x, n: _bv(x).zero_extend(int(n)),
+        "sext": lambda x, n: _bv(x).sign_extend(int(n)),
+        "bv": lambda v, n: claripy.BVV(int(v), int(n)),
+    }
+
+    def evaluate(src: str):
+        e = Parser(src, resolve, funcs).parse()
+        if isinstance(e, int):
+            e = claripy.BVV(e, 64)
+        return e
+
+    return evaluate
+
+
+def as_bool(ast):
+    return _truth(ast)

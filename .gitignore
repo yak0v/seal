@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# compiled sample binary (build it with: make -C samples)
+samples/vuln
+
+# editor / OS
+.DS_Store
+*.swp
