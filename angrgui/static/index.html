@@ -181,6 +181,11 @@ select{font-family:var(--sans)}
 .dex>div{display:flex;gap:10px}
 .dex .k{color:var(--dim);min-width:70px}
 
+.checksbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 8px;font-family:var(--mono);font-size:11px}
+.chchip{padding:1px 8px;border-radius:10px;border:1px solid;white-space:nowrap}
+.chchip.warn{border-color:var(--warn);color:var(--warn)}
+.chchip.info{border-color:var(--info);color:var(--info)}
+
 /* live activity feed */
 #actBtn.live{border-color:var(--ok)}
 #actBtn.live::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);margin-right:5px;vertical-align:middle}

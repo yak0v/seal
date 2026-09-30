@@ -580,7 +580,7 @@ function renderTree(force) {
   }
   const treeCol = $("#treeCol", wrap), detailCol = $("#detailCol", wrap);
   const keepScroll = treeCol.scrollTop;
-  treeCol.replaceChildren(pathsHelp(), pathsSummary(T, snap));
+  treeCol.replaceChildren(pathsHelp(), checksBar(), pathsSummary(T, snap));
   const box = el("div", { class: "ptree" });
   T.roots.forEach(r => box.append(renderPathNode(T, r, snap)));
   treeCol.append(box);
@@ -629,6 +629,22 @@ function pathsHelp() {
     toggle));
 }
 
+function describeCheckShort(c) {
+  const nm = c.name || c.kind.replace("_", " ");
+  if (c.kind === "assert") return "assert " + (c.expr || "");
+  if (c.kind === "int_overflow") return nm + (c.addr ? " @" + hx64(c.addr) : " (whole fn)") + " · " + (c.signed || "either");
+  if (c.kind === "reach" || c.kind === "avoid") return c.kind + " " + (c.addr != null ? hx64(c.addr) : "");
+  if (c.kind === "custom") return nm;
+  return nm;
+}
+function checksBar() {
+  const cs = (A.config && A.config.checks || []).filter(c => c.enabled);
+  if (!cs.length) return el("span", { class: "hidden" });
+  const bar = el("div", { class: "checksbar" }, el("span", { class: "albl" }, "checks run"));
+  const cls = { int_overflow: "warn", assert: "warn", reach: "info", avoid: "warn", custom: "info" };
+  for (const c of cs) bar.append(el("span", { class: "chchip " + (cls[c.kind] || "info") }, describeCheckShort(c)));
+  return bar;
+}
 function pathsSummary(T, snap) {
   const leaves = snap.tree.filter(n => !T.kids[n.id]);
   const counts = {};
