@@ -54,7 +54,7 @@ select{font-family:var(--sans)}
 #main{display:flex;height:calc(100% - 46px)}
 .panel{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}
 #left{width:240px}
-#center{flex:1;min-width:0}
+#center{flex:1;min-width:0;background:var(--bg)}
 #right{width:360px;border-right:none;border-left:1px solid var(--line)}
 .phead{height:34px;display:flex;align-items:center;gap:8px;padding:0 12px;
   border-bottom:1px solid var(--line);font-weight:600;font-size:12px;color:var(--dim);
@@ -234,6 +234,12 @@ select{font-family:var(--sans)}
 .ccode .cline[data-addr]:hover{background:#1a2230}
 .ccode .cline.onpath{background:rgba(76,154,255,.12);border-left-color:var(--accent)}
 .ccode .cline.hitline{background:rgba(248,81,73,.14);border-left-color:var(--bad)}
+.ccode .cline{position:relative;padding-right:80px}
+.clacts{position:absolute;right:6px;top:0;display:none;gap:3px}
+.ccode .cline:hover .clacts{display:inline-flex}
+.ckname{background:transparent;border:1px solid transparent;border-radius:4px;font-weight:600;color:var(--ink);padding:1px 5px;min-width:0;font-family:var(--sans);font-size:12px}
+.ckname:hover{border-color:var(--line)}
+.ckname:focus{border-color:var(--accent);background:#0b0f16;outline:none}
 .py-c{color:#6b7f95;font-style:italic}
 .py-s{color:#a5d6a7}
 .py-k{color:#c792ea}

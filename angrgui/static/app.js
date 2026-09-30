@@ -434,7 +434,8 @@ function renderCheck(c, i) {
   box.append(el("div", { class: "top" },
     el("input", { type: "checkbox", checked: c.enabled ? "" : null, style: "width:auto", onchange: e => { c.enabled = e.target.checked; saveConfig(); renderRight(); } }),
     el("span", { class: "pill " + kindPill }, c.kind.replace("_", " ")),
-    el("span", { class: "kind grow" }, c.name || ""),
+    el("input", { class: "kind grow ckname", value: c.name || "", placeholder: "name…", title: "rename this check",
+      oninput: e => { c.name = e.target.value; scheduleSave(); } }),
     c.addr ? btn("↧", () => { selectTab("code"); scrollToAddr(c.addr); }, "tiny ghost") : null,
     btn("✕", () => { A.config.checks.splice(i, 1); saveConfig(); renderRight(); }, "tiny ghost")));
   const desc = describeCheck(c);
@@ -888,15 +889,31 @@ function renderDecompLines(code, into) {
     const div = el("div", { class: "cline" });
     if (addr != null) {
       div.dataset.addr = addr;
-      div.title = hx64(addr);
+      div.title = hx64(addr) + " — click for checks";
       const blk = a2b[addr];
       if (path && blk != null && path.has(blk)) div.classList.add("onpath");
       if (hits.has(addr) || (blk != null && hitBlocks.has(blk))) div.classList.add("hitline");
-      div.addEventListener("click", () => { selectTab("code"); scrollToAddr(addr); });
+      highlightC(text.length ? text : " ", div);
+      const acts = el("span", { class: "clacts" },
+        btn("reach", () => addReachCheck(addr, "reach"), "tiny"),
+        btn("⋯", () => openAddrMenu(addr), "tiny ghost"));
+      div.append(acts);
+    } else {
+      highlightC(text.length ? text : " ", div);
     }
-    highlightC(text.length ? text : " ", div);
     into.append(div);
   }
+}
+
+function openAddrMenu(addr) {
+  const m = modal("At " + hx64(addr), el("div", { class: "col", style: "gap:8px" },
+    menuItem("Reach check", "record any path that reaches this line", () => { m.remove(); addReachCheck(addr, "reach"); }),
+    menuItem("Avoid check", "record + mark paths that reach this line", () => { m.remove(); addReachCheck(addr, "avoid"); }),
+    menuItem("Assert here", "a boolean that should always hold at this point", () => { m.remove(); openAssertModal(addr); }),
+    menuItem("Custom Python check here", "run your own predicate at this point", () => { m.remove(); openCustomModal(addr); }),
+    menuItem("Show in disassembly", "jump to this address in the code view", () => { m.remove(); selectTab("code"); scrollToAddr(addr); })),
+    [el("button", { onclick: () => m.remove() }, "Close")]);
+  $("#modalHost").append(m);
 }
 
 // ==================================================================== angr script
@@ -1324,11 +1341,13 @@ async function renderCFG(force) {
   drawCFG(pane, g);
 }
 function drawCFG(pane, g) {
+  // if this function's graph is already laid out here, only recolor (keeps pan/zoom/position)
+  if (pane._cfg && pane._cfg.addr === g.addr) { pane._cfg.recolor(); return; }
+  if (pane._cfg && pane._cfg.cleanup) pane._cfg.cleanup();
+
   const gr = new dagre.graphlib.Graph({ multigraph: true });
   gr.setGraph({ rankdir: "TB", nodesep: 26, ranksep: 34, marginx: 20, marginy: 20 });
   gr.setDefaultEdgeLabel(() => ({}));
-  const hitAddrs = new Set((A.run?.snapshot?.hits || []).map(h => h.addr));
-  const pathBlocks = A.pathHighlight || new Set();
   const LINE_H = 14, CHAR_W = 6.4, PAD = 10;
   for (const n of g.nodes) {
     const lines = n.insns.slice(0, 8).map(i => `${hx64(i.addr).slice(2)}  ${i.text}`);
@@ -1338,84 +1357,109 @@ function drawCFG(pane, g) {
     gr.setNode(n.addr, { label: hx64(n.addr), lines, width: w, height: h, insns: n.insns });
   }
   let ei = 0;
-  for (const e of g.edges) {
-    if (gr.hasNode(e.src) && gr.hasNode(e.dst)) gr.setEdge(e.src, e.dst, { kind: e.kind }, "e" + (ei++));
-  }
+  for (const e of g.edges) if (gr.hasNode(e.src) && gr.hasNode(e.dst)) gr.setEdge(e.src, e.dst, { kind: e.kind }, "e" + (ei++));
   dagre.layout(gr);
   const W = gr.graph().width || 400, H = gr.graph().height || 300;
   const NS = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(NS, "svg");
-  svg.setAttribute("width", W); svg.setAttribute("height", H);
-  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-  svg.style.cssText = "display:block;background:var(--bg)";
-  // defs: arrow
+  svg.setAttribute("width", "100%"); svg.setAttribute("height", "100%");
+  svg.style.cssText = "display:block;background:var(--bg);cursor:grab;touch-action:none;user-select:none";
   svg.innerHTML = `<defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
     <path d="M0,0 L7,3 L0,6 Z" fill="#5a6577"/></marker>
     <marker id="arrhi" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
     <path d="M0,0 L7,3 L0,6 Z" fill="#4c9aff"/></marker></defs>`;
-  // edges
+  const viewport = document.createElementNS(NS, "g");
+  svg.append(viewport);
+
+  const edgeEls = [], nodeEls = {};
   gr.edges().forEach(eid => {
-    const e = gr.edge(eid);
-    const pts = e.points;
-    const hiEdge = pathBlocks.has(+eid.v) && pathBlocks.has(+eid.w);
+    const e = gr.edge(eid), pts = e.points;
     let d = `M${pts[0].x},${pts[0].y}`;
     for (let i = 1; i < pts.length; i++) d += ` L${pts[i].x},${pts[i].y}`;
-    const color = e.kind === "call" ? "#7c5cff" : e.kind === "return" ? "#3fb950" : "#5a6577";
     const p = document.createElementNS(NS, "path");
-    p.setAttribute("d", d);
-    p.setAttribute("fill", "none");
-    p.setAttribute("stroke", hiEdge ? "#4c9aff" : color);
-    p.setAttribute("stroke-width", hiEdge ? 2.5 : 1.3);
+    p.setAttribute("d", d); p.setAttribute("fill", "none");
     if (e.kind === "call") p.setAttribute("stroke-dasharray", "4 3");
-    p.setAttribute("marker-end", hiEdge ? "url(#arrhi)" : "url(#arr)");
-    svg.append(p);
+    viewport.append(p);
+    edgeEls.push({ p, v: +eid.v, w: +eid.w, kind: e.kind });
   });
-  // nodes
   gr.nodes().forEach(id => {
     const n = gr.node(id);
     const gEl = document.createElementNS(NS, "g");
     gEl.setAttribute("transform", `translate(${n.x - n.width / 2},${n.y - n.height / 2})`);
-    const onPath = pathBlocks.has(+id);
-    const hasHit = n.insns.some(i => hitAddrs.has(i.addr));
     const rect = document.createElementNS(NS, "rect");
-    rect.setAttribute("width", n.width); rect.setAttribute("height", n.height);
-    rect.setAttribute("rx", 7);
-    rect.setAttribute("fill", hasHit ? "#241318" : onPath ? "#17233a" : "#161b22");
-    rect.setAttribute("stroke", hasHit ? "#f85149" : onPath ? "#4c9aff" : "#2a3140");
-    rect.setAttribute("stroke-width", (hasHit || onPath) ? 2 : 1);
+    rect.setAttribute("width", n.width); rect.setAttribute("height", n.height); rect.setAttribute("rx", 7);
     rect.style.cursor = "pointer";
-    rect.addEventListener("click", () => { selectTab("code"); scrollToAddr(+id); });
     gEl.append(rect);
     const head = document.createElementNS(NS, "text");
     head.setAttribute("x", 8); head.setAttribute("y", 14);
-    head.setAttribute("fill", hasHit ? "#f85149" : "#9aa7b4");
-    head.setAttribute("font-family", "var(--mono)"); head.setAttribute("font-size", "10");
-    head.setAttribute("font-weight", "700");
+    head.setAttribute("font-family", "var(--mono)"); head.setAttribute("font-size", "10"); head.setAttribute("font-weight", "700");
     head.textContent = n.label;
     gEl.append(head);
     n.lines.forEach((ln, i) => {
       const t = document.createElementNS(NS, "text");
-      t.setAttribute("x", 8); t.setAttribute("y", 14 + 14 + i * LINE_H);
+      t.setAttribute("x", 8); t.setAttribute("y", 28 + i * LINE_H);
       t.setAttribute("fill", "#c9d3de"); t.setAttribute("font-family", "monospace"); t.setAttribute("font-size", "10.5");
       t.textContent = ln;
       gEl.append(t);
     });
-    svg.append(gEl);
+    nodeEls[+id] = { rect, head, insns: n.insns };
+    viewport.append(gEl);
   });
-  // pan/zoom
-  const holder = el("div", { style: "width:100%;height:100%;overflow:auto;position:relative" });
-  const toolbar = el("div", { style: "position:sticky;top:0;left:0;z-index:2;padding:6px 10px;display:flex;gap:8px;align-items:center;background:linear-gradient(180deg,#0e1117,transparent)" },
-    el("span", { class: "faint", style: "font-size:11px" }, `${g.nodes.length} blocks`),
-    A.pathHighlight ? el("span", { class: "pill info" }, "selected path highlighted (blue)") : el("span", { class: "faint", style: "font-size:11px" }, "select a row in Paths, or a finding, to trace its path here"));
-  holder.append(toolbar, svg);
-  const abar = assumptionsBar();
-  pane.replaceChildren(...(abar ? [abar] : []), holder);
-  // bring the highlighted path into view
-  const on = gr.nodes().filter(id => pathBlocks.has(+id)).map(id => gr.node(id));
-  if (on.length) {
-    const minX = Math.min(...on.map(n => n.x - n.width / 2)), maxX = Math.max(...on.map(n => n.x + n.width / 2));
-    const minY = Math.min(...on.map(n => n.y - n.height / 2));
-    holder.scrollLeft = Math.max(0, (minX + maxX) / 2 - holder.clientWidth / 2);
-    holder.scrollTop = Math.max(0, minY - 40);
+
+  function recolor() {
+    const pathBlocks = A.pathHighlight || new Set();
+    const hitAddrs = new Set((A.run?.snapshot?.hits || []).map(h => h.addr));
+    for (const addr in nodeEls) {
+      const ne = nodeEls[addr], onPath = pathBlocks.has(+addr), hasHit = ne.insns.some(i => hitAddrs.has(i.addr));
+      ne.rect.setAttribute("fill", hasHit ? "#241318" : onPath ? "#17233a" : "#161b22");
+      ne.rect.setAttribute("stroke", hasHit ? "#f85149" : onPath ? "#4c9aff" : "#2a3140");
+      ne.rect.setAttribute("stroke-width", (hasHit || onPath) ? 2 : 1);
+      ne.head.setAttribute("fill", hasHit ? "#f85149" : "#9aa7b4");
+    }
+    for (const e of edgeEls) {
+      const hi = pathBlocks.has(e.v) && pathBlocks.has(e.w);
+      const color = e.kind === "call" ? "#7c5cff" : e.kind === "return" ? "#3fb950" : "#5a6577";
+      e.p.setAttribute("stroke", hi ? "#4c9aff" : color);
+      e.p.setAttribute("stroke-width", hi ? 2.5 : 1.3);
+      e.p.setAttribute("marker-end", hi ? "url(#arrhi)" : "url(#arr)");
+    }
   }
+
+  // pan (drag) + zoom (wheel), like a disassembler graph view
+  const view = { x: 12, y: 16, k: 1 };
+  const apply = () => viewport.setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`);
+  let dragging = false, dragged = false, sx = 0, sy = 0;
+  const onDown = ev => { dragging = true; dragged = false; sx = ev.clientX; sy = ev.clientY; svg.style.cursor = "grabbing"; };
+  const onMove = ev => { if (!dragging) return; const dx = ev.clientX - sx, dy = ev.clientY - sy; if (Math.abs(dx) + Math.abs(dy) > 3) dragged = true; view.x += dx; view.y += dy; sx = ev.clientX; sy = ev.clientY; apply(); };
+  const onUp = () => { dragging = false; svg.style.cursor = "grab"; };
+  const onWheel = ev => {
+    ev.preventDefault();
+    const r = svg.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    const f = ev.deltaY < 0 ? 1.12 : 1 / 1.12, nk = Math.max(0.15, Math.min(3, view.k * f));
+    view.x = mx - (mx - view.x) * (nk / view.k); view.y = my - (my - view.y) * (nk / view.k); view.k = nk; apply();
+  };
+  svg.addEventListener("mousedown", onDown);
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  svg.addEventListener("wheel", onWheel, { passive: false });
+  for (const addr in nodeEls) nodeEls[addr].rect.addEventListener("click", () => { if (!dragged) { selectTab("code"); scrollToAddr(+addr); } });
+
+  pane.replaceChildren(svg);
+  pane._cfg = { addr: g.addr, recolor, view,
+    cleanup: () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); } };
+
+  // initial fit: scale to the panel, center on the highlighted path if there is one
+  requestAnimationFrame(() => {
+    const r = svg.getBoundingClientRect();
+    view.k = Math.max(0.2, Math.min(1, (r.width - 24) / W));
+    const pathBlocks = A.pathHighlight || new Set();
+    const on = gr.nodes().filter(id => pathBlocks.has(+id)).map(id => gr.node(id));
+    if (on.length) {
+      const cx = (Math.min(...on.map(n => n.x - n.width / 2)) + Math.max(...on.map(n => n.x + n.width / 2))) / 2;
+      const minY = Math.min(...on.map(n => n.y - n.height / 2));
+      view.x = r.width / 2 - cx * view.k; view.y = 20 - minY * view.k;
+    } else { view.x = (r.width - W * view.k) / 2; view.y = 12; }
+    apply();
+  });
+  recolor();
 }
