@@ -612,7 +612,11 @@ function renderTree(force) {
   const T = pathModel(snap);
   let wrap = $("#pathsWrap", pane);
   if (!wrap) {
-    wrap = el("div", { id: "pathsWrap" }, el("div", { id: "treeCol" }), el("div", { id: "detailCol" }));
+    wrap = el("div", { id: "pathsWrap" },
+      el("div", { id: "treeCol" }),
+      el("div", { id: "rightCol" },
+        el("div", { id: "pathGraph" }),
+        el("div", { id: "detailCol" })));
     pane.replaceChildren(wrap);
   }
   const treeCol = $("#treeCol", wrap), detailCol = $("#detailCol", wrap);
@@ -623,6 +627,19 @@ function renderTree(force) {
   treeCol.append(box);
   treeCol.scrollTop = keepScroll;
   detailCol.replaceChildren(...(T.byId[A.selNode] ? [renderPathDetail(T, snap)] : []));
+  renderPathGraph();
+}
+
+// the control-flow graph, always visible beside the tree, highlighting the selected path
+async function renderPathGraph() {
+  const box = $("#pathGraph"); if (!box || !A.fn) return;
+  let g = A.cfgCache[A.fn.addr];
+  if (!g) {
+    box.innerHTML = '<div class="empty">laying out graph…</div>';
+    try { g = await api("/api/cfg/" + A.fn.addr); A.cfgCache[A.fn.addr] = g; }
+    catch (e) { box.innerHTML = '<div class="empty">graph unavailable</div>'; return; }
+  }
+  drawCFG(box, g);
 }
 
 function pathModel(snap) {
@@ -645,25 +662,10 @@ function pathModel(snap) {
 }
 
 function pathsHelp() {
-  let hidden = false;
-  try { hidden = localStorage.getItem("pathsHelpHidden") === "1"; } catch (e) {}
-  const toggle = el("button", { class: "tiny ghost", onclick: () => {
-    try { localStorage.setItem("pathsHelpHidden", hidden ? "0" : "1"); } catch (e) {}
-    renderTree(true);
-  } }, hidden ? "how to read this?" : "hide");
-  if (hidden) return el("div", { class: "phelp small" }, toggle);
-  const fn = A.fn ? `${A.fn.name}(${((A.config && A.config.args) || []).map(a => a.name).join(", ")})` : "the function";
-  return el("div", { class: "phelp" }, el("div", { class: "row", style: "align-items:flex-start" },
-    el("div", { class: "grow", html:
-      `<b>How to read this.</b> angr runs <code>${esc(fn)}</code> with your symbolic inputs. ` +
-      `At every branch whose direction depends on those inputs it takes <b>both</b> sides, so the run splits in two. ` +
-      `Each row is one stretch of execution between splits:` +
-      `<ul><li><span class="cond">condition</span>: what the inputs must satisfy to take this side, next to the source line that decided it.</li>` +
-      `<li>Read a path top to bottom. The inputs must satisfy <i>all</i> the conditions on the way down.</li>` +
-      `<li>Rows that end a path (<b>#1, #2…</b>) say how it ended and give example inputs that drive the program down it.</li>` +
-      `<li><span class="pill bad">finding</span> marks where a check fired; the <span class="tohit-key">red rail</span> leads to it.</li></ul>` +
-      `Click a row to see the whole path and highlight it in the code and the control-flow graph.` }),
-    toggle));
+  // short by design; each row is one stretch between branches, blue = the input condition
+  return el("div", { class: "phelp small" },
+    "Each row is a stretch of execution; ", el("span", { class: "cond" }, "blue"),
+    " is the input condition to take it. Click a row to highlight its path in the graph →");
 }
 
 function describeCheckShort(c) {
@@ -730,16 +732,15 @@ function renderPathNode(T, n, snap) {
   }
   row.append(head);
 
-  const sub = [];
-  if (n.lines.length) sub.push("runs " + lineRanges(n.lines));
-  if (n.calls.length) sub.push("calls " + n.calls.map(c => c + "()").join(", "));
-  if (!kids.length && n.end?.reason === "returned" && n.ret) sub.push("returns " + n.ret);
-  if (!kids.length && n.end && !["returned", "exit"].includes(n.end.reason)) sub.push(n.end.text);
-  if (kids.length && collapsed) sub.push(`${countLeaves(T, n)} paths folded`);
-  const line2 = el("div", { class: "psub" }, sub.join("  ·  "));
-  if (!kids.length && n.example && Object.keys(n.example).length)
-    line2.append(el("span", { class: "ex" }, (sub.length ? "  ·  " : "") + "e.g. " + fmtWitness(n.example)));
-  row.append(line2);
+  const line2 = el("div", { class: "psub" });
+  const chip = (text, cls) => line2.append(el("span", { class: "pchip" + (cls ? " " + cls : "") }, text));
+  if (n.lines.length) chip("runs " + lineRanges(n.lines));
+  if (n.calls.length) chip("calls " + n.calls.map(c => c + "()").join(", "));
+  if (!kids.length && n.end?.reason === "returned" && n.ret) chip("returns " + n.ret, "ret");
+  if (!kids.length && n.end && !["returned", "exit"].includes(n.end.reason)) chip(n.end.text);
+  if (kids.length && collapsed) chip(`${countLeaves(T, n)} paths folded`);
+  if (!kids.length && n.example && Object.keys(n.example).length) chip("e.g. " + fmtWitness(n.example), "ex");
+  if (line2.childNodes.length) row.append(line2);
   row.addEventListener("click", () => selectPathNode(n.id));
 
   const node = el("div", { class: "pnode" }, row);
@@ -779,6 +780,7 @@ function updatePathHighlight() {
   }
   highlightHits();
   if ($("#pane-decomp").classList.contains("sel")) renderDecomp();   // re-tint decompilation lines (cached, no refetch)
+  if ($("#pane-paths").classList.contains("sel")) renderPathGraph(); // the always-visible graph beside the tree
   const cfgPane = $("#pane-cfg");
   if (cfgPane.classList.contains("sel")) renderCFG(true); else cfgPane.dataset.stale = "1";
 }
@@ -834,9 +836,10 @@ function renderPathDetail(T, snap) {
     d.append(el("div", { class: "dlabel" }, "Findings on this path"));
     hits.forEach(i => { const h = snap.hits[i]; if (h) d.append(renderHit(h, i)); });
   }
-  d.append(el("div", { class: "row", style: "margin-top:14px;gap:6px" },
-    el("button", { class: "tiny", onclick: () => { selectTab("code"); scrollToAddr(n.blocks[0] ?? n.addr); } }, "Show in code"),
-    el("button", { class: "tiny", onclick: () => selectTab("cfg") }, "Show on control-flow graph")));
+  d.append(el("div", { class: "row", style: "margin-top:14px;gap:6px;flex-wrap:wrap" },
+    A.ida && A.ida.connected
+      ? el("button", { class: "tiny", onclick: () => { selectTab("decomp"); } }, "Show in decompilation") : null,
+    el("button", { class: "tiny", onclick: () => { selectTab("code"); scrollToAddr(n.blocks[0] ?? n.addr); } }, "Show in disassembly")));
   return d;
 }
 
