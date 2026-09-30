@@ -68,6 +68,14 @@ select{font-family:var(--sans)}
 .fn .nm{font-family:var(--mono);font-weight:600}
 .fn .sub{font-size:11px;color:var(--faint);margin-top:2px;display:flex;gap:8px}
 .fn.unnamed .nm{color:var(--faint);font-weight:400}
+.fn .idanm{color:var(--ok)}
+.fn .sub .idatag{color:var(--ok)}
+#idaBtn.on{border-color:var(--ok);color:var(--ok)}
+.decompwrap{display:flex;flex-direction:column;height:100%}
+.decompbar{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12px;color:var(--dim)}
+.decompbar .fn{font-family:var(--mono);color:var(--ink);padding:0;border:none}
+.ccode{flex:1;margin:0;overflow:auto;padding:10px 14px;font-family:var(--mono);font-size:12px;line-height:18px;color:var(--ink);white-space:pre;tab-size:2}
+.ccode .ty{color:#f5b673}.ccode .kw{color:#c792ea}.ccode .cm{color:#6b7f95;font-style:italic}.ccode .nm2{color:#a5d6a7}
 
 /* tabs */
 .tabs{display:flex;gap:2px;padding:6px 10px 0;border-bottom:1px solid var(--line);flex:0 0 auto}
@@ -102,7 +110,8 @@ select{font-family:var(--sans)}
 .sec h3{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);
   padding:10px 12px 6px;display:flex;align-items:center;gap:8px}
 .sec .body{padding:0 12px 12px}
-.arg{display:grid;grid-template-columns:1fr 84px 54px auto;gap:6px;align-items:center;margin-bottom:6px}
+.arg{display:grid;grid-template-columns:minmax(0,1fr) 84px 54px auto;gap:6px;align-items:center;margin-bottom:6px}
+.arg input.name{min-width:0;width:100%}
 .arg input.name{font-weight:600}
 .assume{display:flex;gap:6px;margin-bottom:6px}
 .assume input{flex:1}
@@ -128,19 +137,97 @@ select{font-family:var(--sans)}
 .stats{display:flex;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--dim);font-family:var(--mono)}
 .stats b{color:var(--ink)}
 
-/* tree */
-#tree{padding:10px}
-.tnode{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;padding:2px 0}
-.tnode .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:var(--dim)}
-.tnode .dot.active{background:var(--accent)}
-.tnode .dot.deadended{background:var(--faint)}
-.tnode .dot.found{background:var(--bad)}
-.tnode .dot.avoided{background:var(--warn)}
-.tnode .dot.errored{background:var(--warn)}
-.tnode .dot.unconstrained{background:var(--accent2)}
-.tnode .dot.pruned{background:#3a4150}
-.tnode:hover{background:var(--panel2)}
-.tnode.hashit{color:var(--bad)}
+.insn.onpath{border-left-color:var(--accent);background:rgba(76,154,255,.07)}
+
+/* paths tab */
+#pane-paths.sel{overflow:hidden}
+#pathsWrap{display:flex;height:100%}
+#treeCol{flex:1;min-width:0;overflow:auto;padding:10px 12px 40px}
+#detailCol{width:360px;flex:0 0 auto;border-left:1px solid var(--line);overflow:auto;background:var(--panel)}
+#detailCol:empty{display:none}
+.phelp{font-size:12px;line-height:1.55;color:var(--dim);background:#121a28;border:1px solid #22314a;border-radius:8px;padding:9px 12px;margin-bottom:10px}
+.phelp.small{background:none;border:none;padding:0;text-align:right;margin-bottom:4px}
+.phelp ul{margin:4px 0 4px 18px;padding:0}
+.phelp code{background:#0b0f16;padding:1px 4px;border-radius:3px;color:var(--ink)}
+.tohit-key{border-left:3px solid var(--bad);padding-left:4px}
+.psum{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:4px 0 10px;font-size:12px}
+.ptree{font-size:12px}
+.prow{padding:4px 8px 5px 4px;border-radius:6px;cursor:pointer;border:1px solid transparent}
+.prow:hover{background:var(--panel2)}
+.prow.sel{background:#17233a;border-color:var(--accent)}
+.phead1{display:flex;align-items:center;gap:8px;min-width:0}
+.caret{width:26px;flex:0 0 auto;text-align:center;color:var(--dim);font-size:11px;user-select:none}
+.caret.leafno{color:var(--faint);font-family:var(--mono);font-size:10px}
+.startlbl{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--faint)}
+.cond{font-family:var(--mono);color:#8cc4ff;background:rgba(76,154,255,.1);padding:1px 6px;border-radius:4px;white-space:nowrap;
+  flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.where{font-family:var(--mono);font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;min-width:0}
+.phead1 .pill{flex:0 0 auto}
+.psub{margin-left:34px;overflow-wrap:anywhere;font-size:11px;color:var(--faint);margin-top:1px}
+.psub .ex{color:var(--warn);font-family:var(--mono)}
+.pkids{margin-left:12px}
+.pkid{border-left:1px solid var(--line);padding-left:4px}
+.pkid.tohit{border-left:2px solid var(--bad);padding-left:3px}
+.pdetail{padding:12px 14px}
+.pdetail h4{margin:0;font-size:13px}
+.dlabel{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);margin:14px 0 6px}
+.dcond{display:flex;flex-direction:column;gap:2px;margin-bottom:6px}
+.dcond .cond{align-self:flex-start;white-space:normal;word-break:break-word}
+.dsrc{font-family:var(--mono);font-size:11px;background:#0b0f16;border:1px solid var(--line);border-radius:6px;padding:6px 0;max-height:260px;overflow:auto}
+.dsrc>div{display:flex;white-space:pre}
+.dsrc .ln{width:34px;text-align:right;color:var(--faint);padding-right:10px;flex:0 0 auto}
+.dend{font-size:12px}
+.dex{font-family:var(--mono);font-size:12px;color:var(--warn)}
+.dex>div{display:flex;gap:10px}
+.dex .k{color:var(--dim);min-width:70px}
+
+/* live activity feed */
+#actBtn.live{border-color:var(--ok)}
+#actBtn.live::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);margin-right:5px;vertical-align:middle}
+.actbadge{display:none;background:var(--bad);color:#fff;border-radius:9px;padding:0 5px;font-size:10px;margin-left:2px}
+#actPanel{position:fixed;right:12px;bottom:12px;width:420px;max-width:92vw;max-height:60vh;z-index:60;
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 16px 50px rgba(0,0,0,.5);
+  display:none;flex-direction:column;overflow:hidden}
+#actPanel.open{display:flex}
+.acthead{display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid var(--line);font-weight:600;font-size:12px}
+#actLog{overflow:auto;padding:4px 0;flex:1}
+.actrow{display:flex;gap:8px;align-items:baseline;padding:4px 12px;font-size:12px;border-bottom:1px solid #171c26}
+.actrow .actdot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:var(--dim);align-self:center}
+.actrow.config .actdot{background:var(--accent2)}
+.actrow.run .actdot{background:var(--accent)}
+.actrow.finding .actdot{background:var(--bad)}
+.actrow.run_status .actdot{background:var(--ok)}
+.actrow.ida .actdot{background:var(--info)}
+.actrow .acttime{color:var(--faint);font-family:var(--mono);font-size:10px;flex:0 0 auto}
+.actrow .actmsg{color:var(--ink)}
+.actrow.finding .actmsg{color:var(--bad)}
+.actfoot{padding:6px 12px;border-top:1px solid var(--line);font-size:11px}
+.actfoot code{background:#0b0f16;padding:0 4px;border-radius:3px}
+
+/* assumptions overlay */
+.assumebar{position:sticky;top:0;z-index:3;display:flex;gap:6px;align-items:center;flex-wrap:wrap;
+  padding:6px 12px;border-bottom:1px solid var(--line);background:#12161a;font-family:var(--mono);font-size:11px;flex:0 0 auto}
+.assumebar .albl{color:var(--faint);text-transform:uppercase;letter-spacing:.5px;font-family:var(--sans);font-size:10px}
+.achip{padding:1px 8px;border-radius:10px;border:1px solid var(--ac);color:var(--ac);white-space:nowrap}
+.avar{color:var(--ac);border-bottom:1.5px solid var(--ac);border-radius:2px;padding:0 1px}
+.adot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;display:inline-block;margin-right:2px}
+.assume{align-items:center}
+
+/* angr script tab */
+#pane-script.sel{overflow:hidden}
+.swrap{display:flex;flex-direction:column;height:100%}
+.sbar{display:flex;gap:8px;align-items:flex-start;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12px;line-height:1.5;color:var(--dim)}
+.sbar code{background:#0b0f16;padding:0 4px;border-radius:3px;color:var(--ink)}
+.scode{flex:1;margin:0;overflow:auto;padding:10px 14px;font-family:var(--mono);font-size:12px;line-height:18px;color:var(--ink);tab-size:4}
+.ccode .cline{display:block;padding:0 4px;border-left:3px solid transparent}
+.ccode .cline[data-addr]{cursor:pointer}
+.ccode .cline[data-addr]:hover{background:#1a2230}
+.ccode .cline.onpath{background:rgba(76,154,255,.12);border-left-color:var(--accent)}
+.ccode .cline.hitline{background:rgba(248,81,73,.14);border-left-color:var(--bad)}
+.py-c{color:#6b7f95;font-style:italic}
+.py-s{color:#a5d6a7}
+.py-k{color:#c792ea}
+.py-n{color:#f5b673}
 
 /* modal */
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:50}
@@ -173,6 +260,8 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
 <div id="top">
   <div class="brand"><b>angr</b> bug hunter</div>
   <button id="openBtn" class="tiny">Open binary…</button>
+  <button id="idaBtn" class="tiny" title="Connect to an IDA MCP server for real names + decompilation">IDA: off</button>
+  <button id="actBtn" class="tiny" title="Live activity — actions from you and from agents (MCP)">Activity <span id="actBadge" class="actbadge"></span></button>
   <div class="binfo" id="binfo">no binary loaded</div>
   <div class="grow"></div>
   <div class="faint" id="hint">Load an ELF, pick a function, set up its state, add checks, and run.</div>
@@ -197,11 +286,15 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
       <div class="tab sel" data-tab="code">Disassembly &amp; source</div>
       <div class="tab" data-tab="paths">Paths</div>
       <div class="tab" data-tab="cfg">Control-flow graph</div>
+      <div class="tab" data-tab="script">angr script</div>
+      <div class="tab" data-tab="decomp">Decompilation</div>
     </div>
     <div class="grow" style="position:relative;min-height:0">
       <div class="tabpane sel" id="pane-code"><div class="empty">Select a function on the left.</div></div>
       <div class="tabpane" id="pane-paths"><div class="empty">Run a check to see the paths angr explored.</div></div>
       <div class="tabpane" id="pane-cfg"><div class="empty">Select a function to see its control-flow graph.</div></div>
+      <div class="tabpane" id="pane-script"><div class="empty">Select a function to see its setup as an angr script.</div></div>
+      <div class="tabpane" id="pane-decomp"><div class="empty">Connect to IDA (top bar) for decompilation.</div></div>
     </div>
   </div>
 
@@ -214,6 +307,13 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
   </div>
 </div>
 
+<div id="actPanel">
+  <div class="acthead">Activity
+    <label class="row" style="font-size:11px;gap:4px;font-weight:400"><input type="checkbox" id="followChk" checked style="width:auto"> follow agent</label>
+    <span class="grow"></span><button class="tiny ghost" onclick="toggleActivity()">✕</button></div>
+  <div id="actLog"></div>
+  <div class="actfoot faint">Agents drive this over MCP at <code>/mcp</code></div>
+</div>
 <div id="modalHost"></div>
 <div id="toastHost"></div>
 

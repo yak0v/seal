@@ -15,15 +15,19 @@ Endpoints (all JSON unless noted):
   GET  /api/run/{run_id}          -> live snapshot (progress, tree, hits)
   POST /api/run/{run_id}/cancel   -> cancel
   GET  /api/custom-template       -> starter code for a custom check
+  POST /api/script                {...runspec...}  -> equivalent standalone angr script
 """
 from __future__ import annotations
 
+import json
 import os
+import threading
+import time
 import uuid
 import logging
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -31,6 +35,8 @@ from .engine import Binary
 from .runner import Run
 from .workspace import Workspace
 from .checks import CUSTOM_TEMPLATE
+from .codegen import generate_script
+from .idamcp import IdaSession, MCPError, DEFAULT_URL
 
 log = logging.getLogger("angrgui.server")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -48,9 +54,61 @@ class _Session:
         self.workspace: Workspace | None = None
         self.runs: dict[str, Run] = {}
         self.load_status = {"loading": False, "message": "", "error": None}
+        self.ida = None                     # optional angrgui.idamcp.IdaSession
 
 
 S = _Session()
+
+
+# --------------------------------------------------------------------------- event bus
+class EventBus:
+    """A tiny in-process pub/sub for the live activity feed. Actions (from the GUI or
+    from an agent over MCP) publish here; the GUI subscribes over SSE and both see the
+    same events, so the human watches whatever an agent does."""
+
+    def __init__(self, keep=500):
+        self._events: list[dict] = []
+        self._seq = 0
+        self._keep = keep
+        self._cv = threading.Condition()
+
+    def publish(self, kind: str, message: str = "", **data) -> dict:
+        with self._cv:
+            self._seq += 1
+            ev = {"seq": self._seq, "type": kind, "ts": round(time.time(), 3),
+                  "message": message, **data}
+            self._events.append(ev)
+            del self._events[:-self._keep]
+            self._cv.notify_all()
+        return ev
+
+    def stream(self, after: int):
+        while True:
+            with self._cv:
+                batch = [e for e in self._events if e["seq"] > after]
+                if not batch:
+                    self._cv.wait(timeout=15)
+                    batch = [e for e in self._events if e["seq"] > after]
+                if batch:
+                    after = batch[-1]["seq"]
+            if batch:
+                for e in batch:
+                    yield e
+            else:
+                yield None      # heartbeat so the SSE connection stays alive
+
+
+BUS = EventBus()
+
+
+def _fname(addr) -> str:
+    """A display name for a function address (IDA name if known, else angr's)."""
+    if S.binary is None:
+        return hex(addr)
+    if S.ida is not None and S.ida._names and addr in S.ida._names:
+        return S.ida._names[addr]
+    f = S.binary.get_function(addr)
+    return f.name if f is not None else hex(addr)
 
 
 # --------------------------------------------------------------------------- models
@@ -147,6 +205,8 @@ def load(req: LoadReq):
         S.workspace = Workspace(path)
         S.runs.clear()
         S.load_status = {"loading": False, "message": "ready", "error": None}
+        BUS.publish("load", f"loaded {os.path.basename(path)}", path=path,
+                    functions=len(S.binary.user_functions()))
     except Exception as e:
         S.binary = None
         S.load_status = {"loading": False, "message": "", "error": f"{type(e).__name__}: {e}"}
@@ -163,7 +223,27 @@ def functions():
         cfg = saved.get(str(f["addr"]))
         f["configured"] = bool(cfg and (cfg.get("checks") or cfg.get("assumptions")))
         f["check_count"] = len(cfg.get("checks", [])) if cfg else 0
+    _apply_ida_names(fns)
     return {"functions": fns}
+
+
+_GENERIC_IDA = ("sub_", "nullsub_", "unknown_", "unknown", "loc_", "off_", "def_", "j_", "nullsub")
+
+
+def _apply_ida_names(fns):
+    """Overlay IDA's *real* function names (when connected) onto the angr list.
+
+    IDA auto-names unknown functions `sub_<ADDR>` just like angr, so those carry
+    no information (and differ only in hex case); only surface a name once IDA —
+    or the user, by renaming in IDA — actually knows what the function is.
+    """
+    if S.ida is None or S.ida._names is None:
+        return
+    for f in fns:
+        nm = S.ida._names.get(f["addr"])
+        if nm and not nm.lower().startswith(_GENERIC_IDA):
+            f["ida_name"] = nm
+            f["named"] = True
 
 
 @app.get("/api/function/{addr}")
@@ -199,21 +279,55 @@ def save_config(addr: int, req: ConfigReq):
     _need_binary()
     if S.workspace is None:
         raise HTTPException(400, "no workspace")
-    S.workspace.set_function(addr, req.model_dump())
+    _store_config(addr, req.model_dump())
     return {"ok": True}
+
+
+def _store_config(addr: int, cfg: dict, source: str = "gui"):
+    prev = S.workspace.get_function(addr)
+    S.workspace.set_function(addr, cfg)
+    # a concise activity line describing what changed
+    na, nc = len(cfg.get("assumptions", [])), len(cfg.get("checks", []))
+    if source != "gui":
+        BUS.publish("config", f"{source} configured {_fname(addr)}: "
+                    f"{na} assumption(s), {nc} check(s)", func=addr,
+                    assumptions=cfg.get("assumptions", []),
+                    checks=[c.get("name") or c.get("kind") for c in cfg.get("checks", [])])
 
 
 @app.post("/api/run")
 def run(req: RunReq):
+    return {"run_id": _start_run(req.model_dump())}
+
+
+def _start_run(spec: dict, source: str = "gui") -> str:
     b = _need_binary()
-    if b.get_function(req.func_addr) is None:
+    if b.get_function(spec["func_addr"]) is None:
         raise HTTPException(404, "no such function")
     run_id = uuid.uuid4().hex[:12]
-    spec = req.model_dump()
-    r = Run(b, spec)
+
+    def on_event(kind, **data):
+        msg = {"finding": lambda: f"finding: {data.get('check_kind')} at {data.get('addr', 0):#x} — {data.get('detail', '')}",
+               "run_status": lambda: f"run of {_fname(spec['func_addr'])} {data.get('status')} "
+                                     f"({data.get('hits', 0)} finding(s))"}.get(kind, lambda: kind)()
+        BUS.publish(kind, msg, run_id=run_id, **data)
+
+    r = Run(b, spec, on_event=on_event)
     S.runs[run_id] = r
     r.start()
-    return {"run_id": run_id}
+    BUS.publish("run", f"{source} started a run of {_fname(spec['func_addr'])}",
+                func=spec["func_addr"], run_id=run_id,
+                checks=[c.get("name") or c.get("kind") for c in spec.get("checks", []) if c.get("enabled", True)])
+    return run_id
+
+
+@app.get("/api/events")
+def events(after: int = 0):
+    def gen():
+        yield "retry: 2000\n\n"
+        for e in BUS.stream(after):
+            yield ": ping\n\n" if e is None else f"id: {e['seq']}\ndata: {json.dumps(e)}\n\n"
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/api/run/{run_id}")
@@ -231,6 +345,277 @@ def run_cancel(run_id: str):
         raise HTTPException(404, "no such run")
     r.cancel()
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- IDA MCP
+class IdaConnectReq(BaseModel):
+    url: str = DEFAULT_URL
+
+
+@app.get("/api/ida/status")
+def ida_status():
+    return S.ida.status() if S.ida is not None else {"connected": False}
+
+
+@app.post("/api/ida/connect")
+def ida_connect(req: IdaConnectReq):
+    b = _need_binary()
+    sess = IdaSession(req.url)
+    sess.client.timeout = 120           # open/analysis of a real binary can be slow
+    try:
+        st = sess.connect(b.path)       # official: opens by path; community: uses the open GUI
+        sess.function_names()           # pull names up front so the list can show them
+    except MCPError as e:
+        raise HTTPException(502, str(e))
+    S.ida = sess
+    st = sess.status()
+    BUS.publish("ida", f"connected to IDA ({st.get('server')}, {st.get('name_count')} names)", **st)
+    return st
+
+
+@app.post("/api/ida/disconnect")
+def ida_disconnect():
+    S.ida = None
+    return {"connected": False}
+
+
+@app.get("/api/ida/decompile/{addr}")
+def ida_decompile(addr: int, force: bool = False):
+    if S.ida is None:
+        raise HTTPException(400, "not connected to IDA")
+    try:
+        return S.ida.decompile(addr, force=force)
+    except MCPError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/ida/refresh")
+def ida_refresh():
+    if S.ida is None:
+        raise HTTPException(400, "not connected to IDA")
+    try:
+        return S.ida.refresh()
+    except MCPError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/script")
+def script(req: RunReq):
+    b = _need_binary()
+    if b.get_function(req.func_addr) is None:
+        raise HTTPException(404, "no such function")
+    return {"code": generate_script(b, req.model_dump())}
+
+
+# --------------------------------------------------------------------------- MCP server
+# Expose the tool as an MCP server so an agent can drive it (list functions, set
+# assumptions/checks, run, read results) while a human watches the GUI: agent
+# actions go through the same session S and publish to the same event bus, so the
+# GUI reflects them live. Minimal Streamable-HTTP MCP, stdlib JSON only.
+MCP_PROTOCOL = "2025-06-18"
+
+
+def _addr(x) -> int:
+    if isinstance(x, int):
+        return x
+    s = str(x).strip()
+    return int(s, 16) if s.lower().startswith("0x") else int(s)
+
+
+def _mcp_functions(query=None, limit: int = 200):
+    fns = functions()["functions"]
+    if query:
+        q = str(query).lower()
+        fns = [f for f in fns if q in f["name"].lower()
+               or q in (f.get("ida_name") or "").lower() or q in hex(f["addr"])]
+    return [{"addr": hex(f["addr"]), "name": f.get("ida_name") or f["name"],
+             "blocks": f["block_count"], "args": len(f["args"]),
+             "checks": f.get("check_count", 0), "has_source": f["has_source"]}
+            for f in fns[:int(limit)]]
+
+
+def _mcp_get_function(addr):
+    a = _addr(addr)
+    d = function(a)
+    return {"addr": hex(a), "name": d["disasm"]["name"], "config": d["config"],
+            "has_source": bool(d["disasm"].get("source")),
+            "return_heads": d["return_heads"]}
+
+
+def _mcp_disassemble(addr):
+    b = _need_binary()
+    d = b.disassemble(_addr(addr))
+    lines = [f"{i['addr']:#x}  {i['text']}" + (f"    ; {i['src_file']}:{i['src_line']}" if i.get('src_line') else "")
+             for i in d["instructions"]]
+    return {"addr": hex(_addr(addr)), "name": d["name"], "text": "\n".join(lines)}
+
+
+def _mcp_configure(addr, patch: dict):
+    _need_binary()
+    a = _addr(addr)
+    cfg = dict(S.workspace.get_function(a))
+    for k in ("args", "buffers", "assumptions", "stdin", "checks", "limits"):
+        if k in patch and patch[k] is not None:
+            if k == "limits":
+                cfg["limits"] = {**cfg.get("limits", {}), **patch["limits"]}
+            elif k == "checks":
+                out = []
+                for c in patch["checks"]:
+                    c = dict(c)
+                    if c.get("addr") is not None:
+                        c["addr"] = _addr(c["addr"])
+                    c.setdefault("id", uuid.uuid4().hex[:6])
+                    c.setdefault("enabled", True)
+                    c["func_addr"] = a
+                    out.append(c)
+                cfg["checks"] = out
+            else:
+                cfg[k] = patch[k]
+    _store_config(a, cfg, source="agent")
+    return _mcp_get_function(a)["config"]
+
+
+def _mcp_add(addr, *, assumption=None, check=None):
+    _need_binary()
+    a = _addr(addr)
+    cfg = dict(S.workspace.get_function(a))
+    if assumption is not None:
+        cfg["assumptions"] = list(cfg.get("assumptions", [])) + [assumption]
+    if check is not None:
+        c = dict(check)
+        if c.get("addr") is not None:              # agents pass "0x..." strings
+            c["addr"] = _addr(c["addr"])
+        c.setdefault("id", uuid.uuid4().hex[:6])
+        c.setdefault("enabled", True)
+        c["func_addr"] = a
+        cfg["checks"] = list(cfg.get("checks", [])) + [c]
+    _store_config(a, cfg, source="agent")
+    return _mcp_get_function(a)["config"]
+
+
+def _mcp_run(addr):
+    a = _addr(addr)
+    cfg = S.workspace.get_function(a)
+    spec = {"func_addr": a, "args": cfg.get("args", []), "buffers": cfg.get("buffers", []),
+            "assumptions": [x for x in cfg.get("assumptions", []) if x.strip()],
+            "stdin": cfg.get("stdin"), "limits": cfg.get("limits", {}),
+            "checks": [c for c in cfg.get("checks", []) if c.get("enabled", True)]}
+    if not spec["checks"]:
+        raise HTTPException(400, "no enabled checks on this function; add one first")
+    return {"run_id": _start_run(spec, source="agent")}
+
+
+def _mcp_get_run(run_id):
+    r = S.runs.get(run_id)
+    if r is None:
+        raise HTTPException(404, "no such run")
+    snap = r.snapshot()
+    tree = [{"id": n["id"], "parent": n["parent"], "cond": n["cond"], "kind": n["kind"],
+             "end": (n["end"] or {}).get("reason"), "hits": n["hits"]} for n in snap["tree"]]
+    return {"status": snap["status"], "error": snap["error"], "summary": snap["summary"],
+            "findings": snap["hits"], "paths": tree}
+
+
+def _mcp_decompile(addr):
+    if S.ida is None:
+        raise HTTPException(400, "not connected to IDA (connect via the GUI or ida.connect)")
+    return S.ida.decompile(_addr(addr))
+
+
+_A = {"addr": {"type": "string", "description": "function address, e.g. \"0x400650\", or name"}}
+TOOL_DEFS = [
+    {"name": "get_status", "description": "What binary is loaded and whether IDA is connected.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "list_functions", "description": "List functions (optionally filtered by name/address substring).",
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string"}, "limit": {"type": "integer", "default": 200}}}},
+    {"name": "get_function", "description": "A function's saved setup (initial state, assumptions, checks, limits).",
+     "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
+    {"name": "disassemble", "description": "Disassembly text of a function.",
+     "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
+    {"name": "decompile", "description": "IDA Hex-Rays pseudocode of a function (requires IDA connected).",
+     "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
+    {"name": "configure", "description": "Set parts of a function's setup. patch may contain any of: "
+     "args, buffers, assumptions (list of expression strings), stdin, checks, limits "
+     "(e.g. {\"steps\":80,\"seconds\":30,\"skip_calls\":true}). Replaces the given keys.",
+     "inputSchema": {"type": "object", "properties": {**_A, "patch": {"type": "object"}}, "required": ["addr", "patch"]}},
+    {"name": "add_assumption", "description": "Append one assumption (an expression that must hold at entry, "
+     "e.g. \"a1 & 0xff == 0x5a\"). Names: the argument names, a1../arg0.. (parameters), registers, ret.",
+     "inputSchema": {"type": "object", "properties": {**_A, "expr": {"type": "string"}}, "required": ["addr", "expr"]}},
+    {"name": "add_check", "description": "Append one check. check is an object like "
+     "{\"kind\":\"int_overflow\",\"addr\":\"0x..\",\"signed\":\"either\"} or "
+     "{\"kind\":\"assert\",\"expr\":\"total < 0x1000\",\"at_return\":true} or "
+     "{\"kind\":\"reach\",\"addr\":\"0x..\"}.",
+     "inputSchema": {"type": "object", "properties": {**_A, "check": {"type": "object"}}, "required": ["addr", "check"]}},
+    {"name": "run", "description": "Run the enabled checks on a function using its saved setup. Returns a run_id.",
+     "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
+    {"name": "get_run", "description": "Results of a run: status, findings (with concrete witnesses), and the path tree.",
+     "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
+]
+
+_MCP_TOOLS = {
+    "get_status": lambda a: _mcp_status_payload(),
+    "list_functions": lambda a: _mcp_functions(a.get("query"), a.get("limit", 200)),
+    "get_function": lambda a: _mcp_get_function(a["addr"]),
+    "disassemble": lambda a: _mcp_disassemble(a["addr"]),
+    "decompile": lambda a: _mcp_decompile(a["addr"]),
+    "configure": lambda a: _mcp_configure(a["addr"], a["patch"]),
+    "add_assumption": lambda a: _mcp_add(a["addr"], assumption=a["expr"]),
+    "add_check": lambda a: _mcp_add(a["addr"], check=a["check"]),
+    "run": lambda a: _mcp_run(a["addr"]),
+    "get_run": lambda a: _mcp_get_run(a["run_id"]),
+}
+
+
+def _mcp_status_payload():
+    out = {"loaded": S.binary is not None}
+    if S.binary:
+        out["binary"] = S.binary.info()
+    out["ida"] = S.ida.status() if S.ida is not None else {"connected": False}
+    return out
+
+
+def _handle_mcp(msg: dict):
+    method, rid, params = msg.get("method"), msg.get("id"), (msg.get("params") or {})
+    if method == "initialize":
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": MCP_PROTOCOL, "capabilities": {"tools": {}},
+            "serverInfo": {"name": "angr-bug-hunter", "version": "0.1"},
+            "instructions": "Drive angr symbolic execution: list_functions, get_function, "
+                            "add_assumption/add_check/configure, run, get_run. A human watches "
+                            "the same session in the GUI."}}
+    if method and method.startswith("notifications/"):
+        return None
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOL_DEFS}}
+    if method == "tools/call":
+        name, args = params.get("name"), (params.get("arguments") or {})
+        fn = _MCP_TOOLS.get(name)
+        if fn is None:
+            return {"jsonrpc": "2.0", "id": rid, "result": {
+                "content": [{"type": "text", "text": f"unknown tool {name}"}], "isError": True}}
+        try:
+            result = fn(args)
+            return {"jsonrpc": "2.0", "id": rid, "result": {
+                "content": [{"type": "text", "text": json.dumps(result, indent=2, default=str)}]}}
+        except HTTPException as e:
+            return {"jsonrpc": "2.0", "id": rid, "result": {
+                "content": [{"type": "text", "text": str(e.detail)}], "isError": True}}
+        except Exception as e:
+            return {"jsonrpc": "2.0", "id": rid, "result": {
+                "content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}], "isError": True}}
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"unknown method {method}"}}
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    body = await request.json()
+    resp = _handle_mcp(body)
+    if resp is None:
+        return Response(status_code=202)
+    if "text/event-stream" in (request.headers.get("accept") or ""):
+        return Response(f"event: message\ndata: {json.dumps(resp)}\n\n", media_type="text/event-stream")
+    return JSONResponse(resp)
 
 
 @app.get("/api/custom-template")
