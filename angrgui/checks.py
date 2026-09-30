@@ -156,6 +156,11 @@ def witness_of(state) -> dict:
                 out["stdin"] = data.hex()
         except Exception:
             pass
+    for fname, fb in (state.globals.get("angrgui_files") or {}).items():
+        try:
+            out["file:" + fname] = state.solver.eval(fb, cast_to=bytes).hex()
+        except Exception:
+            pass
     return out
 
 

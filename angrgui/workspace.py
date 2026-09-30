@@ -48,7 +48,7 @@ class Workspace:
     @staticmethod
     def _default_func() -> dict:
         return {"args": [], "buffers": [], "assumptions": [], "stdin": None,
-                "checks": [], "limits": {}}
+                "files": [], "checks": [], "limits": {}}
 
     def all(self) -> dict:
         return self.data

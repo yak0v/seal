@@ -198,6 +198,7 @@ function normalizeConfig(cfg, d) {
   cfg.assumptions = cfg.assumptions || [];
   cfg.checks = cfg.checks || [];
   cfg.stdin = cfg.stdin || null;
+  cfg.files = cfg.files || [];
   cfg.limits = Object.assign({ steps: 150, active: 300, seconds: 30, loop_bound: 12, find: null, avoid: [] }, cfg.limits || {});
   return cfg;
 }
@@ -354,6 +355,19 @@ function sectionState() {
     "symbolic stdin",
     stdinOn ? el("input", { value: A.config.stdin.size, style: "width:56px", oninput: e => { A.config.stdin.size = +e.target.value; scheduleSave(); } }) : null,
     stdinOn ? el("span", { class: "faint" }, "bytes") : null));
+
+  // symbolic files: the program reads a named file whose contents angr solves for
+  (A.config.files || []).forEach((f, i) => {
+    b.append(el("div", { class: "row", style: "font-size:12px;gap:5px;margin-top:4px" },
+      el("span", { class: "faint" }, "file"),
+      el("input", { value: f.name, placeholder: ".password", style: "flex:1;min-width:0", oninput: e => { f.name = e.target.value; scheduleSave(); } }),
+      el("input", { value: f.size, style: "width:52px", oninput: e => { f.size = +e.target.value; scheduleSave(); } }),
+      el("span", { class: "faint" }, "bytes"),
+      btn("✕", () => { A.config.files.splice(i, 1); renderRight(); scheduleSave(); }, "tiny ghost")));
+  });
+  b.append(el("button", { class: "tiny", style: "margin-top:4px",
+    title: "make a file's contents symbolic (angr solves for what it must contain)",
+    onclick: () => { A.config.files = A.config.files || []; A.config.files.push({ name: "", size: 32 }); renderRight(); scheduleSave(); } }, "+ symbolic file"));
   s.append(b);
   return s;
 }
@@ -518,7 +532,14 @@ function renderHit(h, i) {
     el("span", { class: "grow mono", style: "font-size:11px" }, hx64(h.addr)),
     h.extra?.src_line ? el("span", { class: "faint" }, h.extra.src_line.file + ":" + h.extra.src_line.line) : null));
   box.append(el("div", { class: "msg" }, h.message));
-  if (Object.keys(h.witness || {}).length) box.append(el("div", { class: "wit" }, "inputs: " + fmtWitness(h.witness)));
+  const wit = h.witness || {};
+  const scalars = Object.entries(wit).filter(([k, v]) => typeof v === "object");
+  const byteInputs = Object.entries(wit).filter(([k, v]) => typeof v === "string" && v);
+  if (scalars.length) box.append(el("div", { class: "wit" }, "inputs: " + scalars.map(([k, v]) => `${k}=${fmtOne(k, v)}`).join(", ")));
+  for (const [k, v] of byteInputs) {                 // file / stdin contents = the solution
+    const label = k.startsWith("file:") ? k.slice(5) + " =" : k + " =";
+    box.append(el("div", { class: "wit solution" }, label + " " + bytesPretty(v.replace(/(00)+$/, ""))));
+  }
   const node = h.extra?.node;
   if (node != null) box.append(el("button", { class: "tiny ghost", style: "margin-top:4px",
     onclick: e => { e.stopPropagation(); A.selNode = node; updatePathHighlight(); selectTab("paths"); } }, "show its path"));
@@ -888,7 +909,7 @@ function currentSpec() {
   return {
     func_addr: A.fn.addr, args: A.config.args, buffers: A.config.buffers,
     assumptions: A.config.assumptions.filter(x => x.trim()), stdin: A.config.stdin,
-    checks: A.config.checks.filter(c => c.enabled), limits: A.config.limits,
+    files: (A.config.files || []).filter(f => f.name), checks: A.config.checks.filter(c => c.enabled), limits: A.config.limits,
   };
 }
 function downloadScript() {

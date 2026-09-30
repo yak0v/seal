@@ -153,6 +153,18 @@ class Run:
             named["stdin"] = stdin_sym
             state.globals["angrgui_stdin"] = stdin_sym
 
+        # symbolic files: the program reads a named file whose contents we make symbolic
+        # (a CTF "file checker" reads e.g. .password). Registered in the state filesystem,
+        # so fopen()/open() of that name return our symbolic content.
+        file_syms = {}
+        for fspec in self.spec.get("files", []) or []:
+            fname = fspec.get("name") or "input"
+            n = int(fspec.get("size", 16))
+            fb = claripy.BVS(f"file_{fname}", n * 8)
+            state.fs.insert(fname, angr.SimFile(fname, content=fb, size=n))
+            file_syms[fname] = fb
+        state.globals["angrgui_files"] = file_syms
+
         # Allocate + fill buffers, repoint the pointer args.
         base = self.binary.scratch_base()
         for argname, (buf, size) in buffers.items():

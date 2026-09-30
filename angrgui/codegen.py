@@ -228,6 +228,7 @@ def generate_script(binary, spec: dict) -> str:
     args = spec.get("args", []) or []
     buffers = {b["arg"]: int(b.get("size", 64)) for b in spec.get("buffers", []) or []}
     stdin = spec.get("stdin") if (spec.get("stdin") or {}).get("mode") == "symbolic" else None
+    files = [f for f in (spec.get("files") or []) if f.get("name")]
     checks = [c for c in spec.get("checks", []) or [] if c.get("enabled", True)]
     limits = spec.get("limits", {}) or {}
     max_steps = int(limits.get("steps", 200))
@@ -328,6 +329,16 @@ RETURN_ADDR = project.simos.return_deadend   # where a state lands once it retur
     emit(")")
     for ln in buf_lines:
         emit(ln)
+    if files:
+        emit("")
+        emit("# Symbolic files: the program reads these by name; angr solves for their contents.")
+        emit("FILES = {}")
+        for i, f in enumerate(files):
+            n = int(f.get("size", 16))
+            emit(f"FILES[{f['name']!r}] = claripy.BVS('file_{i}', {n} * 8)   # {n} bytes")
+            emit(f"state.fs.insert({f['name']!r}, angr.SimFile({f['name']!r}, content=FILES[{f['name']!r}], size={n}))")
+    else:
+        emit("FILES = {}")
 
     locals_ = {}
     for v in binary.dwarf_vars(fa):
@@ -366,6 +377,8 @@ def report(check_id, addr, message, state, extra_constraints=()):
             witness["stdin"] = s.solver.eval(STDIN, cast_to=bytes)
         elif s.posix.dumps(0):
             witness["stdin"] = s.posix.dumps(0)   # angr's default stdin, as far as it was read
+        for _fn, _fb in FILES.items():
+            witness["file:" + _fn] = s.solver.eval(_fb, cast_to=bytes)
     findings.append({"check": check_id, "addr": addr, "message": message, "inputs": witness})
     shown = ", ".join(f"{k}={v:#x}" if isinstance(v, int) else f"{k}={v!r}" for k, v in witness.items())
     print(f"[{check_id}] {addr:#x}: {message}\\n      inputs: {shown}")

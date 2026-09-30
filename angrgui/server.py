@@ -122,6 +122,7 @@ class RunReq(BaseModel):
     buffers: list = []
     assumptions: list = []
     stdin: dict | None = None
+    files: list = []
     checks: list = []
     limits: dict = {}
 
@@ -131,6 +132,7 @@ class ConfigReq(BaseModel):
     buffers: list = []
     assumptions: list = []
     stdin: dict | None = None
+    files: list = []
     checks: list = []
     limits: dict = {}
 
@@ -454,7 +456,7 @@ def _mcp_configure(addr, patch: dict):
     _need_binary()
     a = _addr(addr)
     cfg = dict(S.workspace.get_function(a))
-    for k in ("args", "buffers", "assumptions", "stdin", "checks", "limits"):
+    for k in ("args", "buffers", "assumptions", "stdin", "files", "checks", "limits"):
         if k in patch and patch[k] is not None:
             if k == "limits":
                 cfg["limits"] = {**cfg.get("limits", {}), **patch["limits"]}
@@ -498,7 +500,7 @@ def _mcp_run(addr):
     cfg = S.workspace.get_function(a)
     spec = {"func_addr": a, "args": cfg.get("args", []), "buffers": cfg.get("buffers", []),
             "assumptions": [x for x in cfg.get("assumptions", []) if x.strip()],
-            "stdin": cfg.get("stdin"), "limits": cfg.get("limits", {}),
+            "stdin": cfg.get("stdin"), "files": cfg.get("files", []), "limits": cfg.get("limits", {}),
             "checks": [c for c in cfg.get("checks", []) if c.get("enabled", True)]}
     if not spec["checks"]:
         raise HTTPException(400, "no enabled checks on this function; add one first")
