@@ -53,6 +53,8 @@ select{font-family:var(--sans)}
 #top .binfo{font-family:var(--mono);color:var(--dim);font-size:12px}
 #main{display:flex;height:calc(100% - 46px)}
 .panel{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}
+.splitter{flex:0 0 5px;cursor:col-resize;background:var(--line);opacity:.5;transition:opacity .1s}
+.splitter:hover,.splitter.dragging{opacity:1;background:var(--accent)}
 #left{width:240px}
 #center{flex:1;min-width:0;background:var(--bg)}
 #right{width:360px;border-right:none;border-left:1px solid var(--line)}
@@ -240,6 +242,7 @@ select{font-family:var(--sans)}
 .ckname{background:transparent;border:1px solid transparent;border-radius:4px;font-weight:600;color:var(--ink);padding:1px 5px;min-width:0;font-family:var(--sans);font-size:12px}
 .ckname:hover{border-color:var(--line)}
 .ckname:focus{border-color:var(--accent);background:#0b0f16;outline:none}
+.ccode .cline.flash{background:rgba(124,92,255,.28);transition:background 1.2s}
 .py-c{color:#6b7f95;font-style:italic}
 .py-s{color:#a5d6a7}
 .py-k{color:#c792ea}
@@ -296,6 +299,8 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
     <div class="pbody" id="fnList"><div class="empty">Load a binary to see its functions.</div></div>
   </div>
 
+  <div class="splitter" data-target="left"></div>
+
   <!-- CENTER: code / paths / cfg -->
   <div class="panel" id="center">
     <div class="tabs">
@@ -313,6 +318,8 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
       <div class="tabpane" id="pane-decomp"><div class="empty">Connect to IDA (top bar) for decompilation.</div></div>
     </div>
   </div>
+
+  <div class="splitter" data-target="right"></div>
 
   <!-- RIGHT: setup / checks / run / hits -->
   <div class="panel" id="right">

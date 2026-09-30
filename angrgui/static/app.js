@@ -70,6 +70,7 @@ async function init() {
   $("#idaBtn").addEventListener("click", openIdaModal);
   $("#actBtn").addEventListener("click", toggleActivity);
   $("#followChk").addEventListener("change", e => { A.followAgent = e.target.checked; });
+  initSplitters();
   refreshIdaStatus();
   connectEvents();
   await refreshState();
@@ -436,7 +437,7 @@ function renderCheck(c, i) {
     el("span", { class: "pill " + kindPill }, c.kind.replace("_", " ")),
     el("input", { class: "kind grow ckname", value: c.name || "", placeholder: "name…", title: "rename this check",
       oninput: e => { c.name = e.target.value; scheduleSave(); } }),
-    c.addr ? btn("↧", () => { selectTab("code"); scrollToAddr(c.addr); }, "tiny ghost") : null,
+    c.addr ? btn("↧", () => showAddr(c.addr), "tiny ghost") : null,
     btn("✕", () => { A.config.checks.splice(i, 1); saveConfig(); renderRight(); }, "tiny ghost")));
   const desc = describeCheck(c);
   if (desc) box.append(el("div", { class: "desc" }, desc));
@@ -903,6 +904,42 @@ function renderDecompLines(code, into) {
     }
     into.append(div);
   }
+}
+
+function initSplitters() {
+  for (const sp of $$(".splitter")) {
+    const target = sp.dataset.target, panel = $("#" + target);
+    try { const w = localStorage.getItem("panelW:" + target); if (w) panel.style.width = w; } catch (e) {}
+    sp.addEventListener("mousedown", ev => {
+      ev.preventDefault();
+      sp.classList.add("dragging");
+      const startX = ev.clientX, startW = panel.getBoundingClientRect().width;
+      const move = e => {
+        const dx = e.clientX - startX;
+        panel.style.width = Math.max(160, Math.min(1000, target === "left" ? startW + dx : startW - dx)) + "px";
+      };
+      const up = () => {
+        sp.classList.remove("dragging");
+        window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
+        try { localStorage.setItem("panelW:" + target, panel.style.width); } catch (e) {}
+        if ($("#pane-cfg").classList.contains("sel")) { const p = $("#pane-cfg"); if (p._cfg) delete p._cfg; renderCFG(true); }
+        if ($("#pane-paths").classList.contains("sel")) { const b = $("#pathGraph"); if (b && b._cfg) delete b._cfg; renderPathGraph(); }
+      };
+      window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+    });
+  }
+}
+
+function showAddr(addr) {
+  // jump to an address and flash it — prefer the decompilation when IDA is connected
+  if (A.ida && A.ida.connected) {
+    selectTab("decomp");
+    setTimeout(() => {
+      const line = $(`#pane-decomp .cline[data-addr="${addr}"]`);
+      if (line) { line.scrollIntoView({ block: "center", behavior: "smooth" }); line.classList.add("flash"); setTimeout(() => line.classList.remove("flash"), 1400); }
+      else { selectTab("code"); scrollToAddr(addr); }
+    }, 350);
+  } else { selectTab("code"); scrollToAddr(addr); }
 }
 
 function openAddrMenu(addr) {
