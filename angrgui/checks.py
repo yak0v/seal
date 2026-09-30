@@ -100,29 +100,15 @@ class BaseCheck:
         """Called by the runner for each active state at a block boundary."""
         return
 
+    def note_return(self, state, ret_site):
+        """Called by the runner once a state has returned from the target function,
+        where the return register holds its final value. ret_site is the address of
+        the return instruction. Default: nothing (only at_return asserts use this)."""
+        return
+
     # -- helpers shared by subclasses ----------------------------------
     def _witness(self, state) -> dict:
-        """Concrete values for every named input, if the path is satisfiable."""
-        out = {}
-        names = state.globals.get("angrgui_vars", {})
-        if not state.solver.satisfiable():
-            return out
-        for nm, ast in names.items():
-            if isinstance(ast, claripy.ast.Base) and ast.symbolic:
-                try:
-                    v = state.solver.eval(ast)
-                    out[nm] = _fmt(v, ast.size())
-                except Exception:
-                    pass
-        # stdin, if any
-        so = state.globals.get("angrgui_stdin")
-        if so is not None:
-            try:
-                data = state.solver.eval(so, cast_to=bytes)
-                out["stdin"] = data.hex()
-            except Exception:
-                pass
-        return out
+        return witness_of(state)
 
     def _witness_with(self, state, extra_constraints) -> dict:
         """Witness under additional constraints (a fresh copy, so the run is untouched)."""
@@ -138,7 +124,39 @@ class BaseCheck:
         self._seen.add(key)
         self.hits.append(Hit(self.id, self.kind, addr, message,
                              witness or {}, extra or {}))
-        self.ctx.on_hit(self.hits[-1])
+        self.ctx.on_hit(self.hits[-1], state)
+
+
+def witness_of(state) -> dict:
+    """Concrete values for every named input, if the path is satisfiable."""
+    out = {}
+    names = state.globals.get("angrgui_vars", {})
+    if not state.solver.satisfiable():
+        return out
+    for nm, ast in names.items():
+        if isinstance(ast, claripy.ast.Base) and ast.symbolic:
+            try:
+                v = state.solver.eval(ast)
+                out[nm] = _fmt(v, ast.size())
+            except Exception:
+                pass
+    # stdin, if any
+    so = state.globals.get("angrgui_stdin")
+    if so is not None:
+        try:
+            data = state.solver.eval(so, cast_to=bytes)
+            out["stdin"] = data.hex()
+        except Exception:
+            pass
+    else:
+        # stdin wasn't set up explicitly, but the code may still have read angr's default one
+        try:
+            data = state.posix.dumps(0)
+            if data:
+                out["stdin"] = data.hex()
+        except Exception:
+            pass
+    return out
 
 
 def _fmt(v: int, bits: int) -> dict:
@@ -177,7 +195,8 @@ class IntOverflowCheck(BaseCheck):
             return None, None
 
     def _on_expr(self, state):
-        r = state.inspect.expr_result
+        insp = state.inspect
+        r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
         if r is None or not isinstance(r, claripy.ast.BV):
             return
         op_char = AST_OVERFLOW_OPS.get(r.op)
@@ -248,9 +267,11 @@ class AssertCheck(BaseCheck):
         super().__init__(spec, ctx)
         self.at_return = spec.get("at_return", False)
         self.expr = spec["expr"]
-        # Where to evaluate: a set of block-head addresses, or None => every block head.
+        # Where to evaluate. at_return is handled separately (note_return), because the
+        # return value may be computed *inside* the return block (e.g. a cmov at -O2),
+        # so it is only final once the state has actually returned -- not at the block head.
         if self.at_return:
-            self.points = set(ctx.return_addrs)
+            self.points = set()     # nothing at block heads; see note_return
         elif spec.get("addr") is not None:
             self.points = {ctx.block_head(int(spec["addr"]))}
         else:
@@ -263,6 +284,14 @@ class AssertCheck(BaseCheck):
                 return
         elif addr not in self.points:
             return
+        self._evaluate(state, addr)
+
+    def note_return(self, state, ret_site):
+        # called once the state has returned; registers (including the return value) are final
+        if self.at_return:
+            self._evaluate(state, ret_site)
+
+    def _evaluate(self, state, addr):
         try:
             ast = as_bool(make_evaluator(state)(self.expr))
         except ExprError as e:
@@ -418,7 +447,7 @@ class CheckContext:
     return_addrs: list
     line_for: Callable[[int], Any]
     path_of: Callable
-    on_hit: Callable[[Hit], None]
+    on_hit: Callable[[Hit, Any], None]   # (hit, state it was found on)
     block_head: Callable[[int], int]
 
     def in_target_function(self, addr: int) -> bool:

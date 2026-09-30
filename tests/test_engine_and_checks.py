@@ -36,6 +36,12 @@ def _addr(binary, name):
     return [f for f in binary.function_list() if f["name"] == name][0]["addr"]
 
 
+def _line_addr(binary, func_addr, snippet):
+    """First instruction of the source line containing `snippet` (layout-independent)."""
+    rows = binary.disassemble(func_addr)["source"]["rows"]
+    return next(r["addr"] for r in rows if snippet in r["text"] and r["addr"] is not None)
+
+
 def _run(binary, spec, timeout=45):
     r = Run(binary, spec)
     r.start().join(timeout=timeout)
@@ -60,6 +66,27 @@ def test_disassembly_marks_arith(binary):
 def test_cfg_has_branches(binary):
     g = binary.cfg_graph(_addr(binary, "route"))
     assert len(g["nodes"]) > 5 and len(g["edges"]) >= len(g["nodes"])
+
+
+def test_disassembly_blocks_do_not_overlap(binary):
+    """angr's basic blocks can overlap (shared function epilogues); the flattened
+    disassembly must still list each instruction once, owned by exactly one block."""
+    import bisect
+    for fn in binary.function_list():
+        d = binary.disassemble(fn["addr"])
+        insns = d["instructions"]
+        addrs = [i["addr"] for i in insns]
+        assert len(addrs) == len(set(addrs)), f"duplicate instruction in {fn['name']}"
+        leaders = sorted(binary.get_function(fn["addr"]).block_addrs_set)
+        prev_block = -1
+        for i in insns:                      # insns are sorted by address
+            owner = leaders[bisect.bisect_right(leaders, i["addr"]) - 1]
+            assert i["block"] == owner, f"{hex(i['addr'])} owned by wrong block in {fn['name']}"
+            assert i["block"] >= prev_block   # block ids never go backwards down the listing
+            prev_block = i["block"]
+        # the CFG view is likewise free of overlap-duplicated instructions
+        cfg_addrs = [ins["addr"] for n in binary.cfg_graph(fn["addr"])["nodes"] for ins in n["insns"]]
+        assert len(cfg_addrs) == len(set(cfg_addrs)), f"duplicate CFG instruction in {fn['name']}"
 
 
 # ---------------------------------------------------------------- overflow
@@ -121,7 +148,7 @@ def test_assert_can_be_false(binary):
                  {"name": "size", "mode": "symbolic", "size": 4, "signed": False}],
         "assumptions": ["count != 0", "size != 0"],
         "checks": [{"id": "a", "kind": "assert", "expr": "total < 0x10000",
-                    "addr": 0x4011bf, "enabled": True}],
+                    "addr": _line_addr(binary, fa, "malloc(total)"), "enabled": True}],
         "limits": {"steps": 20, "seconds": 20, "loop_bound": 6},
     })
     assert snap["status"] == "done"
@@ -161,7 +188,7 @@ def test_custom_check(binary):
         "args": [{"name": "count", "mode": "symbolic", "size": 4, "signed": False},
                  {"name": "size", "mode": "symbolic", "size": 4, "signed": False}],
         "assumptions": ["count != 0", "size != 0"],
-        "checks": [{"id": "c", "kind": "custom", "code": code, "addr": 0x4011bf, "enabled": True}],
+        "checks": [{"id": "c", "kind": "custom", "code": code, "addr": _line_addr(binary, fa, "malloc(total)"), "enabled": True}],
         "limits": {"steps": 15, "seconds": 15, "loop_bound": 5},
     })
     assert snap["status"] == "done"

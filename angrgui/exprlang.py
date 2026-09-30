@@ -97,16 +97,69 @@ def _truth(x):
     if isinstance(x, claripy.ast.Bool):
         return x
     if isinstance(x, int):
-        return claripy.true if x else claripy.false
+        return claripy.BoolV(bool(x))
     return x != 0
 
 
+_CMP = {
+    "<": claripy.ULT, "<=": claripy.ULE, ">": claripy.UGT, ">=": claripy.UGE,
+    "s<": claripy.SLT, "s<=": claripy.SLE, "s>": claripy.SGT, "s>=": claripy.SGE,
+}
+_BINOPS = {
+    "|": lambda a, b: a | b, "^": lambda a, b: a ^ b, "&": lambda a, b: a & b,
+    "<<": lambda a, b: a << b,
+    ">>": lambda a, b: claripy.LShR(a, b) if not isinstance(a, int) else a >> b,
+    "+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b,
+    "/": lambda a, b: a // b if isinstance(a, int) else a / b,
+    "%": lambda a, b: a % b,
+}
+
+
+class ClaripyOps:
+    """Semantics of the operators: build claripy ASTs (python ints for constants)."""
+
+    def or_(self, a, b):
+        return claripy.Or(_truth(a), _truth(b))
+
+    def and_(self, a, b):
+        return claripy.And(_truth(a), _truth(b))
+
+    def not_(self, a):
+        return claripy.Not(_truth(a))
+
+    def cmp(self, op, a, b):
+        signed = op.startswith("s")
+        a, b = _match(a, b, signed)
+        if isinstance(a, int):
+            return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}[op.lstrip("s")]
+        if op == "==":
+            return a == b
+        if op == "!=":
+            return a != b
+        return _CMP[op](a, b)
+
+    def binop(self, op, a, b):
+        a, b = _match(a, b)
+        return _BINOPS[op](a, b)
+
+    def neg(self, a):
+        return -a
+
+    def inv(self, a):
+        return ~a
+
+
 class Parser:
-    def __init__(self, src: str, resolver: Callable[[str], Any], funcs: dict[str, Callable] | None = None):
+    """Recursive-descent parser; `ops` decides what the operators build
+    (claripy ASTs here, Python source in codegen.py)."""
+
+    def __init__(self, src: str, resolver: Callable[[str], Any], funcs: dict[str, Callable] | None = None,
+                 ops=None):
         self.toks = tokenize(src)
         self.i = 0
         self.resolve = resolver
         self.funcs = funcs or {}
+        self.ops = ops or ClaripyOps()
 
     # -- helpers --------------------------------------------------------
     def peek(self):
@@ -134,20 +187,20 @@ class Parser:
         a = self.p_and()
         while self.is_op("||"):
             self.take()
-            a = claripy.Or(_truth(a), _truth(self.p_and()))
+            a = self.ops.or_(a, self.p_and())
         return a
 
     def p_and(self):
         a = self.p_not()
         while self.is_op("&&"):
             self.take()
-            a = claripy.And(_truth(a), _truth(self.p_not()))
+            a = self.ops.and_(a, self.p_not())
         return a
 
     def p_not(self):
         if self.is_op("!"):
             self.take()
-            return claripy.Not(_truth(self.p_not()))
+            return self.ops.not_(self.p_not())
         return self.p_cmp()
 
     def p_cmp(self):
@@ -155,59 +208,41 @@ class Parser:
         if self.peek()[0] == "op" and self.peek()[1] in CMP_OPS:
             op = self.take()[1]
             b = self.p_bor()
-            signed = op.startswith("s")
-            a, b = _match(a, b, signed)
-            if isinstance(a, int):
-                return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}[op.lstrip("s")]
-            table = {
-                "<": claripy.ULT, "<=": claripy.ULE, ">": claripy.UGT, ">=": claripy.UGE,
-                "s<": claripy.SLT, "s<=": claripy.SLE, "s>": claripy.SGT, "s>=": claripy.SGE,
-            }
-            if op == "==":
-                return a == b
-            if op == "!=":
-                return a != b
-            return table[op](a, b)
+            return self.ops.cmp(op, a, b)
         return a
 
-    def _binary(self, sub, ops: dict):
+    def _binary(self, sub, ops):
         a = sub()
         while self.peek()[0] == "op" and self.peek()[1] in ops:
             op = self.take()[1]
-            b = sub()
-            a, b = _match(a, b)
-            a = ops[op](a, b)
+            a = self.ops.binop(op, a, sub())
         return a
 
     def p_bor(self):
-        return self._binary(self.p_bxor, {"|": lambda a, b: a | b})
+        return self._binary(self.p_bxor, {"|"})
 
     def p_bxor(self):
-        return self._binary(self.p_band, {"^": lambda a, b: a ^ b})
+        return self._binary(self.p_band, {"^"})
 
     def p_band(self):
-        return self._binary(self.p_shift, {"&": lambda a, b: a & b})
+        return self._binary(self.p_shift, {"&"})
 
     def p_shift(self):
-        return self._binary(self.p_add, {"<<": lambda a, b: a << b, ">>": lambda a, b: claripy.LShR(a, b) if not isinstance(a, int) else a >> b})
+        return self._binary(self.p_add, {"<<", ">>"})
 
     def p_add(self):
-        return self._binary(self.p_mul, {"+": lambda a, b: a + b, "-": lambda a, b: a - b})
+        return self._binary(self.p_mul, {"+", "-"})
 
     def p_mul(self):
-        return self._binary(self.p_unary, {
-            "*": lambda a, b: a * b,
-            "/": lambda a, b: a // b if isinstance(a, int) else a / b,
-            "%": lambda a, b: a % b,
-        })
+        return self._binary(self.p_unary, {"*", "/", "%"})
 
     def p_unary(self):
         if self.is_op("-"):
             self.take()
-            return -self.p_unary()
+            return self.ops.neg(self.p_unary())
         if self.is_op("~"):
             self.take()
-            return ~self.p_unary()
+            return self.ops.inv(self.p_unary())
         return self.p_atom()
 
     def p_atom(self):
@@ -252,6 +287,7 @@ def make_evaluator(state):
     """Return eval(expr_string) -> claripy AST for the given state."""
     arch = state.arch
     variables = state.globals.get("angrgui_vars", {})
+    argv = state.globals.get("angrgui_argv", [])
     locals_ = state.globals.get("angrgui_locals", {})
     try:
         bp = state.regs.bp
@@ -274,10 +310,14 @@ def make_evaluator(state):
             return getattr(state.regs, arch.register_names[arch.ret_offset])
         if name in arch.registers:
             return getattr(state.regs, name)
-        if name.startswith("arg") and name[3:].isdigit():
-            key = name
-            if key in variables:
-                return variables[key]
+        # arg0.. (our name) and a1.. (IDA's decompiler name for parameters) both
+        # resolve positionally to the function's arguments at entry.
+        m = re.fullmatch(r"arg(\d+)", name)
+        if m and int(m.group(1)) < len(argv):
+            return argv[int(m.group(1))]
+        m = re.fullmatch(r"a(\d+)", name)
+        if m and 1 <= int(m.group(1)) <= len(argv):
+            return argv[int(m.group(1)) - 1]
         raise ExprError(f"unknown name {name!r}")
 
     def width(bits):

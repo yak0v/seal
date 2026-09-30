@@ -4,6 +4,7 @@ recover DWARF variables and source lines, and describe the per-function CFG.
 """
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 from dataclasses import dataclass
@@ -113,6 +114,12 @@ class Binary:
             "has_lines": bool(self.addr_to_line),
             "function_count": len(self.user_functions()),
         }
+
+    def scratch_base(self) -> int:
+        """Where symbolic input buffers go: above everything the loader mapped
+        (binary, libraries, angr's extern objects), so they can't overlap real data."""
+        top = self.project.loader.max_addr + 1
+        return (top + 0xfffff) & ~0xfffff
 
     # ------------------------------------------------------------- functions
     def user_functions(self):
@@ -234,13 +241,87 @@ class Binary:
         fp, ln = next(iter(entry))
         return fp, ln
 
+    def nearest_line(self, addr: int) -> tuple[str, int] | None:
+        """Line of `addr`, or of the closest preceding instruction in the same function.
+
+        The DWARF line table only marks where each statement *starts*, so e.g. the
+        conditional jump ending an `if` has no entry of its own.
+        """
+        e = self.line_for(addr)
+        if e:
+            return e
+        if not hasattr(self, "_line_addrs"):
+            self._line_addrs = sorted(self.addr_to_line)
+        i = bisect.bisect_right(self._line_addrs, addr) - 1
+        if i < 0:
+            return None
+        prev = self._line_addrs[i]
+        f = self.cfg.kb.functions.floor_func(addr)
+        if f is None or not (f.addr <= prev <= addr):
+            return None
+        return self.line_for(prev)
+
+    def source_at(self, addr: int) -> dict | None:
+        """{file, line, text} for the source line an address comes from."""
+        e = self.nearest_line(addr)
+        if not e:
+            return None
+        text = self._source_lines(e[0])
+        return {"file": os.path.basename(e[0]), "line": e[1],
+                "text": text[e[1] - 1].strip() if text and 0 < e[1] <= len(text) else None}
+
+    def block_source_lines(self, block_addr: int) -> list[int]:
+        """Source line numbers covered by the instructions of one basic block."""
+        cache = self.__dict__.setdefault("_block_lines", {})
+        if block_addr not in cache:
+            lines = []
+            try:
+                f = self.cfg.kb.functions.floor_func(block_addr)
+                leaders = sorted(f.block_addrs_set) if f is not None else [block_addr]
+                addrs = ([ins.address for ins in self._owned_capstone(block_addr, leaders)]
+                         if block_addr in leaders
+                         else list(self.project.factory.block(block_addr).instruction_addrs))
+                for a in addrs:
+                    e = self.line_for(a)
+                    if e and e[1] not in lines:
+                        lines.append(e[1])
+                if not lines and self.project.loader.main_object.contains_addr(block_addr):
+                    e = self.nearest_line(block_addr)
+                    if e:
+                        lines.append(e[1])
+            except Exception:
+                pass
+            cache[block_addr] = lines
+        return cache[block_addr]
+
+    def name_at(self, addr: int) -> str | None:
+        """Name of the function / PLT stub / angr SimProcedure starting at addr."""
+        if self.project.is_hooked(addr):
+            return self.project.hooked_by(addr).display_name
+        f = self.cfg.kb.functions.get(addr)
+        return f.name if f is not None else None
+
     # -------------------------------------------------------------- disassemble
+    def _owned_capstone(self, block_addr: int, leaders: list[int]):
+        """Capstone instructions of a block, truncated at the next block leader.
+
+        angr's basic blocks can overlap: `factory.block(addr)` lifts a full
+        straight-line run, so a block whose tail is shared with a later block
+        (a common function epilogue, say) extends past that later block's
+        leader. Cap each block at the next leader so every instruction belongs
+        to exactly one block and none are emitted twice.
+        """
+        i = bisect.bisect_right(leaders, block_addr)
+        nxt = leaders[i] if i < len(leaders) else None
+        insns = self.project.factory.block(block_addr).capstone.insns
+        return [ins for ins in insns if nxt is None or ins.address < nxt]
+
     def disassemble(self, func_addr: int) -> dict:
         f = self.get_function(func_addr)
+        leaders = sorted(f.block_addrs_set)
         insns = []
-        for block_addr in sorted(f.block_addrs_set):
-            block = self.project.factory.block(block_addr)
-            for ins in block.capstone.insns:
+        for block_addr in leaders:
+            for ins in self._owned_capstone(block_addr, leaders):
                 src = self.line_for(ins.address)
                 insns.append({
                     "addr": ins.address,
@@ -265,9 +346,10 @@ class Binary:
         }
 
     def _instruction_addrs(self, f):
-        for block_addr in sorted(f.block_addrs_set):
-            block = self.project.factory.block(block_addr)
-            yield from block.instruction_addrs
+        leaders = sorted(f.block_addrs_set)
+        for block_addr in leaders:
+            for ins in self._owned_capstone(block_addr, leaders):
+                yield ins.address
 
     def _source_view(self, f) -> dict | None:
         lines_hit = {}
@@ -304,14 +386,14 @@ class Binary:
     # --------------------------------------------------------------------- cfg
     def cfg_graph(self, func_addr: int) -> dict:
         f = self.get_function(func_addr)
+        leaders = sorted(f.block_addrs_set)
         nodes, edges = [], []
-        for block_addr in sorted(f.block_addrs_set):
-            block = self.project.factory.block(block_addr)
-            head = []
-            for ins in block.capstone.insns:
-                head.append({"addr": ins.address, "text": f"{ins.mnemonic} {ins.op_str}".strip()})
-            nodes.append({"addr": block_addr, "size": block.size, "insns": head,
-                          "end": block.instruction_addrs[-1] if block.instruction_addrs else block_addr})
+        for block_addr in leaders:
+            owned = self._owned_capstone(block_addr, leaders)
+            head = [{"addr": ins.address, "text": f"{ins.mnemonic} {ins.op_str}".strip()} for ins in owned]
+            end = owned[-1].address if owned else block_addr
+            size = (owned[-1].address + owned[-1].size - block_addr) if owned else 0
+            nodes.append({"addr": block_addr, "size": size, "insns": head, "end": end})
         etype = {"transition": "flow", "call": "call", "fake_return": "return", "return": "return"}
         for src, dst, data in f.transition_graph.edges(data=True):
             sa, da = getattr(src, "addr", None), getattr(dst, "addr", None)

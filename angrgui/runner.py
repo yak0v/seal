@@ -30,39 +30,43 @@ from typing import Any
 import angr
 import claripy
 
-from .checks import CheckContext, build_check, Hit
+from .checks import CheckContext, build_check, Hit, witness_of
 from .exprlang import make_evaluator, as_bool, ExprError
+from .pretty import printer_for_state
 
 log = logging.getLogger("angrgui.runner")
-
-_SIZE_TO_REG = None
 
 
 @dataclass
 class PathNode:
+    """One stretch of execution between two branch points.
+
+    The root starts at the function entry; every time a state splits (a branch
+    whose direction depends on the inputs), each side gets a child node labelled
+    with the condition the inputs must satisfy to go that way.
+    """
     id: int
-    addr: int
+    addr: int                     # where this stretch starts
     parent: int | None
     depth: int
     kind: str = "active"          # active|deadended|found|avoided|errored|pruned|unconstrained
-    block_addrs: list = field(default_factory=list)
-    label: str = ""
+    cond: str | None = None       # readable branch condition that leads here
+    decided_at: dict | None = None  # the branch instruction + its source line
+    block_addrs: list = field(default_factory=list)   # blocks executed in this stretch
+    cur: int | None = None        # where the state is now
+    end: dict | None = None       # leaves: {"reason", "text"}
+    ret: str | None = None        # leaves that returned: the return value
+    example: dict | None = None   # leaves: concrete inputs that drive execution down this path
     hit_ids: list = field(default_factory=list)
-
-    def to_json(self):
-        return {
-            "id": self.id, "addr": self.addr, "parent": self.parent, "depth": self.depth,
-            "kind": self.kind, "label": self.label,
-            "blocks": [hex(b) for b in self.block_addrs[-6:]], "hits": self.hit_ids,
-        }
 
 
 class Run:
     """One exploration job. Runs on a background thread; progress-pollable."""
 
-    def __init__(self, binary, spec: dict):
+    def __init__(self, binary, spec: dict, on_event=None):
         self.binary = binary
         self.spec = spec
+        self.on_event = on_event      # optional callback(type, **data) for the live feed
         self.project = binary.project
         self.arch = binary.arch
         self.func_addr = spec["func_addr"]
@@ -83,6 +87,9 @@ class Run:
         self._seen_leaves: set = set()          # id(state) of leaves already classified
         self.start_time = None
         self.summary: dict = {}
+        self._printer = str
+        self._return_addr = None
+        self._loop_bound = 0
 
     # ------------------------------------------------------------------ control
     def cancel(self):
@@ -109,6 +116,10 @@ class Run:
             angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
             angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
         }
+        if self.spec.get("limits", {}).get("skip_calls"):
+            # don't descend into called functions: a call returns a fresh unconstrained
+            # value, so exploration stays in the target function and its branches show.
+            opts.add(angr.options.CALLLESS)
         args = self.spec.get("args", [])
         arg_asts = []
         named = {}
@@ -125,33 +136,38 @@ class Run:
             buf = claripy.BVS(f"{argname}_buf", size * 8)
             buffers[argname] = (buf, size)
 
+        # stdin has to be handed to call_state: swapping state.posix.stdin afterwards
+        # leaves the file uninitialised and the first state copy crashes
+        stdin_spec = self.spec.get("stdin")
+        stdin_sym = None
+        extra = {}
+        if stdin_spec and stdin_spec.get("mode") == "symbolic":
+            n = int(stdin_spec.get("size", 16))
+            stdin_sym = claripy.BVS("stdin", n * 8)
+            extra["stdin"] = angr.SimFileStream(name="stdin", content=stdin_sym, has_end=True)
+
         prototype = self._prototype(args, buffers)
         state = self.project.factory.call_state(
-            self.func_addr, *arg_asts, prototype=prototype, add_options=opts)
+            self.func_addr, *arg_asts, prototype=prototype, add_options=opts, **extra)
+        if stdin_sym is not None:
+            named["stdin"] = stdin_sym
+            state.globals["angrgui_stdin"] = stdin_sym
 
         # Allocate + fill buffers, repoint the pointer args.
-        base = 0x600000
+        base = self.binary.scratch_base()
         for argname, (buf, size) in buffers.items():
             addr = base
             base += (size + 0xfff) & ~0xfff
             state.memory.store(addr, buf, endness="Iend_BE")
             named[f"{argname}_buf"] = buf
+            named[argname] = claripy.BVV(addr, self.arch.bits)   # the pointer itself is concrete
             # overwrite the corresponding register/stack slot with the pointer
             idx = next((i for i, a in enumerate(args) if a.get("name") == argname), None)
             if idx is not None:
                 self._set_arg(state, idx, claripy.BVV(addr, self.arch.bits), prototype)
 
-        # stdin
-        stdin_spec = self.spec.get("stdin")
-        stdin_sym = None
-        if stdin_spec and stdin_spec.get("mode") == "symbolic":
-            n = int(stdin_spec.get("size", 16))
-            stdin_sym = claripy.BVS("stdin", n * 8)
-            simfile = angr.SimFileStream(name="stdin", content=stdin_sym, has_end=True)
-            state.posix.stdin = simfile
-            state.globals["angrgui_stdin"] = stdin_sym
-
         state.globals["angrgui_vars"] = named
+        state.globals["angrgui_argv"] = arg_asts    # ordered, for the a1.. / arg0.. aliases
         state.globals["angrgui_locals"] = self._locals_map()
 
         # assumptions
@@ -224,21 +240,102 @@ class Run:
             block_head=self.binary.block_head,
         )
 
-    def _on_hit(self, hit: Hit):
+    def _emit(self, kind, **data):
+        if self.on_event:
+            try:
+                self.on_event(kind, **data)
+            except Exception:
+                pass
+
+    def _on_hit(self, hit: Hit, state):
         with self._lock:
+            # the state carries the id of the tree node (path stretch) it belongs to
+            nid = state.globals.get("angrgui_node") if state is not None else None
+            hit.extra["node"] = nid
             self.hits.append(hit)
+            if nid in self.nodes:
+                self.nodes[nid].hit_ids.append(len(self.hits) - 1)
             self.progress["hits"] = len(self.hits)
+        self._emit("finding", func=self.func_addr, check_kind=hit.kind, addr=hit.addr, detail=hit.message)
 
     # ------------------------------------------------------------------- tree
     def _new_node(self, addr, parent, depth, kind="active"):
         nid = self._node_counter
         self._node_counter += 1
-        node = PathNode(id=nid, addr=addr, parent=parent, depth=depth, kind=kind)
-        f = self.binary.cfg.kb.functions
-        e = self.binary.line_for(addr)
-        node.label = f"{addr:#x}" + (f"  ·  {e[0].split('/')[-1]}:{e[1]}" if e else "")
+        node = PathNode(id=nid, addr=addr, parent=parent, depth=depth, kind=kind, cur=addr)
         self.nodes[nid] = node
         return node
+
+    def _branch_condition(self, state) -> str | None:
+        """The constraint(s) this step added: what the inputs must satisfy to come here."""
+        cons = []
+        for c in state.history.recent_constraints:
+            c = getattr(c, "ast", c)
+            if isinstance(c, claripy.ast.Bool) and c.symbolic:
+                cons.append(c)
+        if not cons:
+            g = state.history.jump_guard
+            if isinstance(g, claripy.ast.Bool) and g.symbolic:
+                cons.append(g)
+        if not cons:
+            return None
+        return " && ".join(self._printer(c) for c in cons)
+
+    def _decision_point(self, parent: PathNode) -> dict | None:
+        """The branch instruction that ended the parent's stretch, with its source line."""
+        if not parent.block_addrs:
+            return None
+        try:
+            ins = self.project.factory.block(parent.block_addrs[-1]).instruction_addrs[-1]
+        except Exception:
+            return None
+        return {"addr": ins, **(self.binary.source_at(ins) or {})}
+
+    def _close(self, node: PathNode, state, fate: str, error: str | None = None):
+        """Record how a leaf path ended, and a concrete input that gets there."""
+        last = node.block_addrs[-1] if node.block_addrs else node.addr
+        if fate == "deadended" and state.addr == self._return_addr:
+            node.end = {"reason": "returned", "text": "returned"}
+            try:
+                rv = getattr(state.regs, self.arch.register_names[self.arch.ret_offset])
+                node.ret = self._fmt_value(state, rv)
+            except Exception:
+                pass
+        elif fate == "deadended" and state.history.jumpkind == "Ijk_Exit":
+            name = self.binary.name_at(last) or "exit"
+            node.end = {"reason": "exit", "text": f"called {name}(), the program stops"}
+        elif fate == "deadended":
+            node.end = {"reason": "ended", "text": "execution ended"}
+        elif fate == "pruned":
+            node.end = {"reason": "loop_bound",
+                        "text": f"stopped: a loop ran more than {self._loop_bound} times (loop bound)"}
+        elif fate == "unconstrained":
+            node.end = {"reason": "unconstrained",
+                        "text": "jumped to an address the inputs control (possible control-flow hijack)"}
+        elif fate == "errored":
+            node.end = {"reason": "error", "text": "angr error: " + (error or "unknown")}
+        try:
+            node.example = witness_of(state) or None
+        except Exception:
+            node.example = None
+
+    def _ret_insn(self, state) -> int:
+        """Address of the return instruction the state just executed (for reporting)."""
+        for b in reversed(list(state.history.bbl_addrs)):
+            if self.binary.get_function(self.func_addr) and self.func_addr <= b < self.func_addr + (self.func.size or 0x1000):
+                try:
+                    return self.project.factory.block(b).instruction_addrs[-1]
+                except Exception:
+                    return b
+        return self.func_addr
+
+    def _fmt_value(self, state, v) -> str:
+        if not v.symbolic:
+            n = state.solver.eval(v)
+            if (1 << 31) <= n < (1 << 32):
+                return f"{n:#x} (= {n - (1 << 32)} as int)"
+            return str(n) if n < 4096 else hex(n)
+        return self._printer(v)
 
     # -------------------------------------------------------------------- run
     def _run(self):
@@ -265,12 +362,15 @@ class Run:
 
             root = self._new_node(self.func_addr, None, 0)
             state.globals["angrgui_node"] = root.id
+            self._printer = printer_for_state(state)
+            self._return_addr = self.project.simos.return_deadend
 
             limits = self.spec.get("limits", {})
             max_steps = int(limits.get("steps", 200))
             max_active = int(limits.get("active", 400))
             max_seconds = float(limits.get("seconds", 30))
             loop_bound = int(limits.get("loop_bound", 12) or 0)
+            self._loop_bound = loop_bound
             find = limits.get("find")
             avoid = set(limits.get("avoid", []) or [])
             if find:
@@ -314,7 +414,11 @@ class Run:
                     for s in extra:
                         n = s.globals.get("angrgui_node")
                         if n is not None and n in self.nodes:
-                            self.nodes[n].kind = "pruned"
+                            node = self.nodes[n]
+                            node.kind = "pruned"
+                            node.end = {"reason": "dropped",
+                                        "text": f"dropped: more than {max_active} paths were active at once (max active)"}
+                            node.example = witness_of(s) or None
 
             if self.status == "running":
                 self.status = "done"
@@ -325,10 +429,12 @@ class Run:
             self.error = f"{type(e).__name__}: {e}"
             log.exception("run failed")
             self.progress["message"] = self.error
+        self._emit("run_status", func=self.func_addr, status=self.status,
+                   hits=len(self.hits), error=self.error)
 
     def _absorb(self, simgr, find, avoid):
         # Gather every fresh successor from this step, tagged with its fate.
-        succ: list[tuple] = [(s, "active") for s in simgr.active]
+        succ: list[tuple] = [(s, "active", None) for s in simgr.active]
         for stash, kind in (("deadended", "deadended"), ("errored", "errored"),
                             ("unconstrained", "unconstrained"), ("spinning", "pruned")):
             for item in getattr(simgr, stash, []):
@@ -336,33 +442,40 @@ class Run:
                 if id(st) in self._seen_leaves:
                     continue
                 self._seen_leaves.add(id(st))
-                succ.append((st, kind))
+                succ.append((st, kind, str(item.error) if stash == "errored" else None))
 
         # Count successors per parent node so we can tell branches from straight lines.
         parent_count: dict = {}
-        for s, _ in succ:
+        for s, _, _ in succ:
             pn = s.globals.get("angrgui_node")
             parent_count[pn] = parent_count.get(pn, 0) + 1
 
-        for s, fate in succ:
+        extended = set()
+        for s, fate, err in succ:
             pn = s.globals.get("angrgui_node")
+            recent = list(s.history.recent_bbl_addrs)
             if pn is None or pn not in self.nodes:
                 node = self._new_node(s.addr, None, 0)
+                node.block_addrs.extend(recent)
                 s.globals["angrgui_node"] = node.id
-                cur = node.id
             elif parent_count.get(pn, 1) > 1:
-                # the parent split here: every successor gets its own child node
-                child = self._new_node(s.addr, pn, self.nodes[pn].depth + 1)
-                s.globals["angrgui_node"] = child.id
-                cur = child.id
+                # the parent split here: the block that branched belongs to the parent,
+                # and every successor starts its own child stretch
+                parent = self.nodes[pn]
+                if pn not in extended:
+                    parent.block_addrs.extend(recent)
+                    extended.add(pn)
+                node = self._new_node(s.addr, pn, parent.depth + 1)
+                node.cond = self._branch_condition(s)
+                node.decided_at = self._decision_point(parent)
+                s.globals["angrgui_node"] = node.id
             else:
-                cur = pn
-            node = self.nodes[cur]
-            node.addr = s.addr
-            node.block_addrs = list(s.history.bbl_addrs)
-            node.label = self._label(s.addr)
+                node = self.nodes[pn]
+                node.block_addrs.extend(recent)
+            node.cur = s.addr
             if fate != "active":
                 node.kind = fate
+                self._close(node, s, fate, err)
             if find and s.addr == find:
                 node.kind = "found"
             if s.addr in avoid:
@@ -371,18 +484,21 @@ class Run:
             # boundaries, where register and memory reads are committed and reliable
             for chk in self._state_checks:
                 chk.note_state(s)
-
-    def _label(self, addr):
-        e = self.binary.line_for(addr)
-        return f"{addr:#x}" + (f"  ·  {e[0].split('/')[-1]}:{e[1]}" if e else "")
+            # at_return asserts are evaluated once the state has actually returned,
+            # where the return register is final (it may be set inside the return block)
+            if fate == "deadended" and s.addr == self._return_addr:
+                ret_site = self._ret_insn(s)
+                for chk in self._state_checks:
+                    chk.note_return(s, ret_site)
 
     def _finalize(self, simgr):
-        # attach hit ids to the nodes whose path reaches them
-        for i, h in enumerate(self.hits):
-            for nid, node in self.nodes.items():
-                if h.addr in [int(x, 16) if isinstance(x, str) else x for x in node.block_addrs] \
-                        or node.addr == h.addr:
-                    node.hit_ids.append(i)
+        # paths still active when the budget ran out
+        for s in simgr.active:
+            node = self.nodes.get(s.globals.get("angrgui_node"))
+            if node is not None and node.end is None:
+                node.end = {"reason": "unfinished",
+                            "text": "not finished: stopped by the step / time limit (or cancelled)"}
+                node.example = witness_of(s) or None
         self.summary.update({
             "status": self.status,
             "steps": self.progress["step"],
@@ -397,6 +513,25 @@ class Run:
         })
 
     # ---------------------------------------------------------------- reporting
+    def _node_json(self, n: PathNode) -> dict:
+        blocks = n.block_addrs[:400]
+        lines, calls = [], []
+        for b in blocks:
+            for ln in self.binary.block_source_lines(b):
+                if ln not in lines:
+                    lines.append(ln)
+            if b != self.func_addr:
+                name = self.binary.name_at(b)
+                if name and name not in calls:
+                    calls.append(name)
+        return {
+            "id": n.id, "parent": n.parent, "depth": n.depth, "kind": n.kind,
+            "addr": n.addr, "cur": n.cur, "start": self.binary.source_at(n.addr),
+            "cond": n.cond, "decided_at": n.decided_at,
+            "blocks": blocks, "lines": lines, "calls": calls,
+            "end": n.end, "ret": n.ret, "example": n.example, "hits": list(n.hit_ids),
+        }
+
     def snapshot(self):
         with self._lock:
             return {
@@ -405,5 +540,5 @@ class Run:
                 "progress": dict(self.progress),
                 "summary": self.summary,
                 "hits": [h.to_json() for h in self.hits],
-                "tree": [n.to_json() for n in self.nodes.values()],
+                "tree": [self._node_json(n) for n in list(self.nodes.values())],
             }
