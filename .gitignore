@@ -8,7 +8,22 @@ venv/
 
 # compiled sample binary (build it with: make -C samples)
 samples/vuln
+samples/vuln.angrgui.json
 
 # editor / OS
 .DS_Store
 *.swp
+
+# IDA databases (created when a binary is opened in IDA, e.g. via the MCP integration)
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+# generated example workspace for the extra sample
+samples/machine.angrgui.json
+
+# built research sample (rebuild: cross-compile samples/machine.c)
+samples/machine

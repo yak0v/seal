@@ -1,4 +1,4 @@
-angr>=9.2
+angr>=9.2,<10          # angr 10 folds claripy into angr and changes the APIs used here
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2
