@@ -953,9 +953,13 @@ function openIdaModal() {
     } catch (e) { toast("connect failed: " + e.message, true); connect.disabled = false; connect.textContent = "Connect"; }
   } }, "Connect");
   const foot = [connect];
-  if (A.ida && A.ida.connected) foot.unshift(el("button", { onclick: async () => {
-    await jpost("/api/ida/disconnect", {}); A.ida = { connected: false }; updateIdaBtn(); await loadFunctions(); m.remove(); toast("IDA disconnected");
-  } }, "Disconnect"));
+  if (A.ida && A.ida.connected) {
+    foot.unshift(el("button", { onclick: async () => {
+      await jpost("/api/ida/disconnect", {}); A.ida = { connected: false }; updateIdaBtn(); await loadFunctions(); m.remove(); toast("IDA disconnected");
+    } }, "Disconnect"));
+    // re-pull names + decompilation after you change or reload something in IDA
+    foot.unshift(el("button", { class: "primary", onclick: async () => { m.remove(); await refreshIda(); } }, "↻ Refresh from IDA"));
+  }
   foot.unshift(el("button", { onclick: () => m.remove() }, "Close"));
   const m = modal("Connect to IDA", body, foot);
   $("#modalHost").append(m);
@@ -1002,6 +1006,7 @@ async function renderDecomp(force) {
 async function refreshIda() {
   try {
     A.ida = await jpost("/api/ida/refresh", {});
+    A.decompCache = {};                       // drop the client-side pseudocode cache too
     updateIdaBtn();
     await loadFunctions();
     if (A.fn) {
