@@ -152,6 +152,13 @@ async function loadFunctions() {
   // stripped binary: almost nothing has a symbol name, so don't hide the sub_* functions
   if (r.functions.filter(f => f.named).length < 10) $("#onlyNamed").checked = false;
   renderFunctions();
+  // after a page reload, re-open the function you were on (restores its run/paths)
+  if (!A.fn) {
+    let last = null;
+    try { last = +localStorage.getItem("lastFn:" + (A.binary && A.binary.name)); } catch (e) {}
+    const f = last && A.functions.find(x => x.addr === last);
+    if (f) selectFunction(f);
+  }
 }
 function renderFunctions() {
   const q = $("#fnSearch").value.toLowerCase();
@@ -178,12 +185,21 @@ function renderFunctions() {
 // ==================================================================== select function
 async function selectFunction(f) {
   A.fn = f; A.run = null; A.selectedHit = null; A.selNode = null; A.pathHighlight = null; A.collapsed.clear();
+  try { localStorage.setItem("lastFn:" + (A.binary && A.binary.name), f.addr); } catch (e) {}
   stopPolling();
   renderFunctions();
   $("#pane-code").innerHTML = '<div class="empty">Loading…</div>';
   const d = await api("/api/function/" + f.addr);
   A.detail = d;
   A.config = normalizeConfig(d.config, d);
+  // re-attach the most recent run for this function (survives a page reload)
+  if (d.last_run) {
+    try {
+      const snap = await api("/api/run/" + d.last_run);
+      A.run = { id: d.last_run, snapshot: snap };
+      if (["pending", "running"].includes(snap.status)) startPolling();
+    } catch (e) { A.run = null; }
+  }
   renderCode();
   renderRight();
   renderCFG();
@@ -636,7 +652,7 @@ function pathsHelp() {
     renderTree(true);
   } }, hidden ? "how to read this?" : "hide");
   if (hidden) return el("div", { class: "phelp small" }, toggle);
-  const fn = A.fn ? `${A.fn.name}(${A.config.args.map(a => a.name).join(", ")})` : "the function";
+  const fn = A.fn ? `${A.fn.name}(${((A.config && A.config.args) || []).map(a => a.name).join(", ")})` : "the function";
   return el("div", { class: "phelp" }, el("div", { class: "row", style: "align-items:flex-start" },
     el("div", { class: "grow", html:
       `<b>How to read this.</b> angr runs <code>${esc(fn)}</code> with your symbolic inputs. ` +
@@ -696,7 +712,7 @@ function renderPathNode(T, n, snap) {
   const head = el("div", { class: "phead1" }, caret);
   if (n.parent === null) {
     head.append(el("span", { class: "startlbl" }, "start"),
-      el("span", { class: "mono" }, `${A.fn?.name || hx64(n.addr)}(${A.config.args.map(a => a.name).join(", ")})`));
+      el("span", { class: "mono" }, `${A.fn?.name || hx64(n.addr)}(${((A.config && A.config.args) || []).map(a => a.name).join(", ")})`));
     const asm = snap.summary?.assumptions_applied || [];
     if (asm.length) head.append(el("span", { class: "where" }, "assuming " + asm.join(", ")));
   } else {

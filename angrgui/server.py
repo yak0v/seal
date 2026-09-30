@@ -53,6 +53,7 @@ class _Session:
         self.binary: Binary | None = None
         self.workspace: Workspace | None = None
         self.runs: dict[str, Run] = {}
+        self.last_run: dict[int, str] = {}       # func_addr -> most recent run_id
         self.load_status = {"loading": False, "message": "", "error": None}
         self.ida = None                     # optional angrgui.idamcp.IdaSession
 
@@ -265,7 +266,8 @@ def function(addr: int):
                 "size": a["size"] or b.word_bytes, "signed": a.get("signed", True),
             })
     return {"disasm": disasm, "dwarf": dwarf, "config": cfg,
-            "return_heads": [hex(h) for h in b.return_block_heads(addr)]}
+            "return_heads": [hex(h) for h in b.return_block_heads(addr)],
+            "last_run": S.last_run.get(addr)}
 
 
 @app.get("/api/cfg/{addr}")
@@ -316,6 +318,7 @@ def _start_run(spec: dict, source: str = "gui") -> str:
 
     r = Run(b, spec, on_event=on_event)
     S.runs[run_id] = r
+    S.last_run[spec["func_addr"]] = run_id
     r.start()
     BUS.publish("run", f"{source} started a run of {_fname(spec['func_addr'])}",
                 func=spec["func_addr"], run_id=run_id,
@@ -324,10 +327,15 @@ def _start_run(spec: dict, source: str = "gui") -> str:
 
 
 @app.get("/api/events")
-def events(after: int = 0):
+def events(request: Request, after: int | None = None):
+    # A fresh page load should NOT replay history (old runs would yank the UI around);
+    # start from "now". EventSource auto-reconnect sends Last-Event-ID, which we resume from.
+    resume = request.headers.get("last-event-id")
+    start = int(resume) if resume and resume.isdigit() else (after if after is not None else BUS._seq)
+
     def gen():
         yield "retry: 2000\n\n"
-        for e in BUS.stream(after):
+        for e in BUS.stream(start):
             yield ": ping\n\n" if e is None else f"id: {e['seq']}\ndata: {json.dumps(e)}\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
 
