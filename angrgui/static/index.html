@@ -326,6 +326,28 @@ select{font-family:var(--sans)}
 .modal .mh{padding:14px 16px;border-bottom:1px solid var(--line);font-weight:600;display:flex;justify-content:space-between}
 .modal .mb{padding:16px;overflow:auto}
 .modal .mf{padding:12px 16px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:8px}
+/* agent documentation */
+.modal.docs{width:860px}
+.docbody{font-size:13px;line-height:1.6;color:var(--ink)}
+.docbody .dh{margin:22px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--green);
+  border-bottom:1px solid var(--line2);padding-bottom:5px}
+.docbody .dh:first-child{margin-top:4px}
+.docbody .dp{margin:8px 0;color:var(--dim)}
+.docbody .dp b{color:var(--ink)}
+.docbody code{font-family:var(--mono);font-size:12px;background:var(--field);color:var(--ink);padding:1px 5px;border-radius:4px}
+.docbody .dcode{font-family:var(--mono);font-size:12.5px;background:var(--field);border:1px solid var(--line);
+  border-radius:6px;padding:10px 12px;margin:8px 0;color:var(--green);overflow-x:auto;user-select:all}
+.docbody .dol{margin:8px 0 8px 2px;padding-left:20px;color:var(--dim)}
+.docbody .dol li{margin:5px 0}
+.docbody .dul{margin:8px 0;padding-left:18px;color:var(--dim)}
+.docbody .dul li{margin:4px 0}
+.docbody .dul b{color:var(--ink)}
+.dtbl{width:100%;border-collapse:collapse;margin:8px 0;font-size:12.5px}
+.dtbl th{text-align:left;color:var(--faint);font-weight:600;padding:4px 8px;border-bottom:1px solid var(--line2);font-size:11px;text-transform:uppercase}
+.dtbl td{padding:6px 8px;border-bottom:1px solid var(--line);color:var(--dim);vertical-align:top}
+.dtbl td:first-child{white-space:nowrap}
+.dargs{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:3px}
+.dcheck{margin:7px 0;color:var(--dim)}
 .field{margin-bottom:12px}
 .field label{display:block;font-size:11px;color:var(--dim);margin-bottom:4px;text-transform:uppercase;letter-spacing:.4px}
 .field input,.field select,.field textarea{width:100%}
@@ -388,6 +410,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
   <div class="binfo" id="binfo">no binary loaded</div>
   <div class="grow"></div>
   <div class="faint" id="hint">Load an ELF, pick a function, set up its state, add checks, and run.</div>
+  <button id="docsBtn" class="tiny ghost" title="How an AI agent drives this tool over MCP">📖 Agent docs</button>
   <button id="themeBtn" class="tiny ghost" title="Choose colour palette">◐ Theme ▾</button>
 </div>
 

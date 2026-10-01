@@ -71,6 +71,7 @@ async function init() {
   $("#idaBtn").addEventListener("click", openIdaModal);
   $("#actBtn").addEventListener("click", toggleActivity);
   $("#themeBtn").addEventListener("click", openThemeMenu);
+  $("#docsBtn").addEventListener("click", openDocsModal);
   $("#followChk").addEventListener("change", e => { A.followAgent = e.target.checked; });
   $("#bottomClose").addEventListener("click", () => {
     const bp = $("#bottomPanel"); bp.classList.toggle("collapsed");
@@ -292,6 +293,36 @@ async function saveConfig() {
   if (f) { f.check_count = A.func.checks.length; f.configured = true; f.scenario_count = A.func.scenarios.length; renderFunctions(); }
 }
 
+// export the active scenario — its setup, the shared checks, and the latest run's
+// findings + paths — to a JSON file for later investigation or sharing with an agent.
+function hitExport(h) {
+  return { kind: h.kind, addr: h.addr != null ? hx64(h.addr) : null, message: h.message,
+           witness: h.witness, src_line: h.extra && h.extra.src_line };
+}
+function exportScenario() {
+  const sc = A.config, snap = A.run && A.run.snapshot;
+  const payload = {
+    tool: "angr-bug-hunter", exported_at: new Date().toISOString(),
+    binary: A.binary ? { name: A.binary.name, path: A.binary.path, arch: A.binary.arch, bits: A.binary.bits } : null,
+    function: A.fn ? { addr: hx64(A.fn.addr), name: A.fn.ida_name || A.fn.name } : null,
+    scenario: sc ? { name: sc.name, args: sc.args, buffers: sc.buffers,
+                     assumptions: (sc.assumptions || []).filter(x => x && x.trim()),
+                     stdin: sc.stdin, files: sc.files, limits: sc.limits } : null,
+    checks: (A.func && A.func.checks) || [],
+    run: snap ? {
+      id: A.run.id, status: snap.status,
+      findings: (snap.hits || []).map(hitExport),
+      paths: (snap.tree || []).map(n => ({ id: n.id, parent: n.parent, cond: n.cond,
+        end: (n.end || {}).reason, ret: n.ret, example: n.example, hits: n.hits })),
+    } : null,
+  };
+  const fname = `${(A.fn && (A.fn.ida_name || A.fn.name)) || "function"}.${(sc && sc.name) || "scenario"}.angrgui.json`
+    .replace(/[^\w.\-]/g, "_");
+  const a = el("a", { href: URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" })), download: fname });
+  document.body.append(a); a.click(); a.remove();
+  toast("exported " + fname + (snap ? " (with results)" : " (no run yet)"));
+}
+
 // ------------------------------------------------------------------ scenarios UI
 function scenarioChip(cls) {                            // a clickable pill: active scenario + switcher
   const n = A.func ? A.func.scenarios.length : 1;
@@ -321,6 +352,7 @@ function openScenarioMenu(anchor) {
   m.append(el("div", { class: "popsep" }));
   m.append(el("div", { class: "popitem add", onclick: () => { m.remove(); addScenario(false); } }, "+ New scenario"));
   m.append(el("div", { class: "popitem add", onclick: () => { m.remove(); addScenario(true); } }, "⎘ Duplicate current"));
+  m.append(el("div", { class: "popitem add", onclick: () => { m.remove(); exportScenario(); } }, "⤓ Export scenario + results"));
   document.body.append(m);
   const r = anchor.getBoundingClientRect();
   m.style.top = Math.min(r.bottom + 6, window.innerHeight - m.offsetHeight - 10) + "px";
@@ -1542,6 +1574,82 @@ function modal(title, bodyNode, footerButtons) {
   bg.addEventListener("click", e => { if (e.target === bg) bg.remove(); });
   bg.remove = () => bg.parentNode && bg.parentNode.removeChild(bg);
   return bg;
+}
+
+// ==================================================================== agent docs
+async function openDocsModal() {
+  let d = {};
+  try { d = await api("/api/agent-docs"); } catch (e) {}
+  const origin = location.origin;
+  const mcpUrl = d.mcp_url || (origin + "/mcp");
+  const h = (t) => el("h4", { class: "dh" }, t);
+  const p = (...k) => el("p", { class: "dp" }, ...k);
+  const code = (t) => el("code", {}, t);
+  const pre = (t) => el("pre", { class: "dcode" }, t);
+  const body = el("div", { class: "docbody" });
+
+  body.append(
+    p(el("b", {}, "angr bug hunter"), " drives ", el("b", {}, "angr"),
+      " symbolic execution behind a visual UI. An agent sets up a function's initial state, adds checks, runs them, and reads back concrete inputs that trigger each finding — while a human watches every action live in this window."));
+
+  body.append(h("1 · Connect"));
+  body.append(p("The tool exposes a built-in ", el("b", {}, "MCP server"), " (", (d.transport || "Streamable HTTP"), "). Point your MCP client at:"));
+  body.append(pre(mcpUrl));
+  body.append(p("Protocol ", code(d.protocol || "2025-06-18"), ", server name ", code(d.server_name || "angr-bug-hunter"),
+    ". Standard MCP handshake: ", code("initialize"), " → ", code("tools/list"), " → ", code("tools/call"),
+    ". No auth. Everything you do appears in the GUI's ", el("b", {}, "Activity"), " feed in real time, and the human can follow along (the view auto-jumps to your runs)."));
+
+  body.append(h("2 · Typical workflow"));
+  const ol = el("ol", { class: "dol" });
+  [["list_functions", "find the function to analyse (by name or address substring)."],
+   ["get_function", "read its current setup (initial state, assumptions, checks, limits)."],
+   ["decompile / disassemble", "read the code to decide what to check."],
+   ["configure / add_assumption / add_check", "mark arguments symbolic or fixed, constrain inputs, and add checks."],
+   ["run", "execute the enabled checks; returns a run_id."],
+   ["get_run", "poll until status is done/error, then read findings — each carries a concrete witness (the exact inputs that trigger it) and the path tree."]].forEach(([t, s]) =>
+    ol.append(el("li", {}, code(t), " — " + s)));
+  body.append(ol);
+
+  body.append(h("3 · Tools"));
+  const tbl = el("table", { class: "dtbl" });
+  tbl.append(el("tr", {}, el("th", {}, "tool"), el("th", {}, "what it does")));
+  (d.tools || []).forEach(t => {
+    const req = (t.inputSchema && t.inputSchema.required) || [];
+    tbl.append(el("tr", {},
+      el("td", {}, code(t.name), req.length ? el("div", { class: "dargs" }, "args: " + req.join(", ")) : null),
+      el("td", {}, t.description)));
+  });
+  body.append(tbl);
+
+  body.append(h("4 · Checks (add_check)"));
+  (d.check_kinds || []).forEach(c => {
+    const fields = Object.entries(c.fields || {}).map(([k, v]) => `${k}: ${v}`).join("  ·  ");
+    body.append(el("div", { class: "dcheck" },
+      el("span", { class: "pill info" }, c.kind), " ", c.summary,
+      fields ? el("div", { class: "dargs" }, fields) : null));
+  });
+  body.append(p("Example: ", code('add_check(addr, {"kind":"assert","expr":"total < 0x1000","at_return":true})')));
+
+  body.append(h("5 · Expression language"));
+  body.append(p("Used by assumptions and by ", code("assert"), " checks, over the input names:"));
+  const el2 = el("ul", { class: "dul" });
+  [["names", "the argument names, plus a1../arg0.. (parameters), registers (rdi, eax…), and ret (return value)."],
+   ["compare", "== != < <= > >=  (unsigned); prefix s for signed: s< s<= s> s>="],
+   ["arith / bitwise", "+ - * / %  & | ^ ~ << >>  (s>> = arithmetic shift, s/ s% = signed)"],
+   ["widths", "u8/u16/u32/u64 read N low bits unsigned; s8/s16/s32/s64 sign-extend"],
+   ["memory", "mem(addr, size) reads memory; e.g. mem(a1, 4)"],
+   ["example", 'a1 & 0xff == 0x5a   ·   u32(x) + 8 < u32(x)   ·   ret s>= 0']].forEach(([k, v]) =>
+    el2.append(el("li", {}, el("b", {}, k + ": "), v)));
+  body.append(el2);
+
+  body.append(h("6 · Scenarios"));
+  body.append(p("A function can have several ", el("b", {}, "scenarios"), " — different ways it is reached, each with its own initial state (args, stdin, files, assumptions, limits). ",
+    "The checks are ", el("b", {}, "shared"), " across scenarios. ", code("run"), " uses the active scenario; ", code("get_function"),
+    " reports the scenario names and which is active."));
+
+  const m = modal("Agent documentation", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
+  m.querySelector(".modal").classList.add("docs");
+  $("#modalHost").append(m);
 }
 
 // ==================================================================== overflow modal

@@ -592,6 +592,22 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
 ]
 
+# documented check kinds (what add_check accepts); kept in sync with checks.py
+CHECK_KINDS = [
+    {"kind": "reach", "summary": "record any path that reaches an address",
+     "fields": {"addr": "0x.. (required)"}},
+    {"kind": "avoid", "summary": "record + flag paths that reach an address (a 'bad' location)",
+     "fields": {"addr": "0x.. (required)"}},
+    {"kind": "assert", "summary": "a boolean that must always hold; a finding is any input that breaks it",
+     "fields": {"expr": "expression (required)", "addr": "0x.. (optional point; omit for return)",
+                "at_return": "true to check at function return"}},
+    {"kind": "int_overflow", "summary": "integer add/sub/mul whose result overflows",
+     "fields": {"addr": "0x.. (optional; omit to scan every add/sub/mul)",
+                "signed": "either | unsigned | signed"}},
+    {"kind": "custom", "summary": "your own Python predicate run at a point (advanced)",
+     "fields": {"code": "python (required)", "addr": "0x.. (optional point)"}},
+]
+
 _MCP_TOOLS = {
     "get_status": lambda a: _mcp_status_payload(),
     "list_functions": lambda a: _mcp_functions(a.get("query"), a.get("limit", 200)),
@@ -661,6 +677,21 @@ async def mcp_endpoint(request: Request):
 def custom_template():
     from .checks import CUSTOM_TEMPLATE
     return {"template": CUSTOM_TEMPLATE}
+
+
+@app.get("/api/agent-docs")
+def agent_docs(request: Request):
+    """Everything an agent needs to drive this tool over MCP: the live tool list,
+    the connection details, the expression language and the available checks."""
+    base = str(request.base_url).rstrip("/")
+    return {
+        "server_name": "angr-bug-hunter",
+        "protocol": MCP_PROTOCOL,
+        "mcp_url": base + "/mcp",
+        "transport": "MCP Streamable HTTP (POST JSON-RPC; responses are JSON or SSE)",
+        "tools": TOOL_DEFS,
+        "check_kinds": CHECK_KINDS,
+    }
 
 
 if os.path.isdir(os.path.join(STATIC, "vendor")):
