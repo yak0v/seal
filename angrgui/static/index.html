@@ -260,6 +260,20 @@ select{font-family:var(--sans)}
 .assumebar .albl{color:var(--faint);text-transform:uppercase;letter-spacing:.5px;font-family:var(--sans);font-size:10px}
 .achip{padding:1px 8px;border-radius:10px;border:1px solid var(--ac);color:var(--ac);white-space:nowrap}
 .avar{color:var(--ac);border-bottom:1.5px solid var(--ac);border-radius:2px;padding:0 1px}
+/* argument variables marked in the decompilation */
+.dvar{cursor:pointer;border-radius:3px;padding:0 1px}
+.dvar.sym{color:var(--green);background:rgba(70,208,126,.12);border-bottom:1.5px dashed var(--green)}
+.dvar.set{color:var(--warn);background:rgba(227,179,65,.1);border-bottom:1.5px dotted var(--warn)}
+.dvar:hover{filter:brightness(1.25);outline:1px solid currentColor;outline-offset:0}
+.dvar.av{border-bottom-color:var(--ac)}
+.varlegend{display:flex;gap:12px;align-items:center;font-size:10.5px;color:var(--faint)}
+.varlegend i{font-style:normal;padding:0 4px;border-radius:3px}
+.varlegend i.sym{color:var(--green);background:rgba(70,208,126,.12);border-bottom:1.5px dashed var(--green)}
+.varlegend i.set{color:var(--warn);background:rgba(227,179,65,.1);border-bottom:1.5px dotted var(--warn)}
+.vmenu{min-width:230px;padding:10px}
+.vmhead{display:flex;flex-direction:column;gap:1px;margin-bottom:8px}
+.vmhead .faint{font-size:11px}
+.vmlbl{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);margin:0 0 4px}
 .adot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;display:inline-block;margin-right:2px}
 .assume{align-items:center}
 

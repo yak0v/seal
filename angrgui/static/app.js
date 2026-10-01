@@ -254,6 +254,7 @@ function renderDock() {
 function renderCode() {
   const d = A.detail, di = d.disasm;
   const pane = $("#pane-code"); pane.replaceChildren();
+  A._vars = varModel();
   const abar = assumptionsBar(); if (abar) pane.append(abar);
   const wrap = el("div", { class: "codewrap" });
 
@@ -1151,7 +1152,7 @@ async function renderDecomp(force) {
     catch (e) { pane.innerHTML = '<div class="empty">Decompile failed: ' + esc(e.message) + '</div>'; return; }
     A.decompCache[A.fn.addr] = d;
   }
-  A._assume = assumeModel();
+  A._assume = assumeModel(); A._vars = varModel();
   // IDA decompiles the function containing the address; show the function IDA
   // actually returned, and flag it when angr's function boundary differs.
   const idaFn = d.func || (A.fn.ida_name || A.fn.name);
@@ -1159,6 +1160,8 @@ async function renderDecomp(force) {
     el("span", {}, "IDA · "),
     el("span", { class: "fn" }, idaFn + (d.func_start != null ? "  " + hx64(d.func_start) : "")),
     el("span", { class: "grow" }),
+    el("span", { class: "varlegend", title: "argument variables are marked in the code; click one to constrain it or flip it between symbolic and fixed" },
+      el("i", { class: "sym" }, "symbolic"), el("i", { class: "set" }, "fixed")),
     d.kind && d.kind !== "pseudocode" ? el("span", { class: "pill warn" }, d.kind) : null,
     el("button", { class: "tiny", title: "re-pull names + decompilation from IDA", onclick: refreshIda }, "↻ Refresh"),
     el("button", { class: "tiny", onclick: () => navigator.clipboard.writeText(stripMarks(d.code)).then(() => toast("copied")) }, "Copy"));
@@ -1243,20 +1246,93 @@ function assumptionsBar() {
       title: (a.vars.size > 1 ? "involves " : "on ") + [...a.vars].join(", ") }, a.expr));
   return bar;
 }
-function annotate(text) {                  // wrap tokens that appear in an assumption
-  const tok = (A._assume || assumeModel()).tok;
+// which decompilation tokens are the function's input arguments, and whether
+// each is symbolic (free for angr to search) or fixed to a concrete value.
+// a1 (IDA) <-> arg0 (ours) <-> your name all resolve to the same slot.
+function varModel() {
+  const tok = {};
+  const args = (A.config && A.config.args) || [];
+  args.forEach((a, idx) => {
+    const info = { name: a.name || ("arg" + idx), idx, mode: a.mode, value: a.value, size: a.size, signed: a.signed };
+    for (const t of aliasesOf(info.name)) tok[t] = info;
+    tok["a" + (idx + 1)] = info; tok["arg" + idx] = info;
+  });
+  return tok;
+}
+function fmtArgVal(info) {
+  const v = info.value ?? 0;
+  return (typeof v === "number" && v >= 16) ? "0x" + v.toString(16) + " (" + v + ")" : String(v);
+}
+
+function annotate(text) {                  // mark argument variables + assumption tokens
+  const atok = (A._assume || assumeModel()).tok;
+  const vtok = A._vars || (A._vars = varModel());
   const frag = document.createDocumentFragment();
   let last = 0, m; const re = /[A-Za-z_]\w*/g;
   while ((m = re.exec(text))) {
-    const hits = tok[m[0]];
-    if (!hits) continue;
+    const word = m[0];
+    const ahits = atok[word], vinfo = vtok[word];
+    if (!ahits && !vinfo) continue;
     if (m.index > last) frag.append(document.createTextNode(text.slice(last, m.index)));
-    frag.append(el("span", { class: "avar", style: `--ac:${hits[0].color}`,
-      title: hits.map(a => a.expr).join("  ;  ") }, m[0]));
+    if (vinfo) {
+      const sym = vinfo.mode !== "concrete";
+      const sp = el("span", { class: "dvar " + (sym ? "sym" : "set"),
+        title: sym ? `${vinfo.name}: symbolic (${vinfo.size || 8} bytes) — click to add a constraint`
+                   : `${vinfo.name} = ${fmtArgVal(vinfo)} — click to change or constrain`,
+        onclick: (e) => { e.stopPropagation(); openVarMenu(vinfo, e); } }, word);
+      if (ahits) { sp.style.setProperty("--ac", ahits[0].color); sp.classList.add("av"); sp.title += "  ·  in: " + ahits.map(a => a.expr).join("  ;  "); }
+      frag.append(sp);
+    } else {
+      frag.append(el("span", { class: "avar", style: `--ac:${ahits[0].color}`,
+        title: ahits.map(a => a.expr).join("  ;  ") }, word));
+    }
     last = re.lastIndex;
   }
   frag.append(document.createTextNode(text.slice(last)));
   return frag;
+}
+
+// click a variable in the decompilation: flip symbolic/fixed or add a constraint on it
+function openVarMenu(info0, ev) {
+  $("#varMenu")?.remove();
+  const a = (A.config.args || [])[info0.idx]; if (!a) return;
+  const info = { name: a.name || ("arg" + info0.idx), idx: info0.idx, mode: a.mode, value: a.value, size: a.size, signed: a.signed };
+  const m = el("div", { class: "popmenu vmenu", id: "varMenu" });
+  const sym = a.mode !== "concrete";
+  m.append(el("div", { class: "vmhead" }, el("b", {}, info.name),
+    el("span", { class: "faint" }, sym ? "symbolic · free to search" : "fixed = " + fmtArgVal(info))));
+  // symbolic / fixed toggle
+  const seg = el("div", { class: "seg", style: "margin:2px 0 8px" },
+    el("div", { class: "segbtn" + (sym ? " on" : ""), onclick: () => { a.mode = "symbolic"; afterVarChange(); } }, "symbolic"),
+    el("div", { class: "segbtn" + (!sym ? " on" : ""), onclick: () => { a.mode = "concrete"; afterVarChange(); } }, "fixed"));
+  m.append(seg);
+  if (!sym) {
+    const vi = el("input", { value: a.value ?? 0, placeholder: "value", style: "width:100%;box-sizing:border-box;margin-bottom:8px",
+      oninput: e => { a.value = parseIntLoose(e.target.value); scheduleSave(); scheduleAssumeRefresh(); } });
+    m.append(el("div", { class: "vmlbl" }, "fixed value"), vi);
+  }
+  // add a constraint referencing this variable
+  m.append(el("div", { class: "vmlbl" }, "constrain " + info.name));
+  const ci = el("input", { placeholder: info.name + " > 0", style: "width:100%;box-sizing:border-box" });
+  const addC = () => { const v = ci.value.trim(); if (!v) return; A.config.assumptions.push(v); m.remove(); renderRight(); scheduleSave(); refreshAssumptionViews(); toast("added assumption: " + v); };
+  ci.addEventListener("keydown", e => { if (e.key === "Enter") addC(); });
+  m.append(ci);
+  const quick = el("div", { class: "row", style: "gap:5px;margin-top:6px;flex-wrap:wrap" });
+  for (const q of ["> 0", "== 0", "!= 0", "< 0"]) quick.append(el("button", { class: "tiny ghost", onclick: () => { ci.value = info.name + " " + q; } }, info.name + " " + q));
+  m.append(quick);
+  m.append(el("div", { class: "row", style: "justify-content:flex-end;margin-top:8px;gap:6px" },
+    el("button", { class: "tiny ghost", onclick: () => m.remove() }, "Cancel"),
+    el("button", { class: "tiny primary", onclick: addC }, "Add constraint")));
+
+  function afterVarChange() { scheduleSave(); A._vars = null; renderRight(); refreshAssumptionViews(); openVarMenu(info, ev); }
+
+  document.body.append(m);
+  const x = ev ? ev.clientX : 200, y = ev ? ev.clientY : 200;
+  m.style.left = Math.min(x, window.innerWidth - m.offsetWidth - 10) + "px";
+  m.style.top = Math.min(y + 8, window.innerHeight - m.offsetHeight - 10) + "px";
+  setTimeout(() => ci.focus(), 0);
+  const close = (e) => { if (!m.contains(e.target) && !e.target.classList?.contains("dvar")) { m.remove(); document.removeEventListener("mousedown", close); } };
+  setTimeout(() => document.addEventListener("mousedown", close), 0);
 }
 function refreshAssumptionViews() {
   A._assume = assumeModel();
