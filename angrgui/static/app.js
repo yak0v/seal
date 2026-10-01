@@ -348,8 +348,10 @@ function sectionState() {
 
   A.config.args.forEach((a, i) => {
     const nameI = el("input", { class: "name", value: a.name || ("arg" + i), oninput: e => { a.name = e.target.value; scheduleSave(); } });
-    const modeS = el("select", { onchange: e => { a.mode = e.target.value; renderRight(); scheduleSave(); } });
-    ["symbolic", "concrete"].forEach(m => modeS.append(el("option", { value: m, selected: a.mode === m ? "" : null }, m)));
+    const setMode = m => { a.mode = m; renderRight(); scheduleSave(); };
+    const modeS = el("div", { class: "seg" },
+      el("div", { class: "segbtn" + (a.mode !== "concrete" ? " on" : ""), onclick: () => setMode("symbolic") }, "sym"),
+      el("div", { class: "segbtn" + (a.mode === "concrete" ? " on" : ""), onclick: () => setMode("concrete") }, "fixed"));
     const sizeS = el("select", { onchange: e => { a.size = +e.target.value; scheduleSave(); } });
     [1, 2, 4, 8].forEach(sz => sizeS.append(el("option", { value: sz, selected: a.size === sz ? "" : null }, sz + "B")));
     let last;
