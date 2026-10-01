@@ -94,15 +94,19 @@ def _signbit_of(e):
 
 
 def _sext_concat(e):
-    """Concat(b, b, ..., X[hi:lo]) with every b == X[hi:hi]  ->  (X[hi:lo], total bits)."""
+    """A sign-extension spelled out as Concat(sign_bit, ..., sign_bit, V): every
+    leading arg is V's own top (sign) bit, repeated. Returns V (the value being
+    sign-extended) or None. V may be an Extract (X[hi:lo], sign bit X[hi:hi]) or
+    any other value (sign bit V[top:top], e.g. a 32-bit add sign-extended to 64)."""
     if e.op != "Concat" or len(e.args) < 2:
         return None
     last = e.args[-1]
-    if last.op != "Extract":
-        return None
-    hi = last.args[0]
+    if last.op == "Extract":
+        inner, signpos = last.args[2], last.args[0]
+    else:
+        inner, signpos = last, last.size() - 1
     for b in e.args[:-1]:
-        if not (b.op == "Extract" and b.args[0] == hi and b.args[1] == hi and b.args[2] is last.args[2]):
+        if not (b.op == "Extract" and b.args[0] == signpos and b.args[1] == signpos and b.args[2] is inner):
             return None
     return last
 
@@ -163,7 +167,7 @@ class Printer:
         if op == "Concat":
             last = _sext_concat(e)
             if last is not None:
-                return f"s{e.size()}({self.extract(last)})", True
+                return f"s{e.size()}({self.p(last)[0]})", True
             parts = list(e.args)
             if len(parts) >= 2 and parts[-1].op == "BVV" and parts[-1].args[0] == 0:
                 shift = parts.pop().size()          # Concat(x, 0#k)  ==  x << k
