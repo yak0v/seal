@@ -460,7 +460,18 @@ def _addr(x) -> int:
     if isinstance(x, int):
         return x
     s = str(x).strip()
-    return int(s, 16) if s.lower().startswith("0x") else int(s)
+    if s.lower().startswith("0x"):
+        return int(s, 16)
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    # resolve a function name (angr's or IDA's), as the tool schemas promise
+    if S.binary is not None:
+        for f in functions()["functions"]:
+            if s in (f.get("name"), f.get("ida_name")):
+                return f["addr"]
+    raise HTTPException(400, f"not an address or known function name: {s!r}")
 
 
 def _mcp_functions(query=None, limit: int = 200):
@@ -629,6 +640,162 @@ def _mcp_load_binary(path):
     return _mcp_status_payload()
 
 
+def _mcp_list_files(directory=None):
+    return browse(directory or "")
+
+
+def _mcp_cancel_run(run_id):
+    return run_cancel(run_id)
+
+
+def _mcp_ida_connect(url=None, host_header=None):
+    return ida_connect(IdaConnectReq(url=url or DEFAULT_URL, host_header=host_header))
+
+
+def _mcp_ida_disconnect():
+    return ida_disconnect()
+
+
+def _mcp_ida_refresh():
+    return ida_refresh()
+
+
+def _mcp_remove_assumption(addr, index=None, expr=None):
+    _need_binary()
+    a = _addr(addr)
+    cfg = S.workspace.get_function(a)
+    sc = cfg["scenarios"][cfg["active"]]
+    asm = sc.get("assumptions", [])
+    if expr is not None:
+        sc["assumptions"] = [x for x in asm if x != expr]
+    elif index is not None and 0 <= int(index) < len(asm):
+        asm.pop(int(index))
+    else:
+        raise HTTPException(400, "give an assumption index or exact expr to remove")
+    _store_config(a, cfg, source="agent")
+    return _mcp_get_function(a)["config"]
+
+
+def _mcp_remove_check(addr, check):
+    _need_binary()
+    a = _addr(addr)
+    cfg = S.workspace.get_function(a)
+    checks = cfg.get("checks", [])
+    idx = None
+    try:                                              # by index
+        i = int(check)
+        if 0 <= i < len(checks):
+            idx = i
+    except (TypeError, ValueError):
+        pass
+    if idx is None:                                   # by id or name
+        idx = next((i for i, c in enumerate(checks) if c.get("id") == check or c.get("name") == check), None)
+    if idx is None:
+        raise HTTPException(404, f"no check {check!r}; have {[c.get('name') or c.get('id') for c in checks]}")
+    checks.pop(idx)
+    _store_config(a, cfg, source="agent")
+    return _mcp_get_function(a)["config"]
+
+
+def _mcp_export_scenario(addr):
+    """The active scenario's setup, shared checks, and latest run — the same bundle
+    the GUI's Export produces, for the agent to keep or report."""
+    _need_binary()
+    a = _addr(addr)
+    flat = Workspace.flatten(S.workspace.get_function(a))
+    fn = next((f for f in S.binary.function_list() if f["addr"] == a), None)
+    run = None
+    rid = S.last_run.get(a)
+    if rid and rid in S.runs:
+        snap = S.runs[rid].snapshot()
+        run = {"id": rid, "status": snap["status"], "findings": snap["hits"],
+               "paths": [{"id": n["id"], "parent": n["parent"], "cond": n["cond"],
+                          "end": (n["end"] or {}).get("reason"), "hits": n["hits"]} for n in snap["tree"]]}
+    return {
+        "binary": S.binary.info(),
+        "function": {"addr": hex(a), "name": fn and (fn.get("ida_name") or fn["name"])},
+        "scenario_name": flat["scenarios"][flat["active"]],
+        "scenario": {k: flat.get(k) for k in ("args", "buffers", "assumptions", "stdin", "files", "limits")},
+        "checks": flat.get("checks", []),
+        "run": run,
+    }
+
+
+def _mcp_guide():
+    return {"guide": GUIDE}
+
+
+GUIDE = r"""# angr bug hunter — guide for agents
+
+## What this tool does (plain terms)
+It runs ONE function with its inputs left UNKNOWN ("symbolic") and asks a solver
+questions like: "can execution reach address X?", "can this add overflow?", "can
+this write land outside a buffer?". For every YES it returns a CONCRETE set of
+inputs (a "witness") that makes it happen. You do not write exploits or guess
+inputs — you declare what is unknown, declare what to look for, then read back the
+exact inputs the solver found. A human watches the same session live in a GUI.
+
+## The loop (do these in order)
+1. get_status                              — is a binary loaded? is IDA connected?
+   (load_binary(path) yourself if needed; list_files(dir) to find a path.)
+2. list_functions(query)                   — pick a function; note its "addr".
+3. get_function(addr)                       — see its setup. Arguments are symbolic by default.
+4. decompile(addr) or disassemble(addr)     — read the code to decide what to check.
+5. configure / add_assumption / add_check   — set up inputs and what to look for.
+6. run(addr) -> {"run_id": ...}             — starts exploring in the background.
+7. get_run(run_id)                          — POLL until status is "done" (or "error"); read findings.
+
+## Worked example — find the input that reaches a "win" block
+list_functions -> {"addr":"0x400666","name":"main"}; decompile shows it prints
+"Congrats!" at 0x400743 only for the right input.
+
+  add_check({"addr":"0x400666","check":{"kind":"reach","addr":"0x400743"}})
+  run({"addr":"0x400666"})                 -> {"run_id":"ab12..."}
+  get_run({"run_id":"ab12..."})            # repeat until status=="done"
+  -> {"status":"done",
+      "findings":[{"kind":"reach","addr":4196675,"message":"reached 0x400743",
+                   "witness":{"arg0":{"hex":"0x5","s":5}, ".password":"IW{...}"}}]}
+  The "witness" is the answer: those inputs drive execution to 0x400743.
+
+## Declaring inputs (configure patch, or add_assumption)
+- Arguments are symbolic by default. Make one FIXED: configure {"args":[{"name":"n","mode":"concrete","value":16,"size":4}]}.
+- Floating-point param: add "float":true to the arg (required for float checks).
+- Pointer to a symbolic buffer: {"buffers":[{"arg":"buf","size":64}]}.
+- Symbolic stdin:  {"stdin":{"mode":"symbolic","size":32}}.
+- Symbolic file the program reads: {"files":[{"name":".password","size":20}]}.
+- Constrain inputs: add_assumption(addr, "arg0 s> 0").  Limits: configure {"limits":{"steps":300,"seconds":60,"skip_calls":true}}.
+
+## Checks — add_check(addr, check). ADD AT LEAST ONE before run (run errors otherwise).
+- reach          {"kind":"reach","addr":"0x.."}           any path that gets here
+- avoid          {"kind":"avoid","addr":"0x.."}           flag paths that hit a bad address
+- assert         {"kind":"assert","expr":"total < 0x1000","at_return":true}   an invariant that must hold
+- int_overflow   {"kind":"int_overflow","signed":"either|signed|unsigned"}    add/sub/mul that wraps
+- narrowing_cast {"kind":"narrowing_cast"}                 value truncated to a smaller int, losing data
+- float_anomaly  {"kind":"float_anomaly"}                  result can be NaN or +/-Inf
+- oob_write      {"kind":"oob_write","base":"a1","size":16}  a write outside [base, base+size)
+Add "addr":"0x.." to any of the last four to check one instruction; omit it to scan the whole function.
+
+## Expression language (used by assumptions and assert "expr")
+names: argument names, a1../arg0.. (parameters), registers (rdi, eax), ret (return value)
+compare: == != < <= > >=  (unsigned). Prefix s for signed: s< s<= s> s>=
+arith/bitwise: + - * / % & | ^ ~ << >>   (s>> arithmetic shift, s/ s% signed)
+widths: u8/u16/u32/u64 (low bits, unsigned), s8/s16/s32/s64 (sign-extend). memory: mem(addr, size)
+examples:  "a1 & 0xff == 0x5a"    "u32(x) + 8 < u32(x)"    "ret s>= 0"
+
+## Scenarios (optional)
+A function can have several scenarios — different ways it is reached, each with its
+own initial state; the checks are SHARED. configure/add_assumption/run act on the
+ACTIVE scenario. Tools: add_scenario(name,duplicate), select_scenario, rename_scenario, delete_scenario.
+
+## Gotchas
+- Addresses in: hex string "0x400743" or a function name. Addresses out (in findings): integers.
+- run is ASYNC — always poll get_run until status is "done" or "error".
+- A witness maps input name -> value: {"hex","s"} for a number, a byte string for stdin/files. That IS the triggering input.
+- Found nothing? Widen limits, or check your assumptions aren't over-constraining. remove_assumption / remove_check undo mistakes.
+- decompile needs IDA (get_status.ida.connected); else use disassemble. ida_connect(url) connects.
+- Call get_guide any time to reread this.
+"""
+
 _A = {"addr": {"type": "string", "description": "function address, e.g. \"0x400650\", or name"}}
 TOOL_DEFS = [
     {"name": "get_status", "description": "What binary is loaded and whether IDA is connected.",
@@ -669,6 +836,27 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {**_A, "scenario": {"type": "string"}, "name": {"type": "string"}}, "required": ["addr", "scenario", "name"]}},
     {"name": "delete_scenario", "description": "Delete a scenario (by name or index). A function keeps at least one.",
      "inputSchema": {"type": "object", "properties": {**_A, "scenario": {"type": "string"}}, "required": ["addr", "scenario"]}},
+    {"name": "get_guide", "description": "A full how-to for this tool: what it does, the step-by-step loop, a worked "
+     "example, the expression language, every check kind, and gotchas. Read this first if unsure.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "list_files", "description": "List a directory (to find a binary to load_binary). ELF files are flagged.",
+     "inputSchema": {"type": "object", "properties": {"directory": {"type": "string"}}}},
+    {"name": "cancel_run", "description": "Stop a run that is still exploring.",
+     "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
+    {"name": "remove_assumption", "description": "Remove one assumption from the active scenario, by index or exact expr.",
+     "inputSchema": {"type": "object", "properties": {**_A, "index": {"type": "integer"}, "expr": {"type": "string"}}, "required": ["addr"]}},
+    {"name": "remove_check", "description": "Remove one shared check, by id, name, or index.",
+     "inputSchema": {"type": "object", "properties": {**_A, "check": {"type": "string", "description": "id, name, or index"}}, "required": ["addr", "check"]}},
+    {"name": "export_scenario", "description": "Bundle the active scenario's setup, the shared checks, and the latest run's "
+     "findings + paths — the same data the GUI's Export produces.",
+     "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
+    {"name": "ida_connect", "description": "Connect to an IDA MCP server for real names + Hex-Rays decompilation. "
+     "url defaults to the configured one; host_header is auto-set to loopback for forwarded servers.",
+     "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "host_header": {"type": "string"}}}},
+    {"name": "ida_disconnect", "description": "Disconnect from IDA.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "ida_refresh", "description": "Re-pull names + decompilation from IDA (after you changed the IDB).",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 # documented check kinds (what add_check accepts); kept in sync with checks.py
@@ -710,6 +898,15 @@ _MCP_TOOLS = {
     "select_scenario": lambda a: _mcp_select_scenario(a["addr"], a["scenario"]),
     "rename_scenario": lambda a: _mcp_rename_scenario(a["addr"], a["scenario"], a["name"]),
     "delete_scenario": lambda a: _mcp_delete_scenario(a["addr"], a["scenario"]),
+    "get_guide": lambda a: _mcp_guide(),
+    "list_files": lambda a: _mcp_list_files(a.get("directory")),
+    "cancel_run": lambda a: _mcp_cancel_run(a["run_id"]),
+    "remove_assumption": lambda a: _mcp_remove_assumption(a["addr"], a.get("index"), a.get("expr")),
+    "remove_check": lambda a: _mcp_remove_check(a["addr"], a["check"]),
+    "export_scenario": lambda a: _mcp_export_scenario(a["addr"]),
+    "ida_connect": lambda a: _mcp_ida_connect(a.get("url"), a.get("host_header")),
+    "ida_disconnect": lambda a: _mcp_ida_disconnect(),
+    "ida_refresh": lambda a: _mcp_ida_refresh(),
 }
 
 
@@ -727,9 +924,17 @@ def _handle_mcp(msg: dict):
         return {"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": MCP_PROTOCOL, "capabilities": {"tools": {}},
             "serverInfo": {"name": "angr-bug-hunter", "version": "0.1"},
-            "instructions": "Drive angr symbolic execution: list_functions, get_function, "
-                            "add_assumption/add_check/configure, run, get_run. A human watches "
-                            "the same session in the GUI."}}
+            "instructions": (
+                "This server drives angr symbolic execution: it runs ONE function with "
+                "its inputs left symbolic (unknown) and finds CONCRETE inputs that reach a "
+                "location or trigger a bug. You declare what's unknown and what to look for; "
+                "it returns the exact inputs ('witness') that make it happen. A human watches "
+                "live in a GUI.\n"
+                "FIRST: call get_guide for the full how-to (workflow, worked example, "
+                "expression language, all check kinds, gotchas).\n"
+                "Loop: get_status -> list_functions -> get_function -> (configure/add_assumption/"
+                "add_check) -> run -> poll get_run until status=='done'. You MUST add at least one "
+                "check before run. run is async. Addresses go in as hex strings or names.")}}
     if method and method.startswith("notifications/"):
         return None
     if method == "tools/list":
@@ -782,6 +987,7 @@ def agent_docs(request: Request):
         "transport": "MCP Streamable HTTP (POST JSON-RPC; responses are JSON or SSE)",
         "tools": TOOL_DEFS,
         "check_kinds": CHECK_KINDS,
+        "guide": GUIDE,
     }
 
 

@@ -1660,6 +1660,13 @@ async function openDocsModal() {
   body.append(p("Manage them with ", code("add_scenario"), " (optionally ", code("duplicate"), " the active one; the new scenario becomes active), ",
     code("select_scenario"), ", ", code("rename_scenario"), " and ", code("delete_scenario"), " — each takes a scenario name or index."));
 
+  if (d.guide) {
+    body.append(h("7 · The agent's own guide"));
+    body.append(p("An agent calls ", code("get_guide"), " (or reads the handshake ", code("instructions"),
+      ") to get this self-contained how-to — the same text, with a worked example:"));
+    body.append(el("pre", { class: "dcode", style: "white-space:pre-wrap;max-height:320px;overflow:auto;color:var(--ink)" }, d.guide));
+  }
+
   const m = modal("Clanker documentation", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
   m.querySelector(".modal").classList.add("docs");
   $("#modalHost").append(m);
