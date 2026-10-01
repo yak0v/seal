@@ -41,7 +41,8 @@ const A = {
   functions: [],
   fn: null,          // selected function {addr,name,...}
   detail: null,      // /api/function response
-  config: null,      // editable per-function config
+  func: null,        // structured per-function setup {checks, scenarios[], active}
+  config: null,      // live view onto the active scenario (+ shared checks)
   run: null,         // {id, snapshot}
   pollTimer: null,
   selectedHit: null,
@@ -139,7 +140,7 @@ async function openBrowser(startPath) {
     try {
       await jpost("/api/load", { path });
       clearInterval(poll); busy.remove();
-      A.fn = A.detail = A.config = A.run = null;
+      A.fn = A.detail = A.config = A.func = A.run = null;
       await refreshState();
       toast("Loaded " + path.split("/").pop());
     } catch (e) { clearInterval(poll); busy.remove(); toast("Load failed: " + e.message, true); }
@@ -198,7 +199,7 @@ async function selectFunction(f) {
   $("#pane-code").innerHTML = '<div class="empty">Loading…</div>';
   const d = await api("/api/function/" + f.addr);
   A.detail = d;
-  A.config = normalizeConfig(d.config, d);
+  A.func = normalizeFunc(d.config); bindConfig(); A._vars = null;
   // re-attach the most recent run for this function (survives a page reload)
   if (d.last_run) {
     try {
@@ -213,25 +214,137 @@ async function selectFunction(f) {
   renderDock();                                               // graph + paths, always visible
 }
 
-function normalizeConfig(cfg, d) {
+// The function's setup is structured as shared `checks` plus a list of
+// `scenarios` (each one a different way of reaching the function, with its own
+// initial state). A.func holds the structure; A.config is a live view onto the
+// active scenario, with the shared checks array exposed as A.config.checks so
+// all the existing per-field editors keep working unchanged.
+const SCEN_FIELDS = ["name", "args", "buffers", "assumptions", "stdin", "files", "limits"];
+function normalizeScenario(s, i) {
+  s = s || {};
+  s.name = s.name || ("Scenario " + (i + 1));
+  s.args = s.args || [];
+  s.buffers = s.buffers || [];
+  s.assumptions = s.assumptions || [];
+  s.stdin = s.stdin || null;
+  s.files = s.files || [];
+  s.limits = Object.assign({ steps: 150, active: 300, seconds: 30, loop_bound: 12, find: null, avoid: [] }, s.limits || {});
+  return s;
+}
+function normalizeFunc(cfg) {
   cfg = cfg || {};
-  cfg.args = cfg.args || [];
-  cfg.buffers = cfg.buffers || [];
-  cfg.assumptions = cfg.assumptions || [];
+  if (!cfg.scenarios || !cfg.scenarios.length) {       // legacy flat -> one scenario
+    cfg = { checks: cfg.checks || [], active: 0, scenarios: [{
+      name: "Default", args: cfg.args, buffers: cfg.buffers, assumptions: cfg.assumptions,
+      stdin: cfg.stdin, files: cfg.files, limits: cfg.limits }] };
+  }
   cfg.checks = cfg.checks || [];
-  cfg.stdin = cfg.stdin || null;
-  cfg.files = cfg.files || [];
-  cfg.limits = Object.assign({ steps: 150, active: 300, seconds: 30, loop_bound: 12, find: null, avoid: [] }, cfg.limits || {});
+  cfg.scenarios.forEach((s, i) => normalizeScenario(s, i));
+  cfg.active = Math.max(0, Math.min(cfg.active || 0, cfg.scenarios.length - 1));
   return cfg;
+}
+function bindConfig() {                                 // expose active scenario (+ shared checks) as A.config
+  const sc = A.func.scenarios[A.func.active];
+  sc.checks = A.func.checks;
+  A.config = sc;
+}
+function scenarioCopy(s) {                              // deep-copy only the initial-state fields (no checks)
+  const o = {};
+  for (const k of SCEN_FIELDS) o[k] = JSON.parse(JSON.stringify(k === "name" ? s[k] : (s[k] ?? null)));
+  return o;
+}
+function structPayload() {
+  return { checks: A.func.checks, active: A.func.active,
+           scenarios: A.func.scenarios.map(scenarioCopy) };
+}
+
+function switchScenario(i) {
+  if (i === A.func.active) return;
+  A.func.active = Math.max(0, Math.min(i, A.func.scenarios.length - 1));
+  bindConfig(); A._vars = null;
+  renderRight(); refreshAssumptionViews(); saveConfig();
+  toast("scenario: " + A.config.name);
+}
+function addScenario(duplicate) {
+  const base = duplicate ? scenarioCopy(A.config) : normalizeScenario({}, A.func.scenarios.length);
+  base.name = duplicate ? (A.config.name + " copy") : ("Scenario " + (A.func.scenarios.length + 1));
+  A.func.scenarios.push(base);
+  switchScenario(A.func.scenarios.length - 1);
+}
+function deleteScenario(i) {
+  if (A.func.scenarios.length <= 1) { toast("a function needs at least one scenario", true); return; }
+  A.func.scenarios.splice(i, 1);
+  A.func.active = Math.min(A.func.active, A.func.scenarios.length - 1);
+  bindConfig(); A._vars = null; renderRight(); refreshAssumptionViews(); saveConfig();
+}
+function renameScenario(i, name) {
+  A.func.scenarios[i].name = name.trim() || A.func.scenarios[i].name;
+  saveConfig(); renderRight();
+  if ($("#pane-decomp") && $("#pane-decomp").classList.contains("sel")) renderDecomp();
 }
 
 async function saveConfig() {
   if (!A.fn) return;
-  try { await jput(`/api/function/${A.fn.addr}/config`, A.config); }
+  try { await jput(`/api/function/${A.fn.addr}/config`, structPayload()); }
   catch (e) { toast("save failed: " + e.message, true); }
   if ($("#pane-script").classList.contains("sel")) renderScript();
   const f = A.functions.find(x => x.addr === A.fn.addr);
-  if (f) { f.check_count = A.config.checks.length; f.configured = true; renderFunctions(); }
+  if (f) { f.check_count = A.func.checks.length; f.configured = true; f.scenario_count = A.func.scenarios.length; renderFunctions(); }
+}
+
+// ------------------------------------------------------------------ scenarios UI
+function scenarioChip(cls) {                            // a clickable pill: active scenario + switcher
+  const n = A.func ? A.func.scenarios.length : 1;
+  return el("button", { class: "scenchip " + (cls || ""), title: "switch or manage scenarios",
+    onclick: (e) => { e.stopPropagation(); openScenarioMenu(e.currentTarget); } },
+    el("span", { class: "scdot" }), A.config.name,
+    n > 1 ? el("span", { class: "sccount" }, n) : null, el("span", { class: "sccar" }, "▾"));
+}
+function scenarioTitle() {
+  const frag = document.createDocumentFragment();
+  frag.append(el("span", { class: "rfn" }, A.fn.ida_name || A.fn.name), scenarioChip("intitle"));
+  return frag;
+}
+function openScenarioMenu(anchor) {
+  if ($("#scenMenu")) { $("#scenMenu").remove(); return; }
+  const m = el("div", { class: "popmenu scenmenu", id: "scenMenu" });
+  m.append(el("div", { class: "vmlbl", style: "padding:2px 6px 4px" }, "scenarios of " + (A.fn.ida_name || A.fn.name)));
+  A.func.scenarios.forEach((s, i) => {
+    const row = el("div", { class: "popitem scrow" + (i === A.func.active ? " on" : "") },
+      el("span", { class: "scdot" }),
+      el("span", { class: "grow scname", title: "switch to this scenario", onclick: () => { m.remove(); switchScenario(i); } }, s.name),
+      i === A.func.active ? el("span", { class: "chk" }, "✓") : null,
+      el("button", { class: "tiny ghost scact", title: "rename", onclick: (e) => { e.stopPropagation(); startRename(row, i); } }, "✎"),
+      A.func.scenarios.length > 1 ? el("button", { class: "tiny ghost scact", title: "delete", onclick: (e) => { e.stopPropagation(); m.remove(); deleteScenario(i); } }, "✕") : null);
+    m.append(row);
+  });
+  m.append(el("div", { class: "popsep" }));
+  m.append(el("div", { class: "popitem add", onclick: () => { m.remove(); addScenario(false); } }, "+ New scenario"));
+  m.append(el("div", { class: "popitem add", onclick: () => { m.remove(); addScenario(true); } }, "⎘ Duplicate current"));
+  document.body.append(m);
+  const r = anchor.getBoundingClientRect();
+  m.style.top = Math.min(r.bottom + 6, window.innerHeight - m.offsetHeight - 10) + "px";
+  m.style.left = Math.max(8, Math.min(r.left, window.innerWidth - m.offsetWidth - 10)) + "px";
+  const close = (e) => { if (!m.contains(e.target) && e.target !== anchor && !anchor.contains(e.target)) { m.remove(); document.removeEventListener("mousedown", close); } };
+  setTimeout(() => document.addEventListener("mousedown", close), 0);
+}
+function startRename(row, i) {
+  const span = row.querySelector(".scname");
+  const inp = el("input", { class: "screname", value: A.func.scenarios[i].name });
+  span.replaceWith(inp); inp.focus(); inp.select();
+  let done = false;
+  const finish = (save) => { if (done) return; done = true; if (save) renameScenario(i, inp.value); $("#scenMenu") && $("#scenMenu").remove(); };
+  inp.addEventListener("keydown", e => { if (e.key === "Enter") finish(true); if (e.key === "Escape") finish(false); });
+  inp.addEventListener("blur", () => finish(true));
+}
+function scenarioBar() {                                // sits on top of the Initial state section
+  return el("div", { class: "scenbar" },
+    el("span", { class: "scenlbl" }, "scenario"),
+    el("button", { class: "scensel", title: "switch or manage scenarios", onclick: (e) => openScenarioMenu(e.currentTarget) },
+      el("span", { class: "scdot" }), el("span", { class: "grow" }, A.config.name),
+      A.func.scenarios.length > 1 ? el("span", { class: "sccount" }, A.func.scenarios.length) : null,
+      el("span", { class: "sccar" }, "▾")),
+    el("button", { class: "tiny ghost", title: "add a new scenario", onclick: () => addScenario(false) }, "+"));
 }
 
 function selectTab(name) {
@@ -336,7 +449,7 @@ function addReachCheck(addr, kind) {
 
 // ==================================================================== right panel
 function renderRight() {
-  $("#rTitle").textContent = A.fn ? (A.fn.ida_name || A.fn.name) : "Setup";
+  const t = $("#rTitle"); t.replaceChildren(A.fn ? scenarioTitle() : document.createTextNode("Setup"));
   const body = $("#rBody"); body.replaceChildren();
   if (!A.fn) { body.append(el("div", { class: "empty" }, "Pick a function.")); return; }
 
@@ -371,6 +484,7 @@ function sectionState() {
   s.append(el("h3", {}, "Initial state", el("span", { class: "grow" }),
     el("button", { class: "tiny ghost", title: "show this setup as angr code", onclick: () => showInScript("= initial state") }, "</> angr")));
   const b = el("div", { class: "body" });
+  b.append(scenarioBar());                               // pick which scenario's initial state you're editing
 
   A.config.args.forEach((a, i) => {
     const nameI = el("input", { class: "name", value: a.name || ("arg" + i), oninput: e => { a.name = e.target.value; scheduleSave(); } });
@@ -1159,6 +1273,7 @@ async function renderDecomp(force) {
   const bar = el("div", { class: "decompbar" },
     el("span", {}, "IDA · "),
     el("span", { class: "fn" }, idaFn + (d.func_start != null ? "  " + hx64(d.func_start) : "")),
+    scenarioChip("inbar"),
     el("span", { class: "grow" }),
     el("span", { class: "varlegend", title: "argument variables are marked in the code; click one to constrain it or flip it between symbolic and fixed" },
       el("i", { class: "sym" }, "symbolic"), el("i", { class: "set" }, "fixed")),
@@ -1380,7 +1495,7 @@ async function onAgentConfig(addr) {
 async function reloadDetail() {
   try {
     const d = await api("/api/function/" + A.fn.addr);
-    A.detail = d; A.config = normalizeConfig(d.config, d);
+    A.detail = d; A.func = normalizeFunc(d.config); bindConfig(); A._vars = null;
     renderRight(); refreshAssumptionViews();
   } catch (e) {}
 }

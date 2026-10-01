@@ -129,13 +129,26 @@ class RunReq(BaseModel):
 
 
 class ConfigReq(BaseModel):
+    # new (scenarios) shape
+    checks: list = []
+    scenarios: list | None = None
+    active: int = 0
+    # legacy flat initial state (older clients / direct callers)
     args: list = []
     buffers: list = []
     assumptions: list = []
     stdin: dict | None = None
     files: list = []
-    checks: list = []
     limits: dict = {}
+
+    def to_struct(self) -> dict:
+        d = self.model_dump()
+        if d.get("scenarios"):
+            return {"checks": d["checks"], "scenarios": d["scenarios"], "active": d.get("active", 0)}
+        sc = {"name": "Default"}
+        for k in ("args", "buffers", "assumptions", "stdin", "files", "limits"):
+            sc[k] = d[k]
+        return {"checks": d["checks"], "scenarios": [sc], "active": 0}
 
 
 # --------------------------------------------------------------------------- helpers
@@ -223,9 +236,12 @@ def functions():
     fns = b.function_list()
     saved = S.workspace.all()["functions"] if S.workspace else {}
     for f in fns:
-        cfg = saved.get(str(f["addr"]))
-        f["configured"] = bool(cfg and (cfg.get("checks") or cfg.get("assumptions")))
+        raw = saved.get(str(f["addr"]))
+        cfg = Workspace._migrate(raw) if raw else None
+        f["configured"] = bool(cfg and (cfg.get("checks") or
+                                        any(s.get("assumptions") for s in cfg.get("scenarios", []))))
         f["check_count"] = len(cfg.get("checks", [])) if cfg else 0
+        f["scenario_count"] = len(cfg.get("scenarios", [])) if cfg else 1
     _apply_ida_names(fns)
     return {"functions": fns}
 
@@ -258,10 +274,11 @@ def function(addr: int):
     disasm = b.disassemble(addr)
     dwarf = [v.to_json(b.word_bytes) for v in b.dwarf_vars(addr)]
     cfg = S.workspace.get_function(addr) if S.workspace else Workspace._default_func()
-    # seed default args from DWARF / calling convention if the user hasn't set any
-    if not cfg.get("args"):
+    # seed default args from DWARF / calling convention into the active scenario
+    sc = cfg["scenarios"][cfg["active"]]
+    if not sc.get("args"):
         for a in [f for f in b.function_list() if f["addr"] == addr][0]["args"]:
-            cfg.setdefault("args", []).append({
+            sc.setdefault("args", []).append({
                 "name": a["name"], "mode": "symbolic",
                 "size": a["size"] or b.word_bytes, "signed": a.get("signed", True),
             })
@@ -283,19 +300,21 @@ def save_config(addr: int, req: ConfigReq):
     _need_binary()
     if S.workspace is None:
         raise HTTPException(400, "no workspace")
-    _store_config(addr, req.model_dump())
+    _store_config(addr, req.to_struct())
     return {"ok": True}
 
 
 def _store_config(addr: int, cfg: dict, source: str = "gui"):
+    cfg = Workspace._migrate(cfg)
     prev = S.workspace.get_function(addr)
     S.workspace.set_function(addr, cfg)
-    # a concise activity line describing what changed
-    na, nc = len(cfg.get("assumptions", [])), len(cfg.get("checks", []))
+    # a concise activity line describing what changed (for the active scenario)
+    sc = cfg["scenarios"][cfg["active"]]
+    na, nc = len(sc.get("assumptions", [])), len(cfg.get("checks", []))
     if source != "gui":
         BUS.publish("config", f"{source} configured {_fname(addr)}: "
                     f"{na} assumption(s), {nc} check(s)", func=addr,
-                    assumptions=cfg.get("assumptions", []),
+                    assumptions=sc.get("assumptions", []),
                     checks=[c.get("name") or c.get("kind") for c in cfg.get("checks", [])])
 
 
@@ -447,7 +466,10 @@ def _mcp_functions(query=None, limit: int = 200):
 def _mcp_get_function(addr):
     a = _addr(addr)
     d = function(a)
-    return {"addr": hex(a), "name": d["disasm"]["name"], "config": d["config"],
+    # agents see the flattened active scenario (initial state + shared checks),
+    # plus the list of scenario names and which one is active.
+    return {"addr": hex(a), "name": d["disasm"]["name"],
+            "config": Workspace.flatten(d["config"]),
             "has_source": bool(d["disasm"].get("source")),
             "return_heads": d["return_heads"]}
 
@@ -460,27 +482,27 @@ def _mcp_disassemble(addr):
     return {"addr": hex(_addr(addr)), "name": d["name"], "text": "\n".join(lines)}
 
 
+def _coerce_check(c, a):
+    c = dict(c)
+    if c.get("addr") is not None:                  # agents pass "0x..." strings
+        c["addr"] = _addr(c["addr"])
+    c.setdefault("id", uuid.uuid4().hex[:6])
+    c.setdefault("enabled", True)
+    c["func_addr"] = a
+    return c
+
+
 def _mcp_configure(addr, patch: dict):
+    """Patch the ACTIVE scenario's initial state; checks are shared across scenarios."""
     _need_binary()
     a = _addr(addr)
-    cfg = dict(S.workspace.get_function(a))
-    for k in ("args", "buffers", "assumptions", "stdin", "files", "checks", "limits"):
+    cfg = S.workspace.get_function(a)                   # structured
+    sc = cfg["scenarios"][cfg["active"]]
+    for k in ("args", "buffers", "assumptions", "stdin", "files", "limits"):
         if k in patch and patch[k] is not None:
-            if k == "limits":
-                cfg["limits"] = {**cfg.get("limits", {}), **patch["limits"]}
-            elif k == "checks":
-                out = []
-                for c in patch["checks"]:
-                    c = dict(c)
-                    if c.get("addr") is not None:
-                        c["addr"] = _addr(c["addr"])
-                    c.setdefault("id", uuid.uuid4().hex[:6])
-                    c.setdefault("enabled", True)
-                    c["func_addr"] = a
-                    out.append(c)
-                cfg["checks"] = out
-            else:
-                cfg[k] = patch[k]
+            sc[k] = {**sc.get("limits", {}), **patch[k]} if k == "limits" else patch[k]
+    if patch.get("checks") is not None:
+        cfg["checks"] = [_coerce_check(c, a) for c in patch["checks"]]
     _store_config(a, cfg, source="agent")
     return _mcp_get_function(a)["config"]
 
@@ -488,28 +510,23 @@ def _mcp_configure(addr, patch: dict):
 def _mcp_add(addr, *, assumption=None, check=None):
     _need_binary()
     a = _addr(addr)
-    cfg = dict(S.workspace.get_function(a))
+    cfg = S.workspace.get_function(a)
+    sc = cfg["scenarios"][cfg["active"]]
     if assumption is not None:
-        cfg["assumptions"] = list(cfg.get("assumptions", [])) + [assumption]
+        sc["assumptions"] = list(sc.get("assumptions", [])) + [assumption]
     if check is not None:
-        c = dict(check)
-        if c.get("addr") is not None:              # agents pass "0x..." strings
-            c["addr"] = _addr(c["addr"])
-        c.setdefault("id", uuid.uuid4().hex[:6])
-        c.setdefault("enabled", True)
-        c["func_addr"] = a
-        cfg["checks"] = list(cfg.get("checks", [])) + [c]
+        cfg["checks"] = list(cfg.get("checks", [])) + [_coerce_check(check, a)]
     _store_config(a, cfg, source="agent")
     return _mcp_get_function(a)["config"]
 
 
 def _mcp_run(addr):
     a = _addr(addr)
-    cfg = S.workspace.get_function(a)
-    spec = {"func_addr": a, "args": cfg.get("args", []), "buffers": cfg.get("buffers", []),
-            "assumptions": [x for x in cfg.get("assumptions", []) if x.strip()],
-            "stdin": cfg.get("stdin"), "files": cfg.get("files", []), "limits": cfg.get("limits", {}),
-            "checks": [c for c in cfg.get("checks", []) if c.get("enabled", True)]}
+    flat = Workspace.flatten(S.workspace.get_function(a))   # the active scenario
+    spec = {"func_addr": a, "args": flat.get("args") or [], "buffers": flat.get("buffers") or [],
+            "assumptions": [x for x in (flat.get("assumptions") or []) if x.strip()],
+            "stdin": flat.get("stdin"), "files": flat.get("files") or [], "limits": flat.get("limits") or {},
+            "checks": [c for c in flat.get("checks", []) if c.get("enabled", True)]}
     if not spec["checks"]:
         raise HTTPException(400, "no enabled checks on this function; add one first")
     return {"run_id": _start_run(spec, source="agent")}
