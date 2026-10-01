@@ -25,6 +25,7 @@ import threading
 import time
 import uuid
 import logging
+import urllib.parse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -379,6 +380,7 @@ def run_cancel(run_id: str):
 # --------------------------------------------------------------------------- IDA MCP
 class IdaConnectReq(BaseModel):
     url: str = DEFAULT_URL
+    host_header: str | None = None      # override Host (for a port-forwarded ida-pro-mcp)
 
 
 @app.get("/api/ida/status")
@@ -389,7 +391,17 @@ def ida_status():
 @app.post("/api/ida/connect")
 def ida_connect(req: IdaConnectReq):
     b = _need_binary()
-    sess = IdaSession(req.url)
+    # ida-pro-mcp rejects a non-loopback Host (DNS-rebind guard). When the URL is a
+    # remote/forwarded address, default the Host header to loopback so it accepts us.
+    host_header = req.host_header
+    if host_header is None:
+        try:
+            h = urllib.parse.urlparse(req.url).hostname or ""
+            if h not in ("localhost", "127.0.0.1", "::1", ""):
+                host_header = "127.0.0.1"
+        except Exception:
+            pass
+    sess = IdaSession(req.url, host_header=host_header)
     sess.client.timeout = 120           # open/analysis of a real binary can be slow
     try:
         st = sess.connect(b.path)       # official: opens by path; community: uses the open GUI

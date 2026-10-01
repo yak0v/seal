@@ -40,9 +40,13 @@ class MCPError(Exception):
 class MCPClient:
     """A minimal synchronous MCP client over Streamable HTTP (stdlib only)."""
 
-    def __init__(self, url: str, timeout: float = 30.0):
+    def __init__(self, url: str, timeout: float = 30.0, host_header: str | None = None):
         self.url = url
         self.timeout = timeout
+        # ida-pro-mcp guards against DNS rebinding by rejecting any Host header that
+        # isn't the loopback address it listens on. When we reach it through a port
+        # forward (e.g. a VM's LAN IP -> 127.0.0.1:13337), send the Host it expects.
+        self.host_header = host_header
         self.session_id: str | None = None
         self._ids = itertools.count(1)
         self._initialized = False
@@ -53,6 +57,8 @@ class MCPClient:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
+        if self.host_header:
+            h["Host"] = self.host_header
         if self._initialized:
             h["MCP-Protocol-Version"] = PROTOCOL_VERSION
         if self.session_id:
@@ -216,9 +222,9 @@ class IdaSession:
       runs IDAPython against a database it opens. Needs IDA >= 9.4.
     """
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, host_header: str | None = None):
         self.url = url
-        self.client = MCPClient(url)
+        self.client = MCPClient(url, host_header=host_header)
         self.flavor: str | None = None
         self.server: str | None = None
         self.instance_id: str | None = None   # official only
