@@ -69,7 +69,7 @@ async function init() {
   $$(".tab").forEach(t => t.addEventListener("click", () => selectTab(t.dataset.tab)));
   $("#idaBtn").addEventListener("click", openIdaModal);
   $("#actBtn").addEventListener("click", toggleActivity);
-  $("#themeBtn").addEventListener("click", cycleTheme);
+  $("#themeBtn").addEventListener("click", openThemeMenu);
   $("#followChk").addEventListener("change", e => { A.followAgent = e.target.checked; });
   $("#bottomClose").addEventListener("click", () => {
     const bp = $("#bottomPanel"); bp.classList.toggle("collapsed");
@@ -825,60 +825,43 @@ function updatePathHighlight() {
 
 function renderPathDetail(T, snap) {
   const n = T.byId[A.selNode];
-  if (!n) return el("div", { class: "empty" }, "Click a row to see the whole path: every condition on the way, what ran, and how it ended.");
+  if (!n) return el("div", { class: "empty" }, "Click a path to see its detail here.");
   const chain = T.chain(n.id);
   const leaf = !T.kids[n.id];
-  const d = el("div", { class: "pdetail" });
-  d.append(el("div", { class: "row" },
-    el("h4", { class: "grow" }, leaf ? `Path #${T.leafNo[n.id]}` : (n.parent === null ? "Function entry" : "Partial path (splits further below)")),
-    el("button", { class: "tiny ghost", onclick: () => selectPathNode(n.id) }, "✕")));
 
+  // laid out horizontally (columns) so the whole detail fits without scrolling
   const conds = chain.filter(c => c.parent !== null);
   const asm = snap.summary?.assumptions_applied || [];
-  d.append(el("div", { class: "dlabel" }, conds.length || asm.length ? "To get here the inputs must satisfy all of" : "No conditions: every run starts here"));
-  asm.forEach(a => d.append(el("div", { class: "dcond" }, el("span", { class: "cond" }, a), el("span", { class: "where" }, "your assumption"))));
-  conds.forEach(c => d.append(el("div", { class: "dcond" }, el("span", { class: "cond" }, c.cond || "?"),
-    c.decided_at?.line ? el("span", { class: "where" }, `${c.decided_at.file}:${c.decided_at.line}  ${c.decided_at.text || ""}`) : null)));
+  const colA = el("div", { class: "pcol" }, el("div", { class: "dlabel" }, "To get here, the inputs satisfy"));
+  if (!conds.length && !asm.length) colA.append(el("div", { class: "faint" }, "no conditions — every run starts here"));
+  asm.forEach(a => colA.append(el("div", { class: "dcond" }, el("span", { class: "cond" }, a), el("span", { class: "where" }, "assumption"))));
+  conds.forEach(c => colA.append(el("div", { class: "dcond" }, el("span", { class: "cond" }, c.cond || "?"),
+    c.decided_at?.line ? el("span", { class: "where" }, `${c.decided_at.file}:${c.decided_at.line} ${c.decided_at.text || ""}`) : null)));
 
-  const text = {};
-  (A.detail?.disasm?.source?.rows || []).forEach(r => { text[r.n] = r.text; });
-  const allLines = chain.flatMap(c => c.lines);
-  if (allLines.length) {
-    d.append(el("div", { class: "dlabel" }, "Source lines executed, in order"));
-    const src = el("div", { class: "dsrc" });
-    const seen = new Set();
-    allLines.forEach(ln => {
-      if (seen.has(ln)) return;
-      seen.add(ln);
-      src.append(el("div", {}, el("span", { class: "ln" }, ln), el("span", {}, (text[ln] ?? "").trim() || "(in a called function)")));
-    });
-    d.append(src);
-  }
+  const colB = el("div", { class: "pcol" });
   const calls = [...new Set(chain.flatMap(c => c.calls))];
-  if (calls.length) d.append(el("div", { class: "dlabel" }, "Calls  ",
-    el("span", { class: "mono", style: "text-transform:none;color:var(--ink);letter-spacing:0" }, calls.map(c => c + "()").join(", "))));
+  colB.append(el("div", { class: "dlabel" }, "Outcome"));
+  colB.append(el("div", { class: "dend" }, leaf
+    ? (n.end ? n.end.text + (n.end.reason === "returned" && n.ret ? ": " + n.ret : "") : (leafReason(n, snap) === "running" ? "still running" : "not finished"))
+    : "splits further below"));
+  if (calls.length) colB.append(el("div", { class: "pchip", style: "margin-top:6px" }, "calls " + calls.map(c => c + "()").join(", ")));
+  if (leaf && n.example && Object.keys(n.example).length) {
+    colB.append(el("div", { class: "dlabel", style: "margin-top:10px" }, "Example input"));
+    const tb = el("div", { class: "dex" });
+    Object.entries(n.example).forEach(([k, v]) => tb.append(el("div", {}, el("span", { class: "k" }, k), el("span", {}, fmtOne(k, v)))));
+    colB.append(tb);
+  }
 
-  if (leaf) {
-    d.append(el("div", { class: "dlabel" }, "How it ended"));
-    d.append(el("div", { class: "dend" }, n.end ? n.end.text + (n.end.reason === "returned" && n.ret ? ": " + n.ret : "")
-      : (leafReason(n, snap) === "running" ? "still running" : "not finished")));
-    if (n.example && Object.keys(n.example).length) {
-      d.append(el("div", { class: "dlabel" }, "Example input that takes this path"));
-      const tb = el("div", { class: "dex" });
-      Object.entries(n.example).forEach(([k, v]) => tb.append(el("div", {}, el("span", { class: "k" }, k), el("span", {}, fmtOne(k, v)))));
-      d.append(tb);
-    }
-  }
+  const colC = el("div", { class: "pcol" });
   const hits = chain.flatMap(c => c.hits);
-  if (hits.length) {
-    d.append(el("div", { class: "dlabel" }, "Findings on this path"));
-    hits.forEach(i => { const h = snap.hits[i]; if (h) d.append(renderHit(h, i)); });
-  }
-  d.append(el("div", { class: "row", style: "margin-top:14px;gap:6px;flex-wrap:wrap" },
-    A.ida && A.ida.connected
-      ? el("button", { class: "tiny", onclick: () => { selectTab("decomp"); } }, "Show in decompilation") : null,
+  colC.append(el("div", { class: "dlabel" }, hits.length ? "Findings on this path" : "Findings"));
+  if (!hits.length) colC.append(el("div", { class: "faint" }, "none on this path"));
+  hits.forEach(i => { const h = snap.hits[i]; if (h) colC.append(renderHit(h, i)); });
+  colC.append(el("div", { class: "row", style: "margin-top:10px;gap:6px;flex-wrap:wrap" },
+    A.ida && A.ida.connected ? el("button", { class: "tiny", onclick: () => selectTab("decomp") }, "Show in decompilation") : null,
     el("button", { class: "tiny", onclick: () => { selectTab("code"); scrollToAddr(n.blocks[0] ?? n.addr); } }, "Show in disassembly")));
-  return d;
+
+  return el("div", { class: "pdetail cols" }, el("div", { class: "pcols" }, colA, colB, colC));
 }
 
 // ---------------------------------------------------------------- value formatting
@@ -942,21 +925,41 @@ function renderDecompLines(code, into) {
   }
 }
 
-const THEMES = ["graphite", "navy", "slate", "ocean"];   // "graphite" = default (no data-theme)
+// "graphite" = default (no data-theme). bg = page colour swatch, dot = accent.
+const THEMES = [
+  { id: "graphite", name: "Graphite", bg: "#0c0e12", dot: "#46d07e" },
+  { id: "navy", name: "Navy", bg: "#0e1117", dot: "#4c9aff" },
+  { id: "slate", name: "Slate", bg: "#111318", dot: "#9a86ff" },
+  { id: "ocean", name: "Ocean", bg: "#0b1620", dot: "#2fd3c4" },
+];
+function curTheme() { try { return localStorage.getItem("theme") || "graphite"; } catch (e) { return "graphite"; } }
 function applyTheme() {
-  let t = "graphite";
-  try { t = localStorage.getItem("theme") || "graphite"; } catch (e) {}
+  const t = curTheme();
   if (t === "graphite") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", t);
   // the graph is rendered with fixed colors from CSS vars; re-draw on theme change
   const b = $("#dockGraph"); if (b && b._cfg) { delete b._cfg; renderPathGraph(); }
 }
-function cycleTheme() {
-  let t = "graphite"; try { t = localStorage.getItem("theme") || "graphite"; } catch (e) {}
-  const next = THEMES[(THEMES.indexOf(t) + 1) % THEMES.length];
-  try { localStorage.setItem("theme", next); } catch (e) {}
+function setTheme(id) {
+  try { localStorage.setItem("theme", id); } catch (e) {}
   applyTheme();
-  toast("theme: " + next);
+}
+function openThemeMenu() {
+  if ($("#themeMenu")) { $("#themeMenu").remove(); return; }
+  const cur = curTheme();
+  const btn = $("#themeBtn"), r = btn.getBoundingClientRect();
+  const m = el("div", { class: "popmenu", id: "themeMenu" });
+  THEMES.forEach(th => {
+    m.append(el("div", { class: "popitem" + (th.id === cur ? " on" : ""), onclick: () => { setTheme(th.id); m.remove(); } },
+      el("span", { class: "swatch", style: `background:${th.bg}` }, el("i", { style: `background:${th.dot}` })),
+      el("span", { class: "grow" }, th.name),
+      th.id === cur ? el("span", { class: "chk" }, "✓") : null));
+  });
+  document.body.append(m);
+  m.style.top = (r.bottom + 6) + "px";
+  m.style.left = Math.max(8, r.right - m.offsetWidth) + "px";
+  const close = (e) => { if (!m.contains(e.target) && e.target !== btn) { m.remove(); document.removeEventListener("mousedown", close); } };
+  setTimeout(() => document.addEventListener("mousedown", close), 0);
 }
 
 const PANEL_FOR = { left: "left", right: "right", dock: "dock" };

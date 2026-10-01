@@ -66,8 +66,9 @@ select{font-family:var(--sans)}
 #top .brand{font-weight:700;letter-spacing:.2px;font-size:14px}
 #top .brand b{color:var(--green)}
 #top .binfo{font-family:var(--mono);color:var(--dim);font-size:12px}
-#workspace{display:flex;flex-direction:column;height:calc(100% - 48px)}
-#main{display:flex;flex:1;min-height:0}
+#main{display:flex;height:calc(100% - 48px)}
+#centerCol{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0}
+#centerRow{flex:1;min-height:0;display:flex;flex-direction:row;background:var(--bg)}
 #bottomPanel{height:230px;flex:0 0 auto;display:flex;flex-direction:column;background:var(--panel);border-top:1px solid var(--line)}
 #bottomPanel.collapsed{height:28px}
 #bottomPanel.collapsed #bottomInner{display:none}
@@ -77,7 +78,7 @@ select{font-family:var(--sans)}
 .splitter{flex:0 0 5px;cursor:col-resize;background:var(--line);opacity:.5;transition:opacity .1s}
 .splitter:hover,.splitter.dragging{opacity:1;background:var(--accent)}
 #left{width:240px}
-#center{flex:1;min-width:0;background:var(--bg);display:flex;flex-direction:row}
+
 #mainView{flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg)}
 #dock{width:440px;flex:0 0 auto;min-width:280px;max-width:60vw;display:flex;flex-direction:column;background:var(--panel);border-left:1px solid var(--line)}
 #dockHead{height:28px;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:0 10px;border-bottom:1px solid var(--line);font-size:11px;color:var(--dim)}
@@ -209,6 +210,11 @@ select{font-family:var(--sans)}
 .pkid.tohit{border-left:2px solid var(--bad);padding-left:3px}
 .pdetail{padding:12px 14px}
 .pdetail h4{margin:0;font-size:13px}
+.pdetail.cols{padding:10px 14px;height:100%;overflow:hidden;box-sizing:border-box}
+.pcols{display:flex;gap:18px;height:100%;align-items:stretch}
+.pcol{flex:1 1 0;min-width:0;overflow:auto;padding-right:4px}
+.pcol .dlabel:first-child{margin-top:0}
+.pcol+.pcol{border-left:1px solid var(--line);padding-left:18px}
 .dlabel{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);margin:14px 0 6px}
 .dcond{display:flex;flex-direction:column;gap:2px;margin-bottom:6px}
 .dcond .cond{align-self:flex-start;white-space:normal;word-break:break-word}
@@ -304,6 +310,15 @@ textarea{font-family:var(--mono);min-height:120px;resize:vertical}
 .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--panel2);
   border:1px solid var(--line);border-radius:8px;padding:10px 16px;z-index:80;box-shadow:0 8px 30px rgba(0,0,0,.5)}
 .toast.bad{border-color:var(--bad)}
+/* popup menu (theme picker etc.) */
+.popmenu{position:fixed;z-index:90;background:var(--panel2);border:1px solid var(--line2);border-radius:8px;
+  padding:5px;min-width:170px;box-shadow:0 10px 34px rgba(0,0,0,.55)}
+.popitem{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:6px;cursor:pointer;font-size:12px;color:var(--ink)}
+.popitem:hover{background:var(--panel)}
+.popitem.on{color:var(--green)}
+.popitem .chk{color:var(--green)}
+.swatch{width:20px;height:20px;border-radius:5px;border:1px solid var(--line2);flex:0 0 auto;position:relative}
+.swatch i{position:absolute;right:3px;bottom:3px;width:7px;height:7px;border-radius:50%}
 kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;font-family:var(--mono);font-size:11px}
 </style>
 </head>
@@ -316,10 +331,9 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
   <div class="binfo" id="binfo">no binary loaded</div>
   <div class="grow"></div>
   <div class="faint" id="hint">Load an ELF, pick a function, set up its state, add checks, and run.</div>
-  <button id="themeBtn" class="tiny ghost" title="Switch colour palette">◐ Theme</button>
+  <button id="themeBtn" class="tiny ghost" title="Choose colour palette">◐ Theme ▾</button>
 </div>
 
-<div id="workspace">
 <div id="main">
   <!-- LEFT: functions -->
   <div class="panel" id="left">
@@ -335,8 +349,9 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
 
   <div class="splitter" data-target="left"></div>
 
-  <!-- CENTER: main code view (decomp/disasm/script) + docked graph & paths -->
-  <div class="panel" id="center">
+  <!-- CENTER: code view + docked graph/paths, with the path detail below (between the side panels) -->
+  <div id="centerCol">
+    <div id="centerRow">
     <div id="mainView">
       <div class="tabs">
         <div class="tab" data-tab="decomp">Decompilation</div>
@@ -360,6 +375,16 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
       <div class="splitter-h" data-target="dockv"></div>
       <div id="dockPaths"><div class="empty">Run the checks to see the paths angr explored.</div></div>
     </div>
+    </div>
+    <div class="splitter-h" data-target="bottom" id="bottomSplit"></div>
+    <div id="bottomPanel">
+      <div id="bottomHead">
+        <span class="dockttl" id="bottomTtl">Path detail</span>
+        <span class="grow"></span>
+        <button class="tiny ghost" id="bottomClose" title="collapse">▾</button>
+      </div>
+      <div id="bottomInner"><div class="empty">Click a path in the dock to see its detail here.</div></div>
+    </div>
   </div>
 
   <div class="splitter" data-target="right"></div>
@@ -371,16 +396,6 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
       <div class="empty">Pick a function to manage its assumptions and checks.</div>
     </div>
   </div>
-</div>
-<div class="splitter-h" data-target="bottom" id="bottomSplit"></div>
-<div id="bottomPanel">
-  <div id="bottomHead">
-    <span class="dockttl" id="bottomTtl">Path detail</span>
-    <span class="grow"></span>
-    <button class="tiny ghost" id="bottomClose" title="hide">▾</button>
-  </div>
-  <div id="bottomInner"><div class="empty">Click a path in the dock to see its detail here.</div></div>
-</div>
 </div>
 
 <div id="actPanel">
