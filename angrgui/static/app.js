@@ -1655,10 +1655,12 @@ async function openDocsModal() {
 
   body.append(h("6 · Scenarios"));
   body.append(p("A function can have several ", el("b", {}, "scenarios"), " — different ways it is reached, each with its own initial state (args, stdin, files, assumptions, limits). ",
-    "The checks are ", el("b", {}, "shared"), " across scenarios. ", code("run"), " uses the active scenario; ", code("get_function"),
-    " reports the scenario names and which is active."));
+    "The checks are ", el("b", {}, "shared"), " across scenarios. ", code("get_function"), " reports the scenario names and which is active; ",
+    code("configure"), ", ", code("add_assumption"), " and ", code("run"), " all act on the ", el("b", {}, "active"), " one."));
+  body.append(p("Manage them with ", code("add_scenario"), " (optionally ", code("duplicate"), " the active one; the new scenario becomes active), ",
+    code("select_scenario"), ", ", code("rename_scenario"), " and ", code("delete_scenario"), " — each takes a scenario name or index."));
 
-  const m = modal("Agent documentation", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
+  const m = modal("Clanker documentation", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
   m.querySelector(".modal").classList.add("docs");
   $("#modalHost").append(m);
 }

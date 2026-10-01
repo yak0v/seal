@@ -561,6 +561,74 @@ def _mcp_decompile(addr):
     return S.ida.decompile(_addr(addr))
 
 
+# -- scenarios: a function's several initial-state setups (checks are shared) ---------
+def _scenario_index(cfg, scenario):
+    """Resolve a scenario given as an index (int / numeric string) or a name."""
+    scs = cfg["scenarios"]
+    if scenario is None:
+        return cfg["active"]
+    try:
+        i = int(scenario)
+        if 0 <= i < len(scs):
+            return i
+    except (TypeError, ValueError):
+        pass
+    for i, s in enumerate(scs):
+        if s.get("name") == scenario:
+            return i
+    raise HTTPException(404, f"no scenario {scenario!r}; have {[s.get('name') for s in scs]}")
+
+
+def _mcp_add_scenario(addr, name=None, duplicate=False):
+    _need_binary()
+    a = _addr(addr)
+    cfg = S.workspace.get_function(a)
+    sc = Workspace._default_scenario(name or f"Scenario {len(cfg['scenarios']) + 1}")
+    if duplicate:
+        cur = cfg["scenarios"][cfg["active"]]
+        for k in ("args", "buffers", "assumptions", "stdin", "files", "limits"):
+            sc[k] = json.loads(json.dumps(cur.get(k)))
+    cfg["scenarios"].append(sc)
+    cfg["active"] = len(cfg["scenarios"]) - 1        # the new scenario becomes active
+    _store_config(a, cfg, source="agent")
+    return _mcp_get_function(a)["config"]
+
+
+def _mcp_select_scenario(addr, scenario):
+    _need_binary()
+    a = _addr(addr)
+    cfg = S.workspace.get_function(a)
+    cfg["active"] = _scenario_index(cfg, scenario)
+    _store_config(a, cfg, source="agent")
+    return _mcp_get_function(a)["config"]
+
+
+def _mcp_delete_scenario(addr, scenario):
+    _need_binary()
+    a = _addr(addr)
+    cfg = S.workspace.get_function(a)
+    if len(cfg["scenarios"]) <= 1:
+        raise HTTPException(400, "a function needs at least one scenario")
+    cfg["scenarios"].pop(_scenario_index(cfg, scenario))
+    cfg["active"] = min(cfg["active"], len(cfg["scenarios"]) - 1)
+    _store_config(a, cfg, source="agent")
+    return _mcp_get_function(a)["config"]
+
+
+def _mcp_rename_scenario(addr, scenario, name):
+    _need_binary()
+    a = _addr(addr)
+    cfg = S.workspace.get_function(a)
+    cfg["scenarios"][_scenario_index(cfg, scenario)]["name"] = name
+    _store_config(a, cfg, source="agent")
+    return _mcp_get_function(a)["config"]
+
+
+def _mcp_load_binary(path):
+    load(LoadReq(path=path))                          # synchronous: analyses before returning
+    return _mcp_status_payload()
+
+
 _A = {"addr": {"type": "string", "description": "function address, e.g. \"0x400650\", or name"}}
 TOOL_DEFS = [
     {"name": "get_status", "description": "What binary is loaded and whether IDA is connected.",
@@ -586,10 +654,21 @@ TOOL_DEFS = [
      "{\"kind\":\"assert\",\"expr\":\"total < 0x1000\",\"at_return\":true} or "
      "{\"kind\":\"reach\",\"addr\":\"0x..\"}.",
      "inputSchema": {"type": "object", "properties": {**_A, "check": {"type": "object"}}, "required": ["addr", "check"]}},
-    {"name": "run", "description": "Run the enabled checks on a function using its saved setup. Returns a run_id.",
+    {"name": "run", "description": "Run the enabled checks on a function using its active scenario's setup. Returns a run_id.",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
     {"name": "get_run", "description": "Results of a run: status, findings (with concrete witnesses), and the path tree.",
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
+    {"name": "load_binary", "description": "Load an ELF binary by absolute path (replaces the current one). Analyses before returning.",
+     "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "add_scenario", "description": "Add a scenario (a separate initial-state setup) to a function and make it active. "
+     "duplicate=true copies the active scenario's initial state. Checks are shared across scenarios.",
+     "inputSchema": {"type": "object", "properties": {**_A, "name": {"type": "string"}, "duplicate": {"type": "boolean"}}, "required": ["addr"]}},
+    {"name": "select_scenario", "description": "Make a scenario active (by name or index). configure/add_assumption/run act on the active scenario.",
+     "inputSchema": {"type": "object", "properties": {**_A, "scenario": {"type": "string", "description": "name or index"}}, "required": ["addr", "scenario"]}},
+    {"name": "rename_scenario", "description": "Rename a scenario (by name or index).",
+     "inputSchema": {"type": "object", "properties": {**_A, "scenario": {"type": "string"}, "name": {"type": "string"}}, "required": ["addr", "scenario", "name"]}},
+    {"name": "delete_scenario", "description": "Delete a scenario (by name or index). A function keeps at least one.",
+     "inputSchema": {"type": "object", "properties": {**_A, "scenario": {"type": "string"}}, "required": ["addr", "scenario"]}},
 ]
 
 # documented check kinds (what add_check accepts); kept in sync with checks.py
@@ -626,6 +705,11 @@ _MCP_TOOLS = {
     "add_check": lambda a: _mcp_add(a["addr"], check=a["check"]),
     "run": lambda a: _mcp_run(a["addr"]),
     "get_run": lambda a: _mcp_get_run(a["run_id"]),
+    "load_binary": lambda a: _mcp_load_binary(a["path"]),
+    "add_scenario": lambda a: _mcp_add_scenario(a["addr"], a.get("name"), a.get("duplicate", False)),
+    "select_scenario": lambda a: _mcp_select_scenario(a["addr"], a["scenario"]),
+    "rename_scenario": lambda a: _mcp_rename_scenario(a["addr"], a["scenario"], a["name"]),
+    "delete_scenario": lambda a: _mcp_delete_scenario(a["addr"], a["scenario"]),
 }
 
 
