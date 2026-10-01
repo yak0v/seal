@@ -487,6 +487,7 @@ function renderRight() {
 
   body.append(sectionState());
   body.append(sectionAssumptions());
+  body.append(sectionModels());
   body.append(sectionChecks());
   body.append(sectionRun());
   body.append(sectionHits());
@@ -594,6 +595,92 @@ function sectionAssumptions() {
   });
   s.append(b);
   return s;
+}
+
+// Call models (hooks): replace a function the target calls with a simple model, so
+// it isn't stepped into (or skipped-to-unconstrained). Essential for cross-call bugs.
+const MODEL_KIND_DESC = {
+  symbolic: "returns a fresh symbolic value",
+  concrete: "returns a constant",
+  return_arg: "returns one of its arguments",
+  alloc: "allocates a buffer sized by one arg (tracked for OOB-write)",
+};
+function describeModel(m) {
+  if (m.kind === "concrete") return `→ ${m.value ?? 0}`;
+  if (m.kind === "symbolic") return `→ symbolic ${m.name || "ret"}${m.bits ? " (" + m.bits + "b)" : ""}`;
+  if (m.kind === "return_arg") return `→ arg${m.arg ?? 0}`;
+  if (m.kind === "alloc") return `→ alloc(arg${m.size_arg ?? 0})${m.name ? " as " + m.name : ""}`;
+  return "";
+}
+function sectionModels() {
+  const s = el("div", { class: "sec" });
+  s.append(el("h3", {}, "Call models", el("span", { class: "grow" }),
+    btn("+ model", () => openModelModal(), "tiny")));
+  const b = el("div", { class: "body" });
+  const models = A.config.models || (A.config.models = []);
+  if (!models.length) b.append(el("div", { class: "faint", style: "font-size:11px" },
+    "Replace a function this one calls with a model, so it isn't stepped into. Needed for bugs that span library calls (e.g. model malloc + size functions, then check for OOB writes)."));
+  models.forEach((m, i) => {
+    b.append(el("div", { class: "modelrow" },
+      el("span", { class: "mono mfn", title: MODEL_KIND_DESC[m.kind] || "" }, m.func || "(unset)"),
+      el("span", { class: "msum" }, describeModel(m)),
+      btn("✎", () => openModelModal(i), "tiny ghost"),
+      btn("✕", () => { models.splice(i, 1); renderRight(); scheduleSave(); }, "tiny ghost")));
+  });
+  s.append(b);
+  return s;
+}
+function openModelModal(editIdx) {
+  const models = A.config.models || (A.config.models = []);
+  const m = editIdx != null ? { ...models[editIdx] } : { kind: "symbolic", func: "" };
+  const funcI = el("input", { value: m.func || "", placeholder: "function name or 0x…", style: "width:100%;box-sizing:border-box" });
+  // suggestions: functions this one calls (from the disassembly's call targets)
+  const dl = el("datalist", { id: "modelFuncs" });
+  calledFunctionNames().forEach(n => dl.append(el("option", { value: n })));
+  funcI.setAttribute("list", "modelFuncs");
+  const kindS = el("select", {});
+  Object.entries(MODEL_KIND_DESC).forEach(([k, d]) => kindS.append(el("option", { value: k, selected: m.kind === k ? "" : null }, k + " — " + d)));
+  const params = el("div", { style: "margin-top:8px" });
+  const rebuild = () => {
+    params.replaceChildren();
+    const k = kindS.value;
+    if (k === "symbolic") {
+      params.append(field("Symbol name (shows in witnesses)", el("input", { value: m.name || "", placeholder: "e.g. scanline_size", oninput: e => m.name = e.target.value })),
+        field("Return width (bits)", el("input", { value: m.bits || 64, oninput: e => m.bits = parseIntLoose(e.target.value) || 64, style: "width:90px" })));
+    } else if (k === "concrete") {
+      params.append(field("Return value", el("input", { value: m.value ?? 0, oninput: e => m.value = parseIntLoose(e.target.value), style: "width:120px" }), "e.g. 0 for success, or a NULL/handle."));
+    } else if (k === "return_arg") {
+      params.append(field("Argument index", el("input", { value: m.arg ?? 0, oninput: e => m.arg = parseIntLoose(e.target.value), style: "width:90px" }), "0 = first argument."));
+    } else if (k === "alloc") {
+      params.append(field("Size argument index", el("input", { value: m.size_arg ?? 0, oninput: e => m.size_arg = parseIntLoose(e.target.value), style: "width:90px" }), "which argument holds the allocation size."),
+        field("Name the pointer (optional)", el("input", { value: m.name || "", placeholder: "e.g. out_buf", oninput: e => m.name = e.target.value })));
+    }
+  };
+  kindS.addEventListener("change", () => { m.kind = kindS.value; rebuild(); });
+  rebuild();
+  const body = el("div", {},
+    field("Function to model", funcI, "A function the analysed function calls. Tip: angr's skip-calls bypasses models, so model every heavy call (reads/writes/allocs) to keep the run bounded."),
+    field("Behavior", kindS), params);
+  const mo = modal(editIdx != null ? "Edit call model" : "Add call model", body, [
+    el("button", { onclick: () => mo.remove() }, "Cancel"),
+    el("button", { class: "primary", onclick: () => {
+      m.func = funcI.value.trim(); m.kind = kindS.value;
+      if (!m.func) { toast("enter the function to model", true); return; }
+      if (editIdx != null) models[editIdx] = m; else models.push(m);
+      mo.remove(); renderRight(); scheduleSave();
+    } }, editIdx != null ? "Save" : "Add model")]);
+  $("#modalHost").append(mo);
+}
+function calledFunctionNames() {
+  const names = new Set();
+  const byAddr = {};
+  (A.functions || []).forEach(f => byAddr[f.addr] = f.ida_name || f.name);
+  for (const ins of (A.detail?.disasm?.instructions || [])) {
+    if (/call/.test(ins.mnemonic) && /^0x[0-9a-f]+$/i.test((ins.op_str || "").trim())) {
+      const t = parseInt(ins.op_str, 16); if (byAddr[t]) names.add(byAddr[t]);
+    }
+  }
+  return [...names].sort();
 }
 
 function sectionChecks() {
@@ -1215,6 +1302,7 @@ function currentSpec() {
     func_addr: A.fn.addr, args: A.config.args, buffers: A.config.buffers,
     assumptions: A.config.assumptions.filter(x => x.trim()), stdin: A.config.stdin,
     files: (A.config.files || []).filter(f => f.name), checks: A.config.checks.filter(c => c.enabled), limits: A.config.limits,
+    models: (A.config.models || []).filter(m => m.func),
   };
 }
 function downloadScript() {

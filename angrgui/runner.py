@@ -197,6 +197,88 @@ class Run:
         self.summary["assumptions_applied"] = applied
         return state
 
+    # ----------------------------------------------------------- call models (hooks)
+    MODEL_REGION = 0x40000      # size of each buffer a hooked allocator hands back
+
+    def _make_model_proc(self, m):
+        """A SimProcedure that replaces a called function with a simple model:
+        return a fresh symbolic value, a constant, one of the arguments, or a freshly
+        allocated buffer (whose logical size is one argument, tracked for OOB checks)."""
+        kind = m.get("kind", "symbolic")
+        bits = self.arch.bits
+        region = self.MODEL_REGION
+        # SysV AMD64 integer argument registers, in order (this tool targets x86-64)
+        ARG_REGS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
+
+        def remember(state, name, val):
+            vs = dict(state.globals.get("angrgui_vars", {}))
+            vs[name] = val
+            state.globals["angrgui_vars"] = vs
+
+        def argval(state, i):
+            return getattr(state.regs, ARG_REGS[i]) if i < len(ARG_REGS) else claripy.BVV(0, bits)
+
+        if kind == "concrete":
+            val = int(m.get("value", 0)) & ((1 << bits) - 1)
+            class P(angr.SimProcedure):
+                def run(self):
+                    return claripy.BVV(val, bits)
+        elif kind == "return_arg":
+            idx = int(m.get("arg", 0))
+            class P(angr.SimProcedure):
+                def run(self):
+                    return argval(self.state, idx)
+        elif kind == "alloc":
+            sidx = int(m.get("size_arg", 0))
+            nm = m.get("name")
+            class P(angr.SimProcedure):
+                def run(self):
+                    size = argval(self.state, sidx)
+                    base = self.state.heap.allocate(region)
+                    allocs = self.state.globals.get("angrgui_allocs", ())
+                    self.state.globals["angrgui_allocs"] = allocs + ((base, size, base + region),)
+                    if nm:
+                        remember(self.state, nm, claripy.BVV(base, bits))
+                    return claripy.BVV(base, bits)
+        else:   # "symbolic" (default)
+            nm = m.get("name") or (str(m.get("func")) + "_ret")
+            rb = int(m.get("bits") or bits)
+            class P(angr.SimProcedure):
+                def run(self):
+                    v = claripy.BVS(nm, rb)
+                    remember(self.state, nm, v)
+                    return v
+        P.display_name = "model_" + str(m.get("func"))
+        return P()
+
+    def _install_models(self, state):
+        self._hooked = []
+        for m in (self.spec.get("models") or []):
+            target = m.get("func")
+            if not target:
+                continue
+            try:
+                proc = self._make_model_proc(m)
+                if isinstance(target, str) and target.lower().startswith("0x"):
+                    addr = int(target, 16)
+                    self.project.hook(addr, proc, replace=True)
+                elif isinstance(target, int):
+                    addr = target
+                    self.project.hook(addr, proc, replace=True)
+                else:
+                    addr = self.project.hook_symbol(target, proc, replace=True)
+                self._hooked.append(addr)
+            except Exception as e:
+                log.warning("could not model %r: %s", target, e)
+
+    def _unhook(self):
+        for a in getattr(self, "_hooked", []):
+            try:
+                self.project.unhook(a)
+            except Exception:
+                pass
+        self._hooked = []
+
     def _prototype(self, args, buffers):
         parts = []
         for a in args:
@@ -360,6 +442,7 @@ class Run:
             self.status = "running"
             self.progress["message"] = "building initial state"
             state = self._build_state()
+            self._install_models(state)
 
             ctx = self._make_context()
             self._state_checks = []
@@ -446,6 +529,8 @@ class Run:
             self.error = f"{type(e).__name__}: {e}"
             log.exception("run failed")
             self.progress["message"] = self.error
+        finally:
+            self._unhook()                 # models are installed on the shared project
         self._emit("run_status", func=self.func_addr, status=self.status,
                    hits=len(self.hits), error=self.error)
 

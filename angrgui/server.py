@@ -521,7 +521,7 @@ def _mcp_configure(addr, patch: dict):
     a = _addr(addr)
     cfg = S.workspace.get_function(a)                   # structured
     sc = cfg["scenarios"][cfg["active"]]
-    for k in ("args", "buffers", "assumptions", "stdin", "files", "limits"):
+    for k in ("args", "buffers", "assumptions", "stdin", "files", "limits", "models"):
         if k in patch and patch[k] is not None:
             sc[k] = {**sc.get("limits", {}), **patch[k]} if k == "limits" else patch[k]
     if patch.get("checks") is not None:
@@ -539,6 +539,17 @@ def _mcp_add(addr, *, assumption=None, check=None):
         sc["assumptions"] = list(sc.get("assumptions", [])) + [assumption]
     if check is not None:
         cfg["checks"] = list(cfg.get("checks", [])) + [_coerce_check(check, a)]
+    _store_config(a, cfg, source="agent")
+    return _mcp_get_function(a)["config"]
+
+
+def _mcp_add_model(addr, model):
+    """Append a call model (hook) to the active scenario."""
+    _need_binary()
+    a = _addr(addr)
+    cfg = S.workspace.get_function(a)
+    sc = cfg["scenarios"][cfg["active"]]
+    sc["models"] = list(sc.get("models", [])) + [dict(model)]
     _store_config(a, cfg, source="agent")
     return _mcp_get_function(a)["config"]
 
@@ -782,6 +793,20 @@ arith/bitwise: + - * / % & | ^ ~ << >>   (s>> arithmetic shift, s/ s% signed)
 widths: u8/u16/u32/u64 (low bits, unsigned), s8/s16/s32/s64 (sign-extend). memory: mem(addr, size)
 examples:  "a1 & 0xff == 0x5a"    "u32(x) + 8 < u32(x)"    "ret s>= 0"
 
+## Modeling calls (hooks) — for bugs that span library calls
+When the analysed function calls others (malloc, size helpers, read/write), you usually
+don't want to execute their real code. `skip_calls` returns "anything" (useless if you
+care about the result), and stepping in is expensive. Instead MODEL a call with add_model
+(or configure {"models":[...]}). Kinds:
+  - {"func":"TIFFScanlineSize","kind":"symbolic","name":"size","bits":64}  # fresh symbolic return
+  - {"func":"_TIFFmalloc","kind":"alloc","size_arg":0}      # allocate a buffer sized by arg0, TRACKED
+  - {"func":"TIFFReadScanline","kind":"concrete","value":0} # no-op returning success
+  - {"func":"foo","kind":"return_arg","arg":0}              # return the first argument
+Then an oob_write check with NO base checks every write against the tracked allocations —
+so "model malloc as alloc + add oob_write" finds heap overflows (e.g. CVE-2017-5225).
+IMPORTANT: skip_calls BYPASSES models, so leave it off and model every heavy call the
+function makes (reads/writes/allocs), or the run won't stay bounded.
+
 ## Scenarios (optional)
 A function can have several scenarios — different ways it is reached, each with its
 own initial state; the checks are SHARED. configure/add_assumption/run act on the
@@ -857,6 +882,13 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "ida_refresh", "description": "Re-pull names + decompilation from IDA (after you changed the IDB).",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "add_model", "description": "Model (hook) a function the target calls, so it isn't stepped into. "
+     "model = {\"func\":\"name or 0x..\",\"kind\":...}. kinds: "
+     "{\"kind\":\"symbolic\",\"name\":\"ret\",\"bits\":64} (fresh symbolic return); "
+     "{\"kind\":\"concrete\",\"value\":0}; {\"kind\":\"return_arg\",\"arg\":0}; "
+     "{\"kind\":\"alloc\",\"size_arg\":0,\"name\":\"buf\"} (allocate a buffer sized by that arg, tracked for oob_write). "
+     "NOTE: skip_calls bypasses models, so to keep a run bounded, model every heavy call the function makes.",
+     "inputSchema": {"type": "object", "properties": {**_A, "model": {"type": "object"}}, "required": ["addr", "model"]}},
 ]
 
 # documented check kinds (what add_check accepts); kept in sync with checks.py
@@ -875,9 +907,9 @@ CHECK_KINDS = [
      "fields": {"addr": "0x.. (optional; omit to scan the whole function)"}},
     {"kind": "float_anomaly", "summary": "a floating-point add/sub/mul/div whose result can be NaN or +/-Inf (from special or extreme inputs)",
      "fields": {"addr": "0x.. (optional; omit to scan the whole function)"}},
-    {"kind": "oob_write", "summary": "a memory write whose address can fall outside a declared buffer [base, base+size)",
-     "fields": {"base": "expression for the buffer start, e.g. a1 or rsp-0x40 (required)",
-                "size": "buffer size in bytes (required)", "addr": "0x.. (optional single write instruction)"}},
+    {"kind": "oob_write", "summary": "a memory write that can fall outside a buffer. Explicit: give base+size. Modeled: omit base to check writes against every buffer an 'alloc' call model handed out (heap overflows).",
+     "fields": {"base": "expression for the buffer start, e.g. a1 or rsp-0x40 (omit for modeled mode)",
+                "size": "buffer size in bytes (with base)", "addr": "0x.. (optional single write instruction)"}},
     {"kind": "custom", "summary": "your own Python predicate run at a point (advanced)",
      "fields": {"code": "python (required)", "addr": "0x.. (optional point)"}},
 ]
@@ -907,6 +939,7 @@ _MCP_TOOLS = {
     "ida_connect": lambda a: _mcp_ida_connect(a.get("url"), a.get("host_header")),
     "ida_disconnect": lambda a: _mcp_ida_disconnect(),
     "ida_refresh": lambda a: _mcp_ida_refresh(),
+    "add_model": lambda a: _mcp_add_model(a["addr"], a["model"]),
 }
 
 

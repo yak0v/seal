@@ -25,7 +25,7 @@ import threading
 SUFFIX = ".angrgui.json"
 
 # the initial-state fields that live on a scenario (everything except checks)
-SCEN_FIELDS = ("args", "buffers", "assumptions", "stdin", "files", "limits")
+SCEN_FIELDS = ("args", "buffers", "assumptions", "stdin", "files", "limits", "models")
 
 
 class Workspace:
@@ -66,7 +66,7 @@ class Workspace:
     @staticmethod
     def _default_scenario(name: str = "Default") -> dict:
         return {"name": name, "args": [], "buffers": [], "assumptions": [],
-                "stdin": None, "files": [], "limits": {}}
+                "stdin": None, "files": [], "limits": {}, "models": []}
 
     @staticmethod
     def _default_func() -> dict:

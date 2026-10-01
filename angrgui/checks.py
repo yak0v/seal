@@ -563,14 +563,19 @@ class FloatAnomalyCheck(BaseCheck):
 
 # --------------------------------------------------------------------------- oob_write
 class BufferBoundsCheck(BaseCheck):
-    """A memory write whose address can fall outside a declared buffer [base, base+size).
-    `base` is an expression (e.g. a pointer argument a1, or rsp-0x40, or a literal)."""
+    """A memory write whose address can fall outside a buffer. Two modes:
+
+    * explicit: `base` is an expression (a pointer arg a1, rsp-0x40, a literal) and
+      `size` the byte count — check writes against [base, base+size).
+    * modeled: no `base` — check writes against every buffer handed out by a hooked
+      allocator (an `alloc` call model), i.e. heap overflows of modeled allocations.
+    """
     kind = "oob_write"
     installs_breakpoint = True
 
     def __init__(self, spec, ctx):
         super().__init__(spec, ctx)
-        self.base_expr = spec["base"]
+        self.base_expr = spec.get("base") or None     # None => check modeled allocations
         self.size = int(spec.get("size", 0))
         self.addr = spec.get("addr")            # restrict to one write instruction, optional
 
@@ -587,50 +592,66 @@ class BufferBoundsCheck(BaseCheck):
         elif not self.ctx.in_target_function(ins_addr):
             return
         wa = state.inspect.mem_write_address
-        if wa is None or not (isinstance(wa, claripy.ast.BV) and wa.symbolic):
-            return                          # constant addresses (stack spills, globals) aren't buffer indexing
+        if wa is None or not isinstance(wa, claripy.ast.BV):
+            return
+        if self.base_expr is not None and not wa.symbolic:
+            return                          # explicit mode: constant addresses are stack spills, not buffer indexing
         wl = state.inspect.mem_write_length
         if wl is None:
             expr = state.inspect.mem_write_expr
             wl = (expr.size() // 8) if expr is not None else 1
-        try:
-            base = make_evaluator(state)(self.base_expr)
-        except ExprError as e:
-            self._record(state, ins_addr, f"buffer base expression error: {e}", dedup_key=("err", str(e)))
-            return
-        except Exception:
-            return
         bits = wa.size()
-        base = base.zero_extend(bits - base.size()) if base.size() < bits else base[bits - 1:0]
         length = wl if isinstance(wl, claripy.ast.BV) else claripy.BVV(int(wl), bits)
         if length.size() != bits:
             length = length.zero_extend(bits - length.size()) if length.size() < bits else length[bits - 1:0]
-        size_bv = claripy.BVV(self.size, bits)
-        # written range [wa, wa+length) must stay within [base, base+size)
+
+        if self.base_expr is not None:
+            try:
+                base = make_evaluator(state)(self.base_expr)
+            except ExprError as e:
+                self._record(state, ins_addr, f"buffer base expression error: {e}", dedup_key=("err", str(e)))
+                return
+            except Exception:
+                return
+            base = base.zero_extend(bits - base.size()) if base.size() < bits else base[bits - 1:0]
+            self._check_region(state, ins_addr, wa, length, base, claripy.BVV(self.size, bits),
+                               None, f"the {self.size}-byte buffer")
+        else:
+            # modeled mode: each tracked allocation is (base, logical_size, region_end)
+            for (base, size, end) in state.globals.get("angrgui_allocs", ()):
+                base_bv = base if isinstance(base, claripy.ast.BV) else claripy.BVV(base, bits)
+                end_bv = end if isinstance(end, claripy.ast.BV) else claripy.BVV(end, bits)
+                size_bv = size if isinstance(size, claripy.ast.BV) else claripy.BVV(size, bits)
+                if size_bv.size() != bits:
+                    size_bv = size_bv.zero_extend(bits - size_bv.size()) if size_bv.size() < bits else size_bv[bits - 1:0]
+                self._check_region(state, ins_addr, wa, length, base_bv, size_bv, end_bv, "its allocated buffer")
+
+    def _check_region(self, state, ins_addr, wa, length, base, size_bv, end, label):
+        # the write at [wa, wa+length) belongs to this buffer, and can leave [base, base+size)
+        belongs = claripy.And(claripy.UGE(wa, base), claripy.ULT(wa, end)) if end is not None \
+            else claripy.And(claripy.UGE(wa, base), claripy.ULE(wa + length, base + size_bv))
         oob = claripy.Or(claripy.ULT(wa, base), claripy.UGT(wa + length, base + size_bv))
-        in_bounds = claripy.And(claripy.UGE(wa, base), claripy.ULE(wa + length, base + size_bv))
         try:
-            if not state.solver.satisfiable(extra_constraints=[oob]):
-                return                       # can never leave the buffer -> safe
-            if not state.solver.satisfiable(extra_constraints=[in_bounds]):
-                return                       # can never be inside it -> not this buffer's write
+            if not state.solver.satisfiable(extra_constraints=[belongs, oob]):
+                return
+            if end is not None and not state.solver.satisfiable(extra_constraints=[belongs, claripy.ULE(wa + length, base + size_bv)]):
+                return                       # never in bounds here -> not a buffer access
         except Exception:
             return
-        witness = self._witness_with(state, [oob])
-        tmp = state.copy(); tmp.add_constraints(oob)
-        where = base_v = None
+        witness = self._witness_with(state, [belongs, oob])
+        where = base_v = size_v = None
         try:
-            where = tmp.solver.eval(wa)
-            base_v = tmp.solver.eval(base)
+            tmp = state.copy(); tmp.add_constraints(belongs); tmp.add_constraints(oob)
+            where = tmp.solver.eval(wa); base_v = tmp.solver.eval(base); size_v = tmp.solver.eval(size_bv)
         except Exception:
             pass
-        msg = f"out-of-bounds write at {hex(ins_addr)}: address can leave the {self.size}-byte buffer"
+        msg = f"out-of-bounds write at {hex(ins_addr)}: address can leave {label}"
         self._record(state, ins_addr, msg, witness,
                      extra={"write_addr": (hex(where) if where is not None else None),
                             "buffer_base": (hex(base_v) if base_v is not None else None),
-                            "buffer_size": self.size,
+                            "buffer_size": size_v if size_v is not None else self.size,
                             "src_line": self.ctx.line_for(ins_addr), "path": self.ctx.path_of(state)},
-                     dedup_key=(ins_addr,))
+                     dedup_key=(ins_addr, base_v))
 
 
 CHECK_TYPES = {
