@@ -15,6 +15,13 @@
   --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
   --sans:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
 }
+/* alternate palettes (toggle in the top bar) */
+html[data-theme="navy"]{--bg:#0e1117;--panel:#161b22;--panel2:#1c2230;--line:#2a3140;--line2:#39414f;
+  --green:#4c9aff;--green-dim:rgba(76,154,255,.16);--field:#0b0f16;--chip:#233047}
+html[data-theme="slate"]{--bg:#111318;--panel:#1a1d24;--panel2:#22262f;--line:#2f343e;--line2:#3b414c;
+  --ink:#edf0f4;--field:#0f1217}
+html[data-theme="ocean"]{--bg:#0b1620;--panel:#102230;--panel2:#16303f;--line:#1f3d4e;--line2:#2b5062;
+  --green:#36c6c0;--green-dim:rgba(54,198,192,.16);--accent:#49b3ff;--field:#081219}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%}
 body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:13px;overflow:hidden;-webkit-font-smoothing:antialiased}
@@ -59,7 +66,13 @@ select{font-family:var(--sans)}
 #top .brand{font-weight:700;letter-spacing:.2px;font-size:14px}
 #top .brand b{color:var(--green)}
 #top .binfo{font-family:var(--mono);color:var(--dim);font-size:12px}
-#main{display:flex;height:calc(100% - 46px)}
+#workspace{display:flex;flex-direction:column;height:calc(100% - 48px)}
+#main{display:flex;flex:1;min-height:0}
+#bottomPanel{height:230px;flex:0 0 auto;display:flex;flex-direction:column;background:var(--panel);border-top:1px solid var(--line)}
+#bottomPanel.collapsed{height:28px}
+#bottomPanel.collapsed #bottomInner{display:none}
+#bottomHead{height:28px;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--line);font-size:11px;color:var(--dim)}
+#bottomInner{flex:1;overflow:auto;padding:6px 16px 16px}
 .panel{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}
 .splitter{flex:0 0 5px;cursor:col-resize;background:var(--line);opacity:.5;transition:opacity .1s}
 .splitter:hover,.splitter.dragging{opacity:1;background:var(--accent)}
@@ -127,7 +140,10 @@ select{font-family:var(--sans)}
 .sec{border-bottom:1px solid var(--line)}
 .sec h3{margin:0;font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--faint);
   padding:10px 12px 6px;display:flex;align-items:center;gap:8px}
-.sec .body{padding:0 12px 12px}
+.sec .body{padding:0 14px 12px}
+.sec h3{cursor:pointer;user-select:none}
+.sec.collapsed .body{display:none}
+.secchev{display:inline-block;width:12px;color:var(--faint);font-size:10px;margin-right:2px}
 .arg{display:grid;grid-template-columns:minmax(0,1fr) auto 54px auto;gap:6px;align-items:center;margin-bottom:6px}
 .arg input.name{min-width:0;width:100%}
 .arg input.name{font-weight:600}
@@ -300,8 +316,10 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
   <div class="binfo" id="binfo">no binary loaded</div>
   <div class="grow"></div>
   <div class="faint" id="hint">Load an ELF, pick a function, set up its state, add checks, and run.</div>
+  <button id="themeBtn" class="tiny ghost" title="Switch colour palette">◐ Theme</button>
 </div>
 
+<div id="workspace">
 <div id="main">
   <!-- LEFT: functions -->
   <div class="panel" id="left">
@@ -353,6 +371,16 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
       <div class="empty">Pick a function to manage its assumptions and checks.</div>
     </div>
   </div>
+</div>
+<div class="splitter-h" data-target="bottom" id="bottomSplit"></div>
+<div id="bottomPanel">
+  <div id="bottomHead">
+    <span class="dockttl" id="bottomTtl">Path detail</span>
+    <span class="grow"></span>
+    <button class="tiny ghost" id="bottomClose" title="hide">▾</button>
+  </div>
+  <div id="bottomInner"><div class="empty">Click a path in the dock to see its detail here.</div></div>
+</div>
 </div>
 
 <div id="actPanel">

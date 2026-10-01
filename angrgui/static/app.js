@@ -69,7 +69,13 @@ async function init() {
   $$(".tab").forEach(t => t.addEventListener("click", () => selectTab(t.dataset.tab)));
   $("#idaBtn").addEventListener("click", openIdaModal);
   $("#actBtn").addEventListener("click", toggleActivity);
+  $("#themeBtn").addEventListener("click", cycleTheme);
   $("#followChk").addEventListener("change", e => { A.followAgent = e.target.checked; });
+  $("#bottomClose").addEventListener("click", () => {
+    const bp = $("#bottomPanel"); bp.classList.toggle("collapsed");
+    $("#bottomClose").textContent = bp.classList.contains("collapsed") ? "▴" : "▾";
+  });
+  applyTheme();
   initSplitters();
   refreshIdaStatus();
   connectEvents();
@@ -338,6 +344,25 @@ function renderRight() {
   body.append(sectionChecks());
   body.append(sectionRun());
   body.append(sectionHits());
+  $$(".sec", body).forEach(makeCollapsible);
+}
+
+// clicking a section header collapses/expands it (remembered per section)
+function makeCollapsible(sec) {
+  const h3 = sec.querySelector("h3"), bodyEl = sec.querySelector(".body");
+  if (!h3 || !bodyEl) return;
+  const key = "sec:" + ((h3.firstChild && h3.firstChild.textContent) || "").trim();
+  let collapsed = false; try { collapsed = localStorage.getItem(key) === "1"; } catch (e) {}
+  const chev = el("span", { class: "secchev" }, collapsed ? "▸" : "▾");
+  h3.insertBefore(chev, h3.firstChild);
+  if (collapsed) sec.classList.add("collapsed");
+  h3.addEventListener("click", ev => {
+    if (ev.target.closest("button") || ev.target.closest("input") || ev.target.closest("select")) return;
+    const now = !sec.classList.contains("collapsed");
+    sec.classList.toggle("collapsed", now);
+    chev.textContent = now ? "▸" : "▾";
+    try { localStorage.setItem(key, now ? "1" : "0"); } catch (e) {}
+  });
 }
 
 function sectionState() {
@@ -625,6 +650,24 @@ function renderTree(force) {
   T.roots.forEach(r => box.append(renderPathNode(T, r, snap)));
   pane.append(box);
   pane.scrollTop = keepScroll;
+  updateBottomDetail();
+}
+
+// the selected path's detail, shown in the resizable bottom panel (distinct from the tree)
+function updateBottomDetail() {
+  const inner = $("#bottomInner"); if (!inner) return;
+  const snap = A.run?.snapshot;
+  const T = snap && snap.tree ? pathModel(snap) : null;
+  if (!T || A.selNode == null || !T.byId[A.selNode]) {
+    inner.replaceChildren(el("div", { class: "empty" }, "Click a path in the dock to see its full detail here."));
+    $("#bottomTtl").textContent = "Path detail";
+    return;
+  }
+  inner.replaceChildren(renderPathDetail(T, snap));
+  const n = T.byId[A.selNode];
+  $("#bottomTtl").textContent = "Path detail · " + (T.kids[n.id] ? "branch point" : "path #" + T.leafNo[n.id]);
+  $("#bottomPanel").classList.remove("collapsed");
+  $("#bottomClose").textContent = "▾";
 }
 
 // the control-flow graph, docked above the paths, highlighting the selected path
@@ -741,7 +784,6 @@ function renderPathNode(T, n, snap) {
   row.addEventListener("click", () => selectPathNode(n.id));
 
   const node = el("div", { class: "pnode" }, row);
-  if (A.selNode === n.id) node.append(renderPathDetail(T, snap));   // inline detail under the selected row
   if (kids.length && !collapsed) {
     const box = el("div", { class: "pkids" });
     kids.forEach(k => box.append(el("div", { class: "pkid" + (T.toHit.has(k.id) ? " tohit" : "") }, renderPathNode(T, k, snap))));
@@ -900,6 +942,23 @@ function renderDecompLines(code, into) {
   }
 }
 
+const THEMES = ["graphite", "navy", "slate", "ocean"];   // "graphite" = default (no data-theme)
+function applyTheme() {
+  let t = "graphite";
+  try { t = localStorage.getItem("theme") || "graphite"; } catch (e) {}
+  if (t === "graphite") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t);
+  // the graph is rendered with fixed colors from CSS vars; re-draw on theme change
+  const b = $("#dockGraph"); if (b && b._cfg) { delete b._cfg; renderPathGraph(); }
+}
+function cycleTheme() {
+  let t = "graphite"; try { t = localStorage.getItem("theme") || "graphite"; } catch (e) {}
+  const next = THEMES[(THEMES.indexOf(t) + 1) % THEMES.length];
+  try { localStorage.setItem("theme", next); } catch (e) {}
+  applyTheme();
+  toast("theme: " + next);
+}
+
 const PANEL_FOR = { left: "left", right: "right", dock: "dock" };
 function initSplitters() {
   // horizontal splitters resize a side panel's width
@@ -922,17 +981,19 @@ function initSplitters() {
   }
   // the vertical splitter sets the docked graph's height
   for (const sp of $$(".splitter-h")) {
-    const box = $("#dockGraph");
-    try { const h = localStorage.getItem("dockGraphH"); if (h) box.style.height = h; } catch (e) {}
+    const target = sp.dataset.target;                 // "dockv" (graph height) or "bottom" (bottom panel)
+    const box = target === "bottom" ? $("#bottomPanel") : $("#dockGraph");
+    const grow = target === "bottom" ? -1 : 1;        // the bottom panel grows when dragging up
+    try { const h = localStorage.getItem("h:" + target); if (h) box.style.height = h; } catch (e) {}
     sp.addEventListener("mousedown", ev => {
       ev.preventDefault(); sp.classList.add("dragging");
       const startY = ev.clientY, startH = box.getBoundingClientRect().height;
-      const move = e => { box.style.height = Math.max(100, startH + (e.clientY - startY)) + "px"; };
+      const move = e => { box.style.height = Math.max(60, startH + grow * (e.clientY - startY)) + "px"; };
       const up = () => {
         sp.classList.remove("dragging");
         window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
-        try { localStorage.setItem("dockGraphH", box.style.height); } catch (e) {}
-        regraph();
+        try { localStorage.setItem("h:" + target, box.style.height); } catch (e) {}
+        if (target !== "bottom") regraph();
       };
       window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
     });
