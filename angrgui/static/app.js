@@ -203,9 +203,8 @@ async function selectFunction(f) {
   }
   renderCode();
   renderRight();
-  renderCFG();
-  selectTab("code");
-  renderTree(true);
+  selectTab(A.ida && A.ida.connected ? "decomp" : "code");   // decompilation is the main view when IDA is on
+  renderDock();                                               // graph + paths, always visible
 }
 
 function normalizeConfig(cfg, d) {
@@ -230,13 +229,19 @@ async function saveConfig() {
 }
 
 function selectTab(name) {
-  $$(".tab").forEach(t => t.classList.toggle("sel", t.dataset.tab === name));
-  $$(".tabpane").forEach(p => p.classList.toggle("sel", p.id === "pane-" + name));
+  // paths and the graph now live in the always-visible dock, not as tabs
+  if (name === "paths" || name === "cfg") { renderDock(); return; }
+  $$("#mainView .tab").forEach(t => t.classList.toggle("sel", t.dataset.tab === name));
+  $$("#mainView .tabpane").forEach(p => p.classList.toggle("sel", p.id === "pane-" + name));
   if (name === "code" && A.detail) renderCode();
-  if (name === "cfg") renderCFG($("#pane-cfg").dataset.stale === "1");
   if (name === "script") renderScript();
-  if (name === "paths") renderTree(true);
   if (name === "decomp") renderDecomp();
+}
+
+// the docked graph + paths, always visible beside the main code view
+function renderDock() {
+  renderPathGraph();
+  renderTree(true);
 }
 
 // ==================================================================== code view
@@ -599,7 +604,7 @@ const END_STYLE = {
 let treeKey = "";
 
 function renderTree(force) {
-  const pane = $("#pane-paths"); if (!pane) return;
+  const pane = $("#dockPaths"); if (!pane) return;
   const snap = A.run?.snapshot;
   if (!snap || !snap.tree || !snap.tree.length) {
     treeKey = "";
@@ -612,29 +617,17 @@ function renderTree(force) {
   treeKey = key;
 
   const T = pathModel(snap);
-  let wrap = $("#pathsWrap", pane);
-  if (!wrap) {
-    wrap = el("div", { id: "pathsWrap" },
-      el("div", { id: "treeCol" }),
-      el("div", { id: "rightCol" },
-        el("div", { id: "pathGraph" }),
-        el("div", { id: "detailCol" })));
-    pane.replaceChildren(wrap);
-  }
-  const treeCol = $("#treeCol", wrap), detailCol = $("#detailCol", wrap);
-  const keepScroll = treeCol.scrollTop;
-  treeCol.replaceChildren(pathsHelp(), checksBar(), pathsSummary(T, snap));
+  const keepScroll = pane.scrollTop;
+  pane.replaceChildren(checksBar(), pathsSummary(T, snap));
   const box = el("div", { class: "ptree" });
   T.roots.forEach(r => box.append(renderPathNode(T, r, snap)));
-  treeCol.append(box);
-  treeCol.scrollTop = keepScroll;
-  detailCol.replaceChildren(...(T.byId[A.selNode] ? [renderPathDetail(T, snap)] : []));
-  renderPathGraph();
+  pane.append(box);
+  pane.scrollTop = keepScroll;
 }
 
-// the control-flow graph, always visible beside the tree, highlighting the selected path
+// the control-flow graph, docked above the paths, highlighting the selected path
 async function renderPathGraph() {
-  const box = $("#pathGraph"); if (!box || !A.fn) return;
+  const box = $("#dockGraph"); if (!box || !A.fn) return;
   let g = A.cfgCache[A.fn.addr];
   if (!g) {
     box.innerHTML = '<div class="empty">laying out graph…</div>';
@@ -746,6 +739,7 @@ function renderPathNode(T, n, snap) {
   row.addEventListener("click", () => selectPathNode(n.id));
 
   const node = el("div", { class: "pnode" }, row);
+  if (A.selNode === n.id) node.append(renderPathDetail(T, snap));   // inline detail under the selected row
   if (kids.length && !collapsed) {
     const box = el("div", { class: "pkids" });
     kids.forEach(k => box.append(el("div", { class: "pkid" + (T.toHit.has(k.id) ? " tohit" : "") }, renderPathNode(T, k, snap))));
@@ -782,9 +776,7 @@ function updatePathHighlight() {
   }
   highlightHits();
   if ($("#pane-decomp").classList.contains("sel")) renderDecomp();   // re-tint decompilation lines (cached, no refetch)
-  if ($("#pane-paths").classList.contains("sel")) renderPathGraph(); // the always-visible graph beside the tree
-  const cfgPane = $("#pane-cfg");
-  if (cfgPane.classList.contains("sel")) renderCFG(true); else cfgPane.dataset.stale = "1";
+  renderPathGraph();                                                  // the docked graph, always visible
 }
 
 function renderPathDetail(T, snap) {
@@ -906,29 +898,45 @@ function renderDecompLines(code, into) {
   }
 }
 
+const PANEL_FOR = { left: "left", right: "right", dock: "dock" };
 function initSplitters() {
+  // horizontal splitters resize a side panel's width
   for (const sp of $$(".splitter")) {
-    const target = sp.dataset.target, panel = $("#" + target);
+    const target = sp.dataset.target, panel = $("#" + PANEL_FOR[target]);
     try { const w = localStorage.getItem("panelW:" + target); if (w) panel.style.width = w; } catch (e) {}
     sp.addEventListener("mousedown", ev => {
-      ev.preventDefault();
-      sp.classList.add("dragging");
+      ev.preventDefault(); sp.classList.add("dragging");
       const startX = ev.clientX, startW = panel.getBoundingClientRect().width;
-      const move = e => {
-        const dx = e.clientX - startX;
-        panel.style.width = Math.max(160, Math.min(1000, target === "left" ? startW + dx : startW - dx)) + "px";
-      };
+      const leftGrows = target === "left";                 // left panel grows with +dx; right/dock with -dx
+      const move = e => { const dx = e.clientX - startX; panel.style.width = Math.max(160, Math.min(1100, startW + (leftGrows ? dx : -dx))) + "px"; };
       const up = () => {
         sp.classList.remove("dragging");
         window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
         try { localStorage.setItem("panelW:" + target, panel.style.width); } catch (e) {}
-        if ($("#pane-cfg").classList.contains("sel")) { const p = $("#pane-cfg"); if (p._cfg) delete p._cfg; renderCFG(true); }
-        if ($("#pane-paths").classList.contains("sel")) { const b = $("#pathGraph"); if (b && b._cfg) delete b._cfg; renderPathGraph(); }
+        regraph();
+      };
+      window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+    });
+  }
+  // the vertical splitter sets the docked graph's height
+  for (const sp of $$(".splitter-h")) {
+    const box = $("#dockGraph");
+    try { const h = localStorage.getItem("dockGraphH"); if (h) box.style.height = h; } catch (e) {}
+    sp.addEventListener("mousedown", ev => {
+      ev.preventDefault(); sp.classList.add("dragging");
+      const startY = ev.clientY, startH = box.getBoundingClientRect().height;
+      const move = e => { box.style.height = Math.max(100, startH + (e.clientY - startY)) + "px"; };
+      const up = () => {
+        sp.classList.remove("dragging");
+        window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
+        try { localStorage.setItem("dockGraphH", box.style.height); } catch (e) {}
+        regraph();
       };
       window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
     });
   }
 }
+function regraph() { const b = $("#dockGraph"); if (b && b._cfg) delete b._cfg; renderPathGraph(); }
 
 function showAddr(addr) {
   // jump to an address and flash it — prefer the decompilation when IDA is connected
@@ -1186,11 +1194,10 @@ function annotate(text) {                  // wrap tokens that appear in an assu
 }
 function refreshAssumptionViews() {
   A._assume = assumeModel();
-  const sel = $(".tab.sel");
+  const sel = $("#mainView .tab.sel");
   const active = sel ? sel.dataset.tab : null;
   if (active === "code") renderCode();
   else if (active === "decomp") renderDecomp();
-  else if (active === "cfg") renderCFG(true);
 }
 let assumeTimer = null;
 function scheduleAssumeRefresh() { clearTimeout(assumeTimer); assumeTimer = setTimeout(refreshAssumptionViews, 350); }
@@ -1363,8 +1370,9 @@ function field(label, node, help) {
 }
 
 // ==================================================================== CFG
-async function renderCFG(force) {
+async function renderCFG(force) {         // legacy CFG tab; the graph now lives in the dock
   const pane = $("#pane-cfg");
+  if (!pane) return renderPathGraph();
   if (!A.fn) { pane.innerHTML = '<div class="empty">Select a function.</div>'; return; }
   if (!force && !pane.classList.contains("sel") && pane.dataset.addr == A.fn.addr) return;
   pane.dataset.stale = "";

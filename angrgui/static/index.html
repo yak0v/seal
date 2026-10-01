@@ -56,7 +56,15 @@ select{font-family:var(--sans)}
 .splitter{flex:0 0 5px;cursor:col-resize;background:var(--line);opacity:.5;transition:opacity .1s}
 .splitter:hover,.splitter.dragging{opacity:1;background:var(--accent)}
 #left{width:240px}
-#center{flex:1;min-width:0;background:var(--bg)}
+#center{flex:1;min-width:0;background:var(--bg);display:flex;flex-direction:row}
+#mainView{flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg)}
+#dock{width:440px;flex:0 0 auto;min-width:280px;max-width:60vw;display:flex;flex-direction:column;background:var(--panel);border-left:1px solid var(--line)}
+#dockHead{height:28px;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:0 10px;border-bottom:1px solid var(--line);font-size:11px;color:var(--dim)}
+.dockttl{font-weight:600;text-transform:uppercase;letter-spacing:.5px;font-size:10px;color:var(--ink)}
+#dockGraph{height:44%;flex:0 0 auto;min-height:120px;overflow:hidden;position:relative;background:var(--bg)}
+#dockPaths{flex:1;overflow:auto;min-height:0;padding:8px 10px 30px}
+.splitter-h{flex:0 0 5px;cursor:row-resize;background:var(--line);opacity:.5}
+.splitter-h:hover,.splitter-h.dragging{opacity:1;background:var(--accent)}
 #right{width:360px;border-right:none;border-left:1px solid var(--line)}
 .phead{height:34px;display:flex;align-items:center;gap:8px;padding:0 12px;
   border-bottom:1px solid var(--line);font-weight:600;font-size:12px;color:var(--dim);
@@ -301,21 +309,30 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
 
   <div class="splitter" data-target="left"></div>
 
-  <!-- CENTER: code / paths / cfg -->
+  <!-- CENTER: main code view (decomp/disasm/script) + docked graph & paths -->
   <div class="panel" id="center">
-    <div class="tabs">
-      <div class="tab sel" data-tab="code">Disassembly &amp; source</div>
-      <div class="tab" data-tab="paths">Paths</div>
-      <div class="tab" data-tab="cfg">Control-flow graph</div>
-      <div class="tab" data-tab="script">angr script</div>
-      <div class="tab" data-tab="decomp">Decompilation</div>
+    <div id="mainView">
+      <div class="tabs">
+        <div class="tab" data-tab="decomp">Decompilation</div>
+        <div class="tab sel" data-tab="code">Disassembly</div>
+        <div class="tab" data-tab="script">angr script</div>
+      </div>
+      <div class="grow" style="position:relative;min-height:0">
+        <div class="tabpane sel" id="pane-code"><div class="empty">Select a function on the left.</div></div>
+        <div class="tabpane" id="pane-script"><div class="empty">Select a function to see its setup as an angr script.</div></div>
+        <div class="tabpane" id="pane-decomp"><div class="empty">Connect to IDA (top bar) for decompilation.</div></div>
+      </div>
     </div>
-    <div class="grow" style="position:relative;min-height:0">
-      <div class="tabpane sel" id="pane-code"><div class="empty">Select a function on the left.</div></div>
-      <div class="tabpane" id="pane-paths"><div class="empty">Run a check to see the paths angr explored.</div></div>
-      <div class="tabpane" id="pane-cfg"><div class="empty">Select a function to see its control-flow graph.</div></div>
-      <div class="tabpane" id="pane-script"><div class="empty">Select a function to see its setup as an angr script.</div></div>
-      <div class="tabpane" id="pane-decomp"><div class="empty">Connect to IDA (top bar) for decompilation.</div></div>
+    <div class="splitter" data-target="dock"></div>
+    <div id="dock">
+      <div id="dockHead">
+        <span class="dockttl">Graph</span>
+        <span class="grow"></span>
+        <span class="faint" style="font-size:10px">drag to pan · wheel to zoom</span>
+      </div>
+      <div id="dockGraph"><div class="empty">Select a function to see its control-flow graph.</div></div>
+      <div class="splitter-h" data-target="dockv"></div>
+      <div id="dockPaths"><div class="empty">Run the checks to see the paths angr explored.</div></div>
     </div>
   </div>
 
