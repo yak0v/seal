@@ -76,6 +76,7 @@ class Hit:
 
 class BaseCheck:
     kind = "base"
+    installs_breakpoint = False     # True => driven by an inspect breakpoint, not note_state
 
     def __init__(self, spec: dict, ctx: "CheckContext"):
         self.spec = spec
@@ -172,6 +173,7 @@ def _fmt(v: int, bits: int) -> dict:
 # --------------------------------------------------------------------------- int_overflow
 class IntOverflowCheck(BaseCheck):
     kind = "int_overflow"
+    installs_breakpoint = True
 
     def __init__(self, spec, ctx):
         super().__init__(spec, ctx)
@@ -428,8 +430,214 @@ class _CustomAPI:
         return self.state.memory.load(addr, size, endness=self.state.arch.memory_endness)
 
 
+# --------------------------------------------------------------------------- narrowing_cast
+# standard C integer widths; a narrowing cast truncates to a smaller one.
+_STD_WIDTHS = {8, 16, 32, 64}
+
+
+class NarrowingCastCheck(BaseCheck):
+    """A value truncated to a smaller integer type (int->short, long->int, ->char …)
+    where the discarded high bits can be non-zero, i.e. information is lost."""
+    kind = "narrowing_cast"
+    installs_breakpoint = True
+
+    def __init__(self, spec, ctx):
+        super().__init__(spec, ctx)
+        self.addr = spec.get("addr")            # None => whole function
+
+    def install(self, state):
+        state.inspect.b("expr", when=angr.BP_AFTER, action=self._on_expr)
+
+    def _on_expr(self, state):
+        insp = state.inspect
+        r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
+        if r is None or not isinstance(r, claripy.ast.BV) or r.op != "Extract":
+            return
+        hi, lo, inner = r.args
+        if lo != 0 or not isinstance(inner, claripy.ast.BV):
+            return
+        small, big = hi + 1, inner.size()
+        if small >= big or small not in _STD_WIDTHS or big not in _STD_WIDTHS:
+            return
+        if not inner.symbolic:
+            return
+        ins_addr = state.scratch.ins_addr
+        if ins_addr is None:
+            return
+        if self.addr is not None:
+            if ins_addr != self.addr:
+                return
+        elif not self.ctx.in_target_function(ins_addr):
+            return
+        # a finding only if the bits we drop can actually be non-zero
+        dropped = inner[big - 1:small]
+        cond = dropped != 0
+        try:
+            if not state.solver.satisfiable(extra_constraints=[cond]):
+                return
+        except Exception:
+            return
+        witness = self._witness_with(state, [cond])
+        mn = text = None
+        try:
+            insn = state.project.factory.block(ins_addr, num_inst=1).capstone.insns[0]
+            mn, text = insn.mnemonic, f"{insn.mnemonic} {insn.op_str}".strip()
+        except Exception:
+            pass
+        msg = f"narrowing {big}->{small} bits may lose data at {text or hex(ins_addr)}"
+        self._record(state, ins_addr, msg, witness,
+                     extra={"from_bits": big, "to_bits": small, "mnemonic": mn,
+                            "src_line": self.ctx.line_for(ins_addr), "path": self.ctx.path_of(state)},
+                     dedup_key=(ins_addr, big, small))
+
+
+# --------------------------------------------------------------------------- float_anomaly
+_FP_OPS = {"fpAdd": "+", "fpSub": "-", "fpMul": "*", "fpDiv": "/"}
+
+
+class FloatAnomalyCheck(BaseCheck):
+    """A floating-point operation whose result can be NaN or +/-Inf — the sort of
+    'weird' value that comes from special or extreme inputs (0/0, inf-inf, overflow)."""
+    kind = "float_anomaly"
+    installs_breakpoint = True
+
+    def __init__(self, spec, ctx):
+        super().__init__(spec, ctx)
+        self.addr = spec.get("addr")
+
+    def install(self, state):
+        state.inspect.b("expr", when=angr.BP_AFTER, action=self._on_expr)
+
+    @staticmethod
+    def _find_fp_ops(root):
+        """FP arithmetic nodes anywhere in an AST. SSE scalar ops (divsd/addsd…) wrap
+        the fp result back into a BV (fpToIEEEBV inside a Concat), so the fpAdd/fpDiv
+        is a sub-expression, not the top node."""
+        out, seen, stack, steps = [], set(), [root], 0
+        while stack and steps < 4000:
+            n = stack.pop(); steps += 1
+            if not hasattr(n, "op") or id(n) in seen:
+                continue
+            seen.add(id(n))
+            if n.op in _FP_OPS and isinstance(n, claripy.ast.FP):
+                out.append(n)
+            for a in n.args:
+                if hasattr(a, "op"):
+                    stack.append(a)
+        return out
+
+    def _on_expr(self, state):
+        insp = state.inspect
+        r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
+        if r is None or not hasattr(r, "op"):
+            return
+        if not (isinstance(r, claripy.ast.FP) or (isinstance(r, claripy.ast.BV) and r.size() in (32, 64, 128))):
+            return
+        if not r.symbolic:
+            return
+        ins_addr = state.scratch.ins_addr
+        if ins_addr is None:
+            return
+        if self.addr is not None:
+            if ins_addr != self.addr:
+                return
+        elif not self.ctx.in_target_function(ins_addr):
+            return
+        for node in self._find_fp_ops(r):
+            if not node.symbolic:
+                continue
+            for label, pred in (("NaN", claripy.fpIsNaN), ("infinite", claripy.fpIsInf)):
+                try:
+                    cond = pred(node)
+                    if not state.solver.satisfiable(extra_constraints=[cond]):
+                        continue
+                except Exception:
+                    continue
+                witness = self._witness_with(state, [cond])
+                msg = f"floating-point result can be {label} ({_FP_OPS.get(node.op, '?')}) at {hex(ins_addr)}"
+                self._record(state, ins_addr, msg, witness,
+                             extra={"anomaly": label, "op": _FP_OPS.get(node.op),
+                                    "src_line": self.ctx.line_for(ins_addr), "path": self.ctx.path_of(state)},
+                             dedup_key=(ins_addr, label, node.op))
+
+
+# --------------------------------------------------------------------------- oob_write
+class BufferBoundsCheck(BaseCheck):
+    """A memory write whose address can fall outside a declared buffer [base, base+size).
+    `base` is an expression (e.g. a pointer argument a1, or rsp-0x40, or a literal)."""
+    kind = "oob_write"
+    installs_breakpoint = True
+
+    def __init__(self, spec, ctx):
+        super().__init__(spec, ctx)
+        self.base_expr = spec["base"]
+        self.size = int(spec.get("size", 0))
+        self.addr = spec.get("addr")            # restrict to one write instruction, optional
+
+    def install(self, state):
+        state.inspect.b("mem_write", when=angr.BP_BEFORE, action=self._on_write)
+
+    def _on_write(self, state):
+        ins_addr = state.scratch.ins_addr
+        if ins_addr is None:
+            return
+        if self.addr is not None:
+            if ins_addr != self.addr:
+                return
+        elif not self.ctx.in_target_function(ins_addr):
+            return
+        wa = state.inspect.mem_write_address
+        if wa is None or not (isinstance(wa, claripy.ast.BV) and wa.symbolic):
+            return                          # constant addresses (stack spills, globals) aren't buffer indexing
+        wl = state.inspect.mem_write_length
+        if wl is None:
+            expr = state.inspect.mem_write_expr
+            wl = (expr.size() // 8) if expr is not None else 1
+        try:
+            base = make_evaluator(state)(self.base_expr)
+        except ExprError as e:
+            self._record(state, ins_addr, f"buffer base expression error: {e}", dedup_key=("err", str(e)))
+            return
+        except Exception:
+            return
+        bits = wa.size()
+        base = base.zero_extend(bits - base.size()) if base.size() < bits else base[bits - 1:0]
+        length = wl if isinstance(wl, claripy.ast.BV) else claripy.BVV(int(wl), bits)
+        if length.size() != bits:
+            length = length.zero_extend(bits - length.size()) if length.size() < bits else length[bits - 1:0]
+        size_bv = claripy.BVV(self.size, bits)
+        # written range [wa, wa+length) must stay within [base, base+size)
+        oob = claripy.Or(claripy.ULT(wa, base), claripy.UGT(wa + length, base + size_bv))
+        in_bounds = claripy.And(claripy.UGE(wa, base), claripy.ULE(wa + length, base + size_bv))
+        try:
+            if not state.solver.satisfiable(extra_constraints=[oob]):
+                return                       # can never leave the buffer -> safe
+            if not state.solver.satisfiable(extra_constraints=[in_bounds]):
+                return                       # can never be inside it -> not this buffer's write
+        except Exception:
+            return
+        witness = self._witness_with(state, [oob])
+        tmp = state.copy(); tmp.add_constraints(oob)
+        where = base_v = None
+        try:
+            where = tmp.solver.eval(wa)
+            base_v = tmp.solver.eval(base)
+        except Exception:
+            pass
+        msg = f"out-of-bounds write at {hex(ins_addr)}: address can leave the {self.size}-byte buffer"
+        self._record(state, ins_addr, msg, witness,
+                     extra={"write_addr": (hex(where) if where is not None else None),
+                            "buffer_base": (hex(base_v) if base_v is not None else None),
+                            "buffer_size": self.size,
+                            "src_line": self.ctx.line_for(ins_addr), "path": self.ctx.path_of(state)},
+                     dedup_key=(ins_addr,))
+
+
 CHECK_TYPES = {
     "int_overflow": IntOverflowCheck,
+    "narrowing_cast": NarrowingCastCheck,
+    "float_anomaly": FloatAnomalyCheck,
+    "oob_write": BufferBoundsCheck,
     "assert": AssertCheck,
     "reach": ReachCheck,
     "avoid": AvoidCheck,

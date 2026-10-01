@@ -203,6 +203,8 @@ class Run:
             nm = a.get("name")
             if nm in buffers:
                 parts.append("void *")
+            elif a.get("float"):
+                parts.append("float" if int(a.get("size") or 8) == 4 else "double")
             else:
                 sz = int(a.get("size") or self.arch.bytes)
                 signed = a.get("signed", True)
@@ -367,8 +369,9 @@ class Run:
                 chk = build_check(cspec, ctx)
                 chk.install(state)
                 self.checks.append(chk)
-                # every check except the expr-driven overflow check observes block heads
-                if chk.kind != "int_overflow":
+                # breakpoint-driven checks (overflow / narrowing / float / oob) run from
+                # their inspect hooks; the rest observe block heads via note_state
+                if not getattr(chk, "installs_breakpoint", False):
                     self._state_checks.append(chk)
 
             self.progress["message"] = "exploring"

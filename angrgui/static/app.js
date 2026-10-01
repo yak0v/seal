@@ -534,6 +534,13 @@ function sectionState() {
         el("input", { type: "checkbox", checked: a.signed ? "" : null, style: "width:auto", onchange: e => { a.signed = e.target.checked; scheduleSave(); } }), "signed");
     }
     b.append(el("div", { class: "arg" }, nameI, modeS, sizeS, last));
+    // float toggle: passes this argument in an SSE register as a symbolic float/double
+    if (a.mode !== "concrete") {
+      b.append(el("label", { class: "row", style: "font-size:11px;color:var(--faint);margin:-2px 0 8px 2px;gap:4px" },
+        el("input", { type: "checkbox", checked: a.float ? "" : null, style: "width:auto",
+          onchange: e => { a.float = e.target.checked; if (a.float && ![4, 8].includes(a.size)) a.size = 8; scheduleSave(); renderRight(); } }),
+        "floating-point ", a.float ? el("span", { class: "faint" }, a.size === 4 ? "(float)" : "(double)") : el("span", { class: "faint" }, "(for float-point checks)")));
+    }
     // buffer toggle for pointer-ish args
     const isBuf = A.config.buffers.some(x => x.arg === a.name);
     const bufRow = el("label", { class: "row", style: "font-size:11px;color:var(--faint);margin:-2px 0 8px 2px;gap:4px" },
@@ -593,18 +600,19 @@ function sectionChecks() {
   const s = el("div", { class: "sec" });
   s.append(el("h3", {}, "Checks", el("span", { class: "grow" }),
     el("button", { class: "tiny ghost", title: "show these checks as angr code", onclick: () => showInScript("= checks") }, "</>"),
-    btn("+ overflow", () => openOverflowModal(), "tiny"),
+    el("button", { class: "tiny", onclick: (e) => openDetectMenu(e.currentTarget) }, "+ detect ▾"),
     btn("+ assert", () => openAssertModal(null), "tiny"),
     btn("+ custom", () => openCustomModal(null), "tiny")));
   const b = el("div", { class: "body" });
-  if (!A.config.checks.length) b.append(el("div", { class: "faint", style: "font-size:11px" }, "No checks yet. Click ", el("b", {}, "+ overflow"), " on an arithmetic instruction in the code view, or add one here."));
+  if (!A.config.checks.length) b.append(el("div", { class: "faint", style: "font-size:11px" }, "No checks yet. Use ", el("b", {}, "+ detect"), " for a bug class, ", el("b", {}, "+ assert"), " for an invariant, or add checks from the code view."));
   A.config.checks.forEach((c, i) => b.append(renderCheck(c, i)));
   s.append(b);
   return s;
 }
 function renderCheck(c, i) {
   const box = el("div", { class: "check" + (c.enabled ? "" : " dis") });
-  const kindPill = { int_overflow: "warn", assert: "warn", reach: "info", avoid: "warn", custom: "info" }[c.kind] || "info";
+  const kindPill = { int_overflow: "warn", narrowing_cast: "warn", float_anomaly: "warn", oob_write: "bad",
+                     assert: "warn", reach: "info", avoid: "warn", custom: "info" }[c.kind] || "info";
   box.append(el("div", { class: "top" },
     el("input", { type: "checkbox", checked: c.enabled ? "" : null, style: "width:auto", onchange: e => { c.enabled = e.target.checked; saveConfig(); renderRight(); } }),
     el("span", { class: "pill " + kindPill }, c.kind.replace("_", " ")),
@@ -618,6 +626,9 @@ function renderCheck(c, i) {
 }
 function describeCheck(c) {
   if (c.kind === "int_overflow") return (c.addr ? hx64(c.addr) + "  " : "whole function  ") + "· " + (c.signed || "either") + (c.note ? "  · " + c.note : "");
+  if (c.kind === "narrowing_cast") return (c.addr ? hx64(c.addr) : "whole function") + " · value truncated to a smaller int loses data";
+  if (c.kind === "float_anomaly") return (c.addr ? hx64(c.addr) : "whole function") + " · result can be NaN / ±Inf";
+  if (c.kind === "oob_write") return `write outside ${c.base}[${c.size}]` + (c.addr ? " at " + hx64(c.addr) : "");
   if (c.kind === "assert") return (c.at_return ? "at return: " : c.addr ? hx64(c.addr) + ": " : "every block: ") + c.expr;
   if (c.kind === "reach" || c.kind === "avoid") return "address " + hx64(c.addr);
   if (c.kind === "custom") return (c.addr ? "at " + hx64(c.addr) : "every block") + " · " + (c.code || "").split("\n").filter(l => l.trim() && !l.trim().startsWith("#")).slice(0, 1).join("").slice(0, 60);
@@ -1673,6 +1684,85 @@ function openOverflowModal() {
       addCheck({ kind: "int_overflow", addr, signed: signed.value,
         name: addr ? `overflow @ ${hx64(addr)}` : "overflow (whole function)",
         note: ins ? ins.mnemonic + " " + ins.op_str : "" });
+      m.remove();
+    } }, "Add check")]);
+  $("#modalHost").append(m);
+}
+
+// ==================================================================== detect menu + numeric/float/memory checks
+function openDetectMenu(anchor) {
+  if ($("#detectMenu")) { $("#detectMenu").remove(); return; }
+  const m = el("div", { class: "popmenu", id: "detectMenu" });
+  m.append(el("div", { class: "vmlbl", style: "padding:2px 8px 4px" }, "detect a bug class"));
+  [["Integer overflow / wrap", "add / sub / mul whose result wraps", openOverflowModal],
+   ["Narrowing cast (lossy)", "value truncated to a smaller int, dropping set bits", openNarrowingModal],
+   ["Floating-point anomaly", "result can be NaN or ±Inf", openFloatModal],
+   ["Out-of-bounds write", "a write that can leave a declared buffer", openOobModal]].forEach(([t, s, fn]) =>
+    m.append(el("div", { class: "popitem", style: "flex-direction:column;align-items:flex-start;gap:1px",
+      onclick: () => { m.remove(); fn(); } }, el("span", {}, t), el("span", { class: "dargs" }, s))));
+  document.body.append(m);
+  const r = anchor.getBoundingClientRect();
+  m.style.top = (r.bottom + 6) + "px";
+  m.style.left = Math.max(8, Math.min(r.left, window.innerWidth - m.offsetWidth - 10)) + "px";
+  const close = (e) => { if (!m.contains(e.target) && e.target !== anchor) { m.remove(); document.removeEventListener("mousedown", close); } };
+  setTimeout(() => document.addEventListener("mousedown", close), 0);
+}
+
+function insnPicker(filterFn) {
+  const sel = el("select", {});
+  sel.append(el("option", { value: "" }, "— whole function —"));
+  (A.detail.disasm.instructions || []).filter(filterFn || (() => true)).forEach(i =>
+    sel.append(el("option", { value: i.addr }, `${hx64(i.addr)}  ${i.mnemonic} ${i.op_str}`)));
+  return sel;
+}
+
+function openNarrowingModal() {
+  const sel = insnPicker();
+  const body = el("div", {}, field("Where", sel,
+    "Scan the whole function, or one instruction. Flags a value truncated to a smaller integer type (int→short, long→int, →char) where the discarded high bits can be non-zero — i.e. data is lost."));
+  const m = modal("Detect narrowing casts", body, [
+    el("button", { onclick: () => m.remove() }, "Cancel"),
+    el("button", { class: "primary", onclick: () => {
+      const addr = sel.value ? +sel.value : null;
+      addCheck({ kind: "narrowing_cast", addr, name: addr ? `narrowing @ ${hx64(addr)}` : "narrowing cast (whole function)" });
+      m.remove();
+    } }, "Add check")]);
+  $("#modalHost").append(m);
+}
+
+function openFloatModal() {
+  const sel = insnPicker();
+  const body = el("div", {},
+    field("Where", sel, "Scan the whole function, or one instruction."),
+    el("div", { class: "help" }, "Flags a floating-point add/sub/mul/div whose result can be NaN or ±Inf (from special or extreme inputs: 0/0, x/0, overflow). ",
+      el("b", {}, "Tip:"), " mark the relevant arguments as ", el("b", {}, "float"), " in Initial state so their values are symbolic."));
+  const m = modal("Detect floating-point anomalies", body, [
+    el("button", { onclick: () => m.remove() }, "Cancel"),
+    el("button", { class: "primary", onclick: () => {
+      const addr = sel.value ? +sel.value : null;
+      addCheck({ kind: "float_anomaly", addr, name: addr ? `float @ ${hx64(addr)}` : "float anomaly (whole function)" });
+      m.remove();
+    } }, "Add check")]);
+  $("#modalHost").append(m);
+}
+
+function openOobModal() {
+  const base = el("input", { placeholder: "a1   ·   rsp-0x40   ·   0x601080", style: "width:100%;box-sizing:border-box" });
+  const size = el("input", { value: "64", style: "width:90px" });
+  const sel = insnPicker();
+  const body = el("div", {},
+    field("Buffer start", base, "Expression for the buffer's base address: a pointer argument (a1/arg0/your name), a register expression (rsp-0x40), or a literal address."),
+    field("Buffer size (bytes)", size, "A write whose address can land outside [base, base+size) is reported — with the input that takes it there."),
+    field("Where (optional)", sel, "Restrict to one write instruction, or watch every write in the function."));
+  const m = modal("Detect out-of-bounds writes", body, [
+    el("button", { onclick: () => m.remove() }, "Cancel"),
+    el("button", { class: "primary", onclick: () => {
+      const b = base.value.trim();
+      if (!b) { toast("enter the buffer's base address/expression", true); return; }
+      const sz = parseIntLoose(size.value);
+      if (!sz) { toast("enter the buffer size in bytes", true); return; }
+      const addr = sel.value ? +sel.value : null;
+      addCheck({ kind: "oob_write", base: b, size: sz, addr, name: `OOB write · ${b}[${sz}]` });
       m.remove();
     } }, "Add check")]);
   $("#modalHost").append(m);
