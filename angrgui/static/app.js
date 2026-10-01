@@ -873,7 +873,7 @@ function renderPathNode(T, n, snap) {
     const asm = snap.summary?.assumptions_applied || [];
     if (asm.length) head.append(el("span", { class: "where" }, "assuming " + asm.join(", ")));
   } else {
-    head.append(el("span", { class: "cond", title: "the inputs must satisfy this to take this side of the branch" },
+    head.append(el("span", { class: "cond", title: (n.cond ? n.cond + "\n\n" : "") + "the inputs must satisfy this to take this side of the branch (full text in Path detail below)" },
       n.cond || "(no input-dependent condition)"));
     if (n.decided_at?.line) head.append(el("span", { class: "where", title: "decided at " + hx64(n.decided_at.addr) },
       `${n.decided_at.file}:${n.decided_at.line}  ${n.decided_at.text || ""}`));
@@ -967,16 +967,16 @@ function renderPathDetail(T, snap) {
     colB.append(tb);
   }
 
-  const colC = el("div", { class: "pcol" });
+  // findings live with the outcome (the graph + paths list now holds the right-hand column)
   const hits = chain.flatMap(c => c.hits);
-  colC.append(el("div", { class: "dlabel" }, hits.length ? "Findings on this path" : "Findings"));
-  if (!hits.length) colC.append(el("div", { class: "faint" }, "none on this path"));
-  hits.forEach(i => { const h = snap.hits[i]; if (h) colC.append(renderHit(h, i)); });
-  colC.append(el("div", { class: "row", style: "margin-top:10px;gap:6px;flex-wrap:wrap" },
+  colB.append(el("div", { class: "dlabel", style: "margin-top:12px" }, hits.length ? "Findings on this path" : "Findings"));
+  if (!hits.length) colB.append(el("div", { class: "faint" }, "none on this path"));
+  hits.forEach(i => { const h = snap.hits[i]; if (h) colB.append(renderHit(h, i)); });
+  colB.append(el("div", { class: "row", style: "margin-top:10px;gap:6px;flex-wrap:wrap" },
     A.ida && A.ida.connected ? el("button", { class: "tiny", onclick: () => selectTab("decomp") }, "Show in decompilation") : null,
     el("button", { class: "tiny", onclick: () => { selectTab("code"); scrollToAddr(n.blocks[0] ?? n.addr); } }, "Show in disassembly")));
 
-  return el("div", { class: "pdetail cols" }, el("div", { class: "pcols" }, colA, colB, colC));
+  return el("div", { class: "pdetail cols" }, el("div", { class: "pcols" }, colA, colB));
 }
 
 // ---------------------------------------------------------------- value formatting

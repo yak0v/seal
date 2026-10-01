@@ -112,12 +112,13 @@ class Printer:
         self.names = names
         self.limit = limit
 
-    def __call__(self, ast) -> str:
+    def __call__(self, ast, limit=None) -> str:
         try:
             s, _ = self.p(ast)
         except Exception:  # never let pretty-printing break a run
             s = str(ast)
-        return s if len(s) <= self.limit else s[: self.limit - 1] + "…"
+        lim = self.limit if limit is None else limit
+        return s if len(s) <= lim else s[: lim - 1] + "…"
 
     # returns (text, is_atom)
     def p(self, e, signed_ctx=False):

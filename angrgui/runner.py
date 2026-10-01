@@ -291,7 +291,9 @@ class Run:
                 cons.append(g)
         if not cons:
             return None
-        return " && ".join(self._printer(c) for c in cons)
+        # show the whole condition (a generous cap guards only pathological cases)
+        fmt = (lambda c: self._printer(c, limit=4000)) if self._printer is not str else str
+        return " && ".join(fmt(c) for c in cons)
 
     def _decision_point(self, parent: PathNode) -> dict | None:
         """The branch instruction that ended the parent's stretch, with its source line."""
