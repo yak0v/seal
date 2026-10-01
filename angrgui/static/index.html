@@ -22,6 +22,18 @@ html[data-theme="slate"]{--bg:#111318;--panel:#1a1d24;--panel2:#22262f;--line:#2
   --ink:#edf0f4;--field:#0f1217}
 html[data-theme="ocean"]{--bg:#0b1620;--panel:#102230;--panel2:#16303f;--line:#1f3d4e;--line2:#2b5062;
   --green:#36c6c0;--green-dim:rgba(54,198,192,.16);--accent:#49b3ff;--field:#081219}
+html[data-theme="forest"]{--bg:#0c130e;--panel:#111b14;--panel2:#17261c;--line:#213025;--line2:#2d4433;
+  --green:#5fd38a;--green-dim:rgba(95,211,138,.16);--accent:#4fb3a0;--field:#0a1009;--chip:#17261c}
+html[data-theme="grape"]{--bg:#120e18;--panel:#1a1424;--panel2:#241a33;--line:#322744;--line2:#43345c;
+  --green:#b58cff;--green-dim:rgba(181,140,255,.18);--accent:#c792ea;--field:#0f0b16;--chip:#241a33}
+html[data-theme="crimson"]{--bg:#140d10;--panel:#1f1318;--panel2:#2b1a22;--line:#3b2630;--line2:#50333f;
+  --green:#ff6b7a;--green-dim:rgba(255,107,122,.16);--accent:#ff8a5c;--field:#110a0d;--chip:#2b1a22}
+html[data-theme="amber"]{--bg:#141007;--panel:#1d1710;--panel2:#282014;--line:#3a2f1c;--line2:#4e4026;
+  --green:#f0b541;--green-dim:rgba(240,181,65,.16);--accent:#e8954a;--field:#120e06;--chip:#282014}
+html[data-theme="nord"]{--bg:#2e3440;--panel:#343b4a;--panel2:#3b4252;--line:#434c5e;--line2:#4c566a;
+  --ink:#eceff4;--dim:#b8c0cf;--faint:#7b869c;--green:#a3be8c;--green-dim:rgba(163,190,140,.18);--accent:#88c0d0;--field:#292e38;--chip:#3b4252}
+html[data-theme="mono"]{--bg:#0d0d0d;--panel:#161616;--panel2:#1f1f1f;--line:#2b2b2b;--line2:#3a3a3a;
+  --ink:#f0f0f0;--dim:#a0a0a0;--faint:#6a6a6a;--green:#d6d6d6;--green-dim:rgba(214,214,214,.14);--accent:#bbbbbb;--field:#0a0a0a;--chip:#1f1f1f}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%}
 body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:13px;overflow:hidden;-webkit-font-smoothing:antialiased}
@@ -98,7 +110,7 @@ select{font-family:var(--sans)}
 .fn.sel{background:var(--panel2);border-left-color:var(--green)}
 .fn .nm{font-family:var(--mono);font-weight:600}
 .fn .sub{font-size:11px;color:var(--faint);margin-top:2px;display:flex;gap:8px}
-.fn.unnamed .nm{color:var(--faint);font-weight:400}
+.fn.unnamed .nm{color:var(--dim);font-weight:400}
 .fn .idanm{color:var(--ok)}
 .fn .sub .idatag{color:var(--ok)}
 #idaBtn.on{border-color:var(--ok);color:var(--ok)}
@@ -136,11 +148,12 @@ select{font-family:var(--sans)}
 .insn.oncur{background:#182338}
 .blocklabel{color:var(--faint);font-size:11px;padding:8px 12px 2px;border-top:1px solid #1a2029;margin-top:4px}
 
-/* right panel sections */
-.sec{border-bottom:1px solid var(--line)}
-.sec h3{margin:0;font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--faint);
-  padding:10px 12px 6px;display:flex;align-items:center;gap:8px}
-.sec .body{padding:0 14px 12px}
+/* right panel sections — strongly separated */
+.sec{border-bottom:3px solid var(--line2)}
+.sec:last-child{border-bottom:none}
+.sec h3{margin:0;font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim);
+  padding:12px 12px 8px;display:flex;align-items:center;gap:8px;background:var(--panel)}
+.sec .body{padding:2px 14px 16px}
 .sec h3{cursor:pointer;user-select:none}
 .sec.collapsed .body{display:none}
 .secchev{display:inline-block;width:12px;color:var(--faint);font-size:10px;margin-right:2px}

@@ -547,12 +547,6 @@ function sectionAssumptions() {
   s.append(el("h3", {}, "Assumptions", el("span", { class: "grow" }),
     btn("+ add", () => { A.config.assumptions.push(""); renderRight(); }, "tiny")));
   const b = el("div", { class: "body" });
-  const argNames = (A.config.args || []).map(a => a.name).filter(Boolean);
-  b.append(el("div", { class: "faint", style: "font-size:11px;margin-bottom:6px" },
-    "Constraints on the initial argument values. Names you can use: ",
-    ...(argNames.length ? argNames.map(n => el("code", {}, n)).flatMap(c => [c, " "]) : [el("code", {}, "arg0"), " "]),
-    "· also ", el("code", {}, "a1"), "…/", el("code", {}, "arg0"), "… (the parameters), registers (", el("code", {}, "rdi"),
-    "), and ", el("code", {}, "ret"), ". e.g. ", el("code", {}, "a1 & 0xff == 0x5a")));
   A.config.assumptions.forEach((a, i) => {
     b.append(el("div", { class: "assume" },
       el("span", { class: "adot", style: `background:${ASSUME_COLORS[i % ASSUME_COLORS.length]}` }),
@@ -1045,7 +1039,13 @@ const THEMES = [
   { id: "graphite", name: "Graphite", bg: "#0c0e12", dot: "#46d07e" },
   { id: "navy", name: "Navy", bg: "#0e1117", dot: "#4c9aff" },
   { id: "slate", name: "Slate", bg: "#111318", dot: "#9a86ff" },
-  { id: "ocean", name: "Ocean", bg: "#0b1620", dot: "#2fd3c4" },
+  { id: "ocean", name: "Ocean", bg: "#0b1620", dot: "#36c6c0" },
+  { id: "forest", name: "Forest", bg: "#0c130e", dot: "#5fd38a" },
+  { id: "grape", name: "Grape", bg: "#120e18", dot: "#b58cff" },
+  { id: "crimson", name: "Crimson", bg: "#140d10", dot: "#ff6b7a" },
+  { id: "amber", name: "Amber", bg: "#141007", dot: "#f0b541" },
+  { id: "nord", name: "Nord", bg: "#2e3440", dot: "#88c0d0" },
+  { id: "mono", name: "Mono", bg: "#0d0d0d", dot: "#d0d0d0" },
 ];
 function curTheme() { try { return localStorage.getItem("theme") || "graphite"; } catch (e) { return "graphite"; } }
 function applyTheme() {
@@ -1650,12 +1650,12 @@ function drawCFG(pane, g) {
   const gr = new dagre.graphlib.Graph({ multigraph: true });
   gr.setGraph({ rankdir: "TB", nodesep: 26, ranksep: 34, marginx: 20, marginy: 20 });
   gr.setDefaultEdgeLabel(() => ({}));
-  const LINE_H = 14, CHAR_W = 6.4, PAD = 10;
+  const LINE_H = 16, CHAR_W = 7.3, PAD = 11;
   for (const n of g.nodes) {
-    const lines = n.insns.slice(0, 8).map(i => `${hx64(i.addr).slice(2)}  ${i.text}`);
+    const lines = n.insns.slice(0, 8).map(i => i.text);     // instructions only; addresses dropped
     if (n.insns.length > 8) lines.push(`… +${n.insns.length - 8}`);
     const w = Math.max(120, Math.min(460, Math.max(...lines.map(l => l.length)) * CHAR_W + PAD * 2));
-    const h = lines.length * LINE_H + PAD * 2 + 14;
+    const h = lines.length * LINE_H + PAD * 2 + 16;
     gr.setNode(n.addr, { label: hx64(n.addr), lines, width: w, height: h, insns: n.insns });
   }
   let ei = 0;
@@ -1693,30 +1693,40 @@ function drawCFG(pane, g) {
     rect.style.cursor = "pointer";
     gEl.append(rect);
     const head = document.createElementNS(NS, "text");
-    head.setAttribute("x", 8); head.setAttribute("y", 14);
-    head.setAttribute("font-family", "var(--mono)"); head.setAttribute("font-size", "10"); head.setAttribute("font-weight", "700");
+    head.setAttribute("x", 9); head.setAttribute("y", 15);
+    head.setAttribute("font-family", "var(--mono)"); head.setAttribute("font-size", "10.5"); head.setAttribute("font-weight", "700");
     head.textContent = n.label;
     gEl.append(head);
+    const lineEls = [];
     n.lines.forEach((ln, i) => {
       const t = document.createElementNS(NS, "text");
-      t.setAttribute("x", 8); t.setAttribute("y", 28 + i * LINE_H);
-      t.setAttribute("fill", "#c9d3de"); t.setAttribute("font-family", "monospace"); t.setAttribute("font-size", "10.5");
+      t.setAttribute("x", 9); t.setAttribute("y", 32 + i * LINE_H);
+      t.setAttribute("font-family", "var(--mono)"); t.setAttribute("font-size", "12.5");
       t.textContent = ln;
       gEl.append(t);
+      lineEls.push(t);
     });
-    nodeEls[+id] = { rect, head, insns: n.insns };
+    nodeEls[+id] = { rect, head, insns: n.insns, lineEls };
     viewport.append(gEl);
   });
 
   function recolor() {
     const pathBlocks = A.pathHighlight || new Set();
     const hitAddrs = new Set((A.run?.snapshot?.hits || []).map(h => h.addr));
+    // pull colours from the active theme so nodes stay distinct from the background
+    const css = getComputedStyle(document.documentElement);
+    const v = (name, fb) => (css.getPropertyValue(name).trim() || fb);
+    const node = v("--panel2", "#1a1e25"), line2 = v("--line2", "#30363f");
+    const ink = v("--ink", "#e8ecf1"), dim = v("--dim", "#98a1ad");
+    const accent = v("--accent", "#4c9aff"), bad = v("--bad", "#f85149");
+    const tint = (hex, a) => { const m = /^#?([0-9a-f]{6})$/i.exec(hex); if (!m) return hex; const n = parseInt(m[1], 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`; };
     for (const addr in nodeEls) {
       const ne = nodeEls[addr], onPath = pathBlocks.has(+addr), hasHit = ne.insns.some(i => hitAddrs.has(i.addr));
-      ne.rect.setAttribute("fill", hasHit ? "#241318" : onPath ? "#17233a" : "#161b22");
-      ne.rect.setAttribute("stroke", hasHit ? "#f85149" : onPath ? "#4c9aff" : "#2a3140");
+      ne.rect.setAttribute("fill", hasHit ? tint(bad, .16) : onPath ? tint(accent, .16) : node);
+      ne.rect.setAttribute("stroke", hasHit ? bad : onPath ? accent : line2);
       ne.rect.setAttribute("stroke-width", (hasHit || onPath) ? 2 : 1);
-      ne.head.setAttribute("fill", hasHit ? "#f85149" : "#9aa7b4");
+      ne.head.setAttribute("fill", hasHit ? bad : dim);
+      (ne.lineEls || []).forEach(t => t.setAttribute("fill", ink));
     }
     for (const e of edgeEls) {
       const hi = pathBlocks.has(e.v) && pathBlocks.has(e.w);
