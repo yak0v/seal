@@ -127,6 +127,7 @@ class RunReq(BaseModel):
     files: list = []
     checks: list = []
     limits: dict = {}
+    models: list = []
 
 
 class ConfigReq(BaseModel):
@@ -560,6 +561,7 @@ def _mcp_run(addr):
     spec = {"func_addr": a, "args": flat.get("args") or [], "buffers": flat.get("buffers") or [],
             "assumptions": [x for x in (flat.get("assumptions") or []) if x.strip()],
             "stdin": flat.get("stdin"), "files": flat.get("files") or [], "limits": flat.get("limits") or {},
+            "models": flat.get("models") or [],
             "checks": [c for c in flat.get("checks", []) if c.get("enabled", True)]}
     if not spec["checks"]:
         raise HTTPException(400, "no enabled checks on this function; add one first")

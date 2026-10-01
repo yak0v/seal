@@ -1176,6 +1176,14 @@ const THEMES = [
   { id: "amber", name: "Amber", bg: "#141007", dot: "#f0b541" },
   { id: "nord", name: "Nord", bg: "#2e3440", dot: "#88c0d0" },
   { id: "mono", name: "Mono", bg: "#0d0d0d", dot: "#d0d0d0" },
+  // popular editor themes, using their real palettes
+  { id: "dracula", name: "Dracula", bg: "#282a36", dot: "#bd93f9" },
+  { id: "monokai", name: "Monokai", bg: "#272822", dot: "#a6e22e" },
+  { id: "onedark", name: "One Dark", bg: "#282c34", dot: "#61afef" },
+  { id: "solarized", name: "Solarized", bg: "#002b36", dot: "#2aa198" },
+  { id: "gruvbox", name: "Gruvbox", bg: "#282828", dot: "#fabd2f" },
+  { id: "tokyonight", name: "Tokyo Night", bg: "#1a1b26", dot: "#7aa2f7" },
+  { id: "nightowl", name: "Night Owl", bg: "#011627", dot: "#82aaff" },
 ];
 function curTheme() { try { return localStorage.getItem("theme") || "graphite"; } catch (e) { return "graphite"; } }
 function applyTheme() {
