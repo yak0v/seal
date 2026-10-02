@@ -72,6 +72,7 @@ async function init() {
   $("#actBtn").addEventListener("click", toggleActivity);
   $("#themeBtn").addEventListener("click", openThemeMenu);
   $("#docsBtn").addEventListener("click", openDocsModal);
+  $("#humanDocsBtn").addEventListener("click", openHumanDocs);
   $("#leftCollapse").addEventListener("click", () => setPanelCollapsed("left", true));
   $("#rightCollapse").addEventListener("click", () => setPanelCollapsed("right", true));
   $("#leftExpand").addEventListener("click", () => setPanelCollapsed("left", false));
@@ -1954,6 +1955,77 @@ function modal(title, bodyNode, footerButtons) {
 }
 
 // ==================================================================== agent docs
+// concise, human-facing docs (what SEAL is + how to use it), with small diagrams.
+function openHumanDocs() {
+  const h = (t) => el("h4", { class: "dh" }, t);
+  const p = (...k) => el("p", { class: "dp" }, ...k);
+  const b = (t) => el("b", {}, t);
+  const svg = (markup, style) => { const d = el("div", { class: "docsvg", style: style || "" }); d.innerHTML = markup; return d; };
+  const body = el("div", { class: "docbody" });
+
+  body.append(p(b("SEAL"), " (Symbolic Execution Analysis Lab) runs one function with its inputs left ", b("unknown"),
+    " and finds the ", b("concrete inputs"), " that reach a location or trigger a bug — a visual front-end over ", b("angr"),
+    " symbolic execution, with IDA for names and decompilation."));
+
+  // workflow pipeline
+  body.append(h("The workflow"));
+  const step = (t) => el("span", { class: "pipe-step" }, t);
+  const arr = () => el("span", { class: "pipe-arr" }, "→");
+  body.append(el("div", { class: "pipeline" },
+    step("pick a function"), arr(), step("set its inputs"), arr(), step("add checks"), arr(),
+    step("explore paths"), arr(), step("read findings")));
+  body.append(p("Checks are optional — with none, exploring just enumerates the paths."));
+
+  // the idea + a tiny path tree
+  body.append(h("The idea"));
+  body.append(el("div", { class: "docrow" },
+    el("div", { class: "grow" }, p("At each branch whose condition depends on an unknown input, execution ", b("forks"),
+      " and follows both sides — building a ", b("tree"), " of paths. Each finding comes with a concrete ", b("witness"),
+      ": the exact input values that take that path and trigger it.")),
+    svg(`<svg viewBox="0 0 120 92" width="120" height="92" aria-hidden="true">
+      <g fill="none" stroke="var(--line2)" stroke-width="1.5">
+        <path d="M60 18 V34 M60 34 L30 52 M60 34 L90 52 M30 52 V68 M90 52 L72 68 M90 52 L108 68"/></g>
+      <circle cx="60" cy="14" r="5" fill="var(--green)"/>
+      <circle cx="30" cy="52" r="5" fill="var(--ok)"/>
+      <circle cx="30" cy="72" r="5" fill="var(--ok)"/>
+      <circle cx="90" cy="52" r="5" fill="var(--accent2)"/>
+      <circle cx="72" cy="72" r="5" fill="var(--ok)"/>
+      <circle cx="108" cy="72" r="5" fill="var(--bad)"/>
+      <text x="2" y="90" font-size="7" fill="var(--faint)" font-family="var(--sans)">green=returned · purple=branch · red=finding</text>
+    </svg>`, "flex:0 0 auto")));
+
+  body.append(h("Setting up inputs"));
+  const ul = el("ul", { class: "dul" });
+  [[b("symbolic / fixed"), " — mark each argument unknown (the solver chooses it) or pin it to a value."],
+   [b("pointers → buffers"), " — tick “points at a symbolic buffer”: the pointer is a real address, the contents are symbolic."],
+   [b("struct editor"), " — for a pointer-to-struct, load the layout from IDA (“as struct”) and set each member symbolic or fixed; expand nested structs."],
+   [b("stdin / files"), " — make program input symbolic (e.g. a .password file)."],
+   [b("assumptions"), " — constrain inputs with expressions (e.g. ", el("code", {}, "a1 & 0xff == 0x5a"), ")."],
+   [b("call models"), " — replace a function the target calls (malloc, size helpers, read/write) with a model, so cross-call bugs stay tractable."]].forEach(x =>
+    ul.append(el("li", {}, ...x)));
+  body.append(ul);
+
+  body.append(h("Looking for bugs"));
+  body.append(p(b("+ detect"), " adds a bug-class check: integer overflow/wrap, narrowing cast, floating-point anomaly (NaN/±Inf), or out-of-bounds write (incl. heap overflows of modeled allocations). ",
+    b("+ assert"), " checks an invariant; ", b("+ custom"), " runs your own predicate; and from the code view you can add ", b("reach"), " / ", b("avoid"), " on any line."));
+
+  body.append(h("Reading the results"));
+  body.append(p("The ", b("paths dock"), " shows every explored path as a ", b("list"), " or a branching ", b("tree"),
+    " (toggle). Click one and the ", b("Path detail"), " panel shows the conditions to get there, the outcome and the finding with its witness — while the ",
+    b("code"), " and ", b("graph"), " highlight that flow (blue) and the exact branches it took (purple)."));
+
+  body.append(h("Getting around"));
+  body.append(p(b("Scenarios"), " keep several initial-state setups per function (shared checks); switch via the chip by the function name. The ",
+    b("Setup / Explore"), " toggle (top bar) swaps a configuring layout for a path-reading one. Collapse either side panel with ", b("« / »"),
+    ", and pick a colour theme from ", b("Theme"), "."));
+
+  body.append(el("div", { class: "dnote" }, "Driving SEAL from an AI agent? See ", b("🤖 Clanker docs"), " for the MCP tools, the full guide and caveats."));
+
+  const m = modal("SEAL — overview", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
+  m.querySelector(".modal").classList.add("docs");
+  $("#modalHost").append(m);
+}
+
 async function openDocsModal() {
   let d = {};
   try { d = await api("/api/agent-docs"); } catch (e) {}
@@ -2026,8 +2098,24 @@ async function openDocsModal() {
   body.append(p("Manage them with ", code("add_scenario"), " (optionally ", code("duplicate"), " the active one; the new scenario becomes active), ",
     code("select_scenario"), ", ", code("rename_scenario"), " and ", code("delete_scenario"), " — each takes a scenario name or index."));
 
+  body.append(h("7 · Modeling calls & structs"));
+  body.append(p("For a pointer-to-struct argument, ", code("get_struct(\"TYPE\")"), " returns the member layout from IDA; set members with ",
+    code("configure buffers[].layout"), " (each member ", code("sym"), " named or ", code("fixed"), "). For functions the target calls, ",
+    code("add_model"), " replaces them (", code("symbolic"), " / ", code("concrete"), " / ", code("return_arg"), " / ", code("alloc"),
+    ") so cross-call bugs are reachable; then an ", code("oob_write"), " check with no base finds heap overflows of modeled allocations. ",
+    el("b", {}, "skip_calls bypasses models"), " — leave it off and model every heavy call."));
+
+  body.append(h("8 · Use cases"));
+  const ucl = el("ul", { class: "dul" });
+  [["Reach a target", "add a reach check at the goal address; the witness is the input that gets there (e.g. a CTF flag check)."],
+   ["Integer overflow (e.g. CVE-2020-12762)", "symbolize the size args, add int_overflow; the witness is a size near INT_MAX."],
+   ["Heap overflow across calls (e.g. CVE-2017-5225)", "model the size/alloc/read-write calls, add oob_write (no base) — finds the unbounded write."],
+   ["Invariant checking", "add_check assert with an expression that should always hold at a point or at return."]].forEach(([t, s]) =>
+    ucl.append(el("li", {}, el("b", {}, t + " — "), s)));
+  body.append(ucl);
+
   if (d.guide) {
-    body.append(h("7 · The agent's own guide"));
+    body.append(h("9 · The agent's own guide"));
     body.append(p("An agent calls ", code("get_guide"), " (or reads the handshake ", code("instructions"),
       ") to get this self-contained how-to — the same text, with a worked example:"));
     body.append(el("pre", { class: "dcode", style: "white-space:pre-wrap;max-height:320px;overflow:auto;color:var(--ink)" }, d.guide));

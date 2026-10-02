@@ -389,6 +389,12 @@ select{font-family:var(--sans)}
 /* agent documentation */
 .modal.docs{width:860px}
 .docbody{font-size:13px;line-height:1.6;color:var(--ink)}
+.docbody .docrow{display:flex;gap:16px;align-items:center;margin:8px 0}
+.docbody .docsvg{flex:0 0 auto}
+.docbody .pipeline{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:10px 0}
+.docbody .pipe-step{background:var(--green-dim);color:var(--green);border:1px solid var(--green);border-radius:16px;padding:4px 12px;font-size:12px;font-weight:600;white-space:nowrap}
+.docbody .pipe-arr{color:var(--faint);font-size:14px}
+.docbody .dnote{margin-top:18px;padding:10px 12px;background:var(--panel2);border:1px solid var(--line2);border-radius:8px;color:var(--dim);font-size:12.5px}
 .docbody .dh{margin:22px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--green);
   border-bottom:1px solid var(--line2);padding-bottom:5px}
 .docbody .dh:first-child{margin-top:4px}
@@ -501,7 +507,8 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
     <div class="segbtn on" data-mode="setup">⚙ Setup</div>
     <div class="segbtn" data-mode="explore">◱ Explore</div>
   </div>
-  <button id="docsBtn" class="tiny ghost" title="How an AI agent (clanker) drives this tool over MCP">🤖 Clanker docs</button>
+  <button id="humanDocsBtn" class="tiny ghost" title="What SEAL does and how to use it (for humans)">📖 Docs</button>
+  <button id="docsBtn" class="tiny ghost" title="Elaborate guide for an AI agent (clanker) driving SEAL over MCP">🤖 Clanker docs</button>
   <button id="themeBtn" class="tiny ghost" title="Choose colour palette">◐ Theme ▾</button>
 </div>
 
