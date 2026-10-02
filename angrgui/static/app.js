@@ -1545,6 +1545,10 @@ function openIdaModal() {
 async function renderDecomp(force) {
   const pane = $("#pane-decomp");
   if (!A.fn) { pane.innerHTML = '<div class="empty">Select a function.</div>'; return; }
+  // keep the scroll position when re-rendering the same function (e.g. a flow click
+  // re-tints the lines); reset it only when switching to a different function
+  const sameFn = pane._fnAddr === A.fn.addr;
+  const keepScroll = sameFn ? (($(".ccode", pane) || {}).scrollTop || 0) : 0;
   if (!A.ida || !A.ida.connected) {
     pane.replaceChildren(el("div", { class: "empty" },
       "Not connected to IDA. ", el("button", { class: "tiny", onclick: openIdaModal }, "Connect to IDA"),
@@ -1579,6 +1583,8 @@ async function renderDecomp(force) {
   renderDecompLines(d.code || "(empty)", pre);
   if (d.note) pre.prepend(el("div", { class: "faint", style: "margin-bottom:6px" }, d.note));
   pane.replaceChildren(el("div", { class: "decompwrap" }, bar, assumptionsBar(), pre));
+  pre.scrollTop = keepScroll;
+  pane._fnAddr = A.fn.addr;
 }
 
 async function refreshIda() {
