@@ -113,6 +113,19 @@ select{font-family:var(--sans)}
 .splitter{flex:0 0 5px;cursor:col-resize;background:var(--line);opacity:.5;transition:opacity .1s}
 .splitter:hover,.splitter.dragging{opacity:1;background:var(--accent)}
 #left{width:240px}
+/* collapsible side panels */
+#left,#right{position:relative}
+#left.collapsed,#right.collapsed{display:none}
+.pcollapse{position:absolute;top:9px;right:7px;z-index:5;width:20px;height:20px;padding:0;line-height:1;
+  background:transparent;border:none;color:var(--faint);font-size:14px;cursor:pointer;border-radius:4px}
+.pcollapse:hover{color:var(--ink);background:var(--panel2)}
+.pcollapse.right{right:auto;left:7px}
+.edgebtn{position:fixed;top:58px;z-index:45;padding:7px 8px;font-size:11px;font-weight:600;letter-spacing:.3px;
+  background:var(--panel2);color:var(--dim);border:1px solid var(--line2);cursor:pointer;writing-mode:vertical-rl;text-orientation:mixed}
+.edgebtn:hover{color:var(--green);border-color:var(--green)}
+.edgebtn.left{left:0;border-left:none;border-radius:0 7px 7px 0}
+.edgebtn.right{right:0;border-right:none;border-radius:7px 0 0 7px}
+.edgebtn.hidden{display:none}
 
 #mainView{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;background:var(--bg)}
 #dock{width:440px;flex:0 0 auto;min-width:280px;max-width:60vw;display:flex;flex-direction:column;background:var(--panel);border-left:1px solid var(--line)}
@@ -451,6 +464,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
 <div id="main">
   <!-- LEFT: functions -->
   <div class="panel" id="left">
+    <button class="pcollapse" id="leftCollapse" title="hide this panel">«</button>
     <div class="phead">Functions <span class="grow"></span><span id="fnCount" class="faint"></span></div>
     <div style="padding:8px 10px;border-bottom:1px solid var(--line)">
       <input id="fnSearch" placeholder="filter…" style="width:100%">
@@ -505,6 +519,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
 
   <!-- RIGHT: setup / checks / run / hits -->
   <div class="panel" id="right">
+    <button class="pcollapse right" id="rightCollapse" title="hide this panel">»</button>
     <div class="phead" id="rTitle">Setup</div>
     <div class="pbody" id="rBody">
       <div class="empty">Pick a function to manage its assumptions and checks.</div>
@@ -519,6 +534,8 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
   <div id="actLog"></div>
   <div class="actfoot faint">Agents drive this over MCP at <code>/mcp</code></div>
 </div>
+<button class="edgebtn left hidden" id="leftExpand" title="show functions">Functions ›</button>
+<button class="edgebtn right hidden" id="rightExpand" title="show setup">‹ Setup</button>
 <div id="modalHost"></div>
 <div id="toastHost"></div>
 

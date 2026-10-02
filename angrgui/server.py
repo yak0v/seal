@@ -563,8 +563,7 @@ def _mcp_run(addr):
             "stdin": flat.get("stdin"), "files": flat.get("files") or [], "limits": flat.get("limits") or {},
             "models": flat.get("models") or [],
             "checks": [c for c in flat.get("checks", []) if c.get("enabled", True)]}
-    if not spec["checks"]:
-        raise HTTPException(400, "no enabled checks on this function; add one first")
+    # checks are optional: with none, this just enumerates the paths (control-flow exploration)
     return {"run_id": _start_run(spec, source="agent")}
 
 
@@ -778,7 +777,7 @@ list_functions -> {"addr":"0x400666","name":"main"}; decompile shows it prints
 - Symbolic file the program reads: {"files":[{"name":".password","size":20}]}.
 - Constrain inputs: add_assumption(addr, "arg0 s> 0").  Limits: configure {"limits":{"steps":300,"seconds":60,"skip_calls":true}}.
 
-## Checks — add_check(addr, check). ADD AT LEAST ONE before run (run errors otherwise).
+## Checks — add_check(addr, check). Optional: with no checks, run just enumerates the paths.
 - reach          {"kind":"reach","addr":"0x.."}           any path that gets here
 - avoid          {"kind":"avoid","addr":"0x.."}           flag paths that hit a bad address
 - assert         {"kind":"assert","expr":"total < 0x1000","at_return":true}   an invariant that must hold
@@ -848,7 +847,7 @@ TOOL_DEFS = [
      "{\"kind\":\"assert\",\"expr\":\"total < 0x1000\",\"at_return\":true} or "
      "{\"kind\":\"reach\",\"addr\":\"0x..\"}.",
      "inputSchema": {"type": "object", "properties": {**_A, "check": {"type": "object"}}, "required": ["addr", "check"]}},
-    {"name": "run", "description": "Run the enabled checks on a function using its active scenario's setup. Returns a run_id.",
+    {"name": "run", "description": "Explore the function's paths using its active scenario, watching for the enabled checks (checks are optional — with none it just enumerates paths). Returns a run_id.",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
     {"name": "get_run", "description": "Results of a run: status, findings (with concrete witnesses), and the path tree.",
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},

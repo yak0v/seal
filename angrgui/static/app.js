@@ -72,6 +72,11 @@ async function init() {
   $("#actBtn").addEventListener("click", toggleActivity);
   $("#themeBtn").addEventListener("click", openThemeMenu);
   $("#docsBtn").addEventListener("click", openDocsModal);
+  $("#leftCollapse").addEventListener("click", () => setPanelCollapsed("left", true));
+  $("#rightCollapse").addEventListener("click", () => setPanelCollapsed("right", true));
+  $("#leftExpand").addEventListener("click", () => setPanelCollapsed("left", false));
+  $("#rightExpand").addEventListener("click", () => setPanelCollapsed("right", false));
+  ["left", "right"].forEach(s => { try { if (localStorage.getItem("collapse:" + s) === "1") setPanelCollapsed(s, true); } catch (e) {} });
   $("#followChk").addEventListener("change", e => { A.followAgent = e.target.checked; });
   $("#bottomClose").addEventListener("click", () => {
     const bp = $("#bottomPanel"); bp.classList.toggle("collapsed");
@@ -739,7 +744,10 @@ function sectionRun() {
     "skip calls ", el("span", { class: "faint" }, "(explore only this function)")));
 
   const running = A.run && (A.run.snapshot?.status === "running" || A.run.snapshot?.status === "pending");
-  const runBtn = el("button", { class: "primary", style: "width:100%;padding:8px", onclick: startRun }, "▶  Run checks");
+  const hasChecks = A.config.checks.some(c => c.enabled);
+  const runBtn = el("button", { class: "primary", style: "width:100%;padding:8px", onclick: startRun,
+    title: hasChecks ? "explore the paths and watch for the enabled checks" : "explore the paths (no checks — just enumerate the control flow)" },
+    hasChecks ? "▶  Run checks" : "▶  Explore paths");
   const cancelBtn = el("button", { style: "width:100%;padding:8px", onclick: cancelRun }, "■  Cancel");
   b.append(running ? cancelBtn : runBtn);
 
@@ -766,7 +774,6 @@ function limInput(label, key, L) {
 }
 
 async function startRun() {
-  if (!A.config.checks.some(c => c.enabled)) { toast("add at least one check first", true); return; }
   await saveConfig();
   try {
     const r = await jpost("/api/run", currentSpec());
@@ -1409,6 +1416,16 @@ function initSplitters() {
   }
 }
 function regraph() { const b = $("#dockGraph"); if (b && b._cfg) delete b._cfg; renderPathGraph(); }
+
+// hide a side panel off to the edge, leaving a button to bring it back
+function setPanelCollapsed(side, collapsed) {
+  const panel = $("#" + side); if (!panel) return;
+  panel.classList.toggle("collapsed", collapsed);
+  const sp = $(`.splitter[data-target="${side}"]`); if (sp) sp.style.display = collapsed ? "none" : "";
+  const exp = $("#" + side + "Expand"); if (exp) exp.classList.toggle("hidden", !collapsed);
+  try { localStorage.setItem("collapse:" + side, collapsed ? "1" : "0"); } catch (e) {}
+  regraph();   // the dock/graph width changed
+}
 
 function showAddr(addr) {
   // jump to an address and flash it — prefer the decompilation when IDA is connected
