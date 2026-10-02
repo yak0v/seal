@@ -77,6 +77,8 @@ async function init() {
   $("#leftExpand").addEventListener("click", () => setPanelCollapsed("left", false));
   $("#rightExpand").addEventListener("click", () => setPanelCollapsed("right", false));
   ["left", "right"].forEach(s => { try { if (localStorage.getItem("collapse:" + s) === "1") setPanelCollapsed(s, true); } catch (e) {} });
+  $$("#viewMode .segbtn").forEach(x => x.addEventListener("click", () => setViewMode(x.dataset.mode)));
+  try { setViewMode(localStorage.getItem("viewMode") || "setup", true); } catch (e) {}
   $("#followChk").addEventListener("change", e => { A.followAgent = e.target.checked; });
   $("#bottomClose").addEventListener("click", () => {
     const bp = $("#bottomPanel"); bp.classList.toggle("collapsed");
@@ -95,7 +97,6 @@ async function refreshState() {
     A.binary = s.binary;
     $("#binfo").textContent = `${s.binary.name}  ·  ${s.binary.arch}  ·  ${s.binary.function_count} funcs` +
       (s.binary.has_dwarf ? "  ·  DWARF" : "  ·  no debug info");
-    $("#hint").textContent = "Pick a function → set up its state → add checks → Run.";
     await loadFunctions();
   } else {
     $("#binfo").textContent = "no binary loaded";
@@ -1488,6 +1489,27 @@ function initSplitters() {
   }
 }
 function regraph() { const b = $("#dockGraph"); if (b && b._cfg) delete b._cfg; renderPathGraph(); }
+
+// a quick layout preset: Setup (configure, both panels) vs Explore (paths, Setup
+// hidden + wider graph/paths dock + the path-detail panel open)
+function setViewMode(mode, initial) {
+  A.viewMode = mode;
+  try { localStorage.setItem("viewMode", mode); } catch (e) {}
+  const dock = $("#dock"), bottom = $("#bottomPanel"), bclose = $("#bottomClose");
+  if (mode === "explore") {
+    setPanelCollapsed("right", true);
+    setPanelCollapsed("left", false);
+    if (dock) dock.style.width = "640px";
+    if (bottom) { bottom.classList.remove("collapsed"); if (bclose) bclose.textContent = "▾"; }
+  } else {
+    setPanelCollapsed("right", false);
+    setPanelCollapsed("left", false);
+    if (dock) dock.style.width = "380px";
+    if (bottom && !initial) { bottom.classList.add("collapsed"); if (bclose) bclose.textContent = "▴"; }
+  }
+  $$("#viewMode .segbtn").forEach(x => x.classList.toggle("on", x.dataset.mode === mode));
+  regraph();
+}
 
 // hide a side panel off to the edge, leaving a button to bring it back
 function setPanelCollapsed(side, collapsed) {
