@@ -441,6 +441,16 @@ def ida_refresh():
         raise HTTPException(502, str(e))
 
 
+@app.get("/api/ida/struct/{name}")
+def ida_struct(name: str):
+    if S.ida is None:
+        raise HTTPException(400, "not connected to IDA")
+    try:
+        return S.ida.struct_layout(name)
+    except MCPError as e:
+        raise HTTPException(502, str(e))
+
+
 @app.post("/api/script")
 def script(req: RunReq):
     b = _need_binary()
@@ -772,7 +782,11 @@ list_functions -> {"addr":"0x400666","name":"main"}; decompile shows it prints
 ## Declaring inputs (configure patch, or add_assumption)
 - Arguments are symbolic by default. Make one FIXED: configure {"args":[{"name":"n","mode":"concrete","value":16,"size":4}]}.
 - Floating-point param: add "float":true to the arg (required for float checks).
-- Pointer to a symbolic buffer: {"buffers":[{"arg":"buf","size":64}]}.
+- Pointer to a symbolic buffer: {"buffers":[{"arg":"buf","size":64}]} (pointer is concrete, contents symbolic).
+- Pointer to a struct: get_struct("TYPE") gives the member layout (offset/size/type); then set members via
+  {"buffers":[{"arg":"p","size":<sizeof>,"layout":[{"offset":12,"size":4,"mode":"sym","name":"p_size"},
+  {"offset":8,"size":4,"mode":"fixed","value":0}]}]} — listed members are set (named symbolic or fixed),
+  the rest stay symbolic. Named members show up in witnesses.
 - Symbolic stdin:  {"stdin":{"mode":"symbolic","size":32}}.
 - Symbolic file the program reads: {"files":[{"name":".password","size":20}]}.
 - Constrain inputs: add_assumption(addr, "arg0 s> 0").  Limits: configure {"limits":{"steps":300,"seconds":60,"skip_calls":true}}.
@@ -883,6 +897,10 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "ida_refresh", "description": "Re-pull names + decompilation from IDA (after you changed the IDB).",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_struct", "description": "A struct type's member layout from IDA (name, offset, size, type; pointer/nested-struct "
+     "members flagged). Use it to set up a pointer-to-struct argument: point the arg at a symbolic buffer and fill "
+     "members via configure buffers[].layout.",
+     "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
     {"name": "add_model", "description": "Model (hook) a function the target calls, so it isn't stepped into. "
      "model = {\"func\":\"name or 0x..\",\"kind\":...}. kinds: "
      "{\"kind\":\"symbolic\",\"name\":\"ret\",\"bits\":64} (fresh symbolic return); "
@@ -941,7 +959,12 @@ _MCP_TOOLS = {
     "ida_disconnect": lambda a: _mcp_ida_disconnect(),
     "ida_refresh": lambda a: _mcp_ida_refresh(),
     "add_model": lambda a: _mcp_add_model(a["addr"], a["model"]),
+    "get_struct": lambda a: (S.ida.struct_layout(a["name"]) if S.ida else _err_no_ida()),
 }
+
+
+def _err_no_ida():
+    raise HTTPException(400, "not connected to IDA")
 
 
 def _mcp_status_payload():

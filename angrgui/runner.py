@@ -128,13 +128,14 @@ class Run:
             arg_asts.append(bv)
             named[a.get("name") or f"arg{i}"] = bv
 
-        # Point the requested pointer arguments at fresh symbolic buffers.
+        # Point the requested pointer arguments at fresh symbolic buffers (optionally
+        # with a struct layout: specific members set to symbolic names or fixed values).
         buffers = {}
         for b in self.spec.get("buffers", []):
             argname = b["arg"]
             size = int(b.get("size", 64))
             buf = claripy.BVS(f"{argname}_buf", size * 8)
-            buffers[argname] = (buf, size)
+            buffers[argname] = (buf, size, b.get("layout") or [])
 
         # stdin has to be handed to call_state: swapping state.posix.stdin afterwards
         # leaves the file uninitialised and the first state copy crashes
@@ -167,12 +168,26 @@ class Run:
 
         # Allocate + fill buffers, repoint the pointer args.
         base = self.binary.scratch_base()
-        for argname, (buf, size) in buffers.items():
+        for argname, (buf, size, layout) in buffers.items():
             addr = base
             base += (size + 0xfff) & ~0xfff
-            state.memory.store(addr, buf, endness="Iend_BE")
+            state.memory.store(addr, buf, endness="Iend_BE")   # the whole region starts symbolic
             named[f"{argname}_buf"] = buf
             named[argname] = claripy.BVV(addr, self.arch.bits)   # the pointer itself is concrete
+            # a struct layout overwrites specific members (fixed value or named symbolic),
+            # leaving unlisted bytes symbolic; stored little-endian so integers read right.
+            for mb in layout:
+                try:
+                    moff = int(mb.get("offset", 0)); msz = int(mb.get("size") or self.arch.bytes)
+                    bits = max(8, msz * 8)
+                    if mb.get("mode") == "fixed":
+                        mv = claripy.BVV(int(mb.get("value", 0)) & ((1 << bits) - 1), bits)
+                    else:
+                        mnm = mb.get("name") or f"{argname}.{moff:x}"
+                        mv = claripy.BVS(mnm, bits); named[mnm] = mv
+                    state.memory.store(addr + moff, mv, endness=self.arch.memory_endness)
+                except Exception as e:
+                    log.warning("buffer %s member at +%s: %s", argname, mb.get("offset"), e)
             # overwrite the corresponding register/stack slot with the pointer
             idx = next((i for i, a in enumerate(args) if a.get("name") == argname), None)
             if idx is not None:

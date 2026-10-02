@@ -338,6 +338,51 @@ class IdaSession:
             self._decomp[ea] = out
             return out
 
+    def struct_layout(self, name: str) -> dict:
+        """The member layout of a struct type from IDA (name, offset, size, type),
+        with pointer/nested-struct members flagged for recursive expansion. Uses the
+        plugin's py_eval (IDAPython); raises if that tool isn't available."""
+        code = (
+            "import ida_typeinf, json\n"
+            "NAME = " + json.dumps(name) + "\n"
+            "til = ida_typeinf.get_idati()\n"
+            "t = ida_typeinf.tinfo_t()\n"
+            "ok = t.get_named_type(til, NAME)\n"
+            "members = []\n"
+            "size = 0\n"
+            "if ok:\n"
+            "    size = t.get_size()\n"
+            "    u = ida_typeinf.udt_type_data_t()\n"
+            "    if t.get_udt_details(u):\n"
+            "        for m in u:\n"
+            "            mt = m.type\n"
+            "            tn = ''\n"
+            "            try:\n"
+            "                if mt.is_ptr():\n"
+            "                    po = mt.get_pointed_object()\n"
+            "                    tn = str(po.get_type_name() or '') if po is not None else ''\n"
+            "                elif mt.is_struct():\n"
+            "                    tn = str(mt.get_type_name() or '')\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "            members.append({'name': m.name, 'offset': m.offset//8, 'size': m.size//8,\n"
+            "                            'type': str(mt), 'is_ptr': bool(mt.is_ptr()),\n"
+            "                            'is_struct': bool(mt.is_struct()), 'type_name': tn})\n"
+            "result = json.dumps({'name': NAME, 'size': size, 'members': members, 'found': bool(ok)})\n"
+        )
+        try:
+            res = self.client.call_tool("py_eval", {"code": code})
+        except MCPError as e:
+            raise MCPError(f"struct inspection needs the IDA 'py_eval' tool, which this server lacks ({e})")
+        s = res.get("result") if isinstance(res, dict) else res
+        try:
+            data = json.loads(s)
+        except Exception:
+            raise MCPError(f"could not read struct layout from IDA: {str(s)[:200]}")
+        if not data.get("found"):
+            raise MCPError(f"no type named {name!r} in IDA")
+        return data
+
     def refresh(self) -> dict:
         """Drop caches and re-pull names — after renaming/retyping in IDA."""
         with self._lock:
