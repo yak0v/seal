@@ -883,13 +883,144 @@ function renderTree(force) {
   treeKey = key;
 
   const T = pathModel(snap);
+  const view = pathsView();
   const keepScroll = pane.scrollTop;
-  pane.replaceChildren(checksBar(), pathsSummary(T, snap));
-  const box = el("div", { class: "ptree" });
-  T.roots.forEach(r => box.append(renderPathNode(T, r, snap)));
-  pane.append(box);
-  pane.scrollTop = keepScroll;
+  const summary = pathsSummary(T, snap);
+  summary.append(pathsViewToggle());
+  pane.replaceChildren(checksBar(), summary);
+  if (view === "tree") {
+    pane.classList.add("treemode");
+    const host = el("div", { class: "ptreegraph" });
+    pane.append(host);
+    drawPathTree(host, T, snap);
+  } else {
+    pane.classList.remove("treemode");
+    const box = el("div", { class: "ptree" });
+    T.roots.forEach(r => box.append(renderPathNode(T, r, snap)));
+    pane.append(box);
+    pane.scrollTop = keepScroll;
+  }
   updateBottomDetail();
+}
+function pathsView() { try { return A.pathsView || (A.pathsView = localStorage.getItem("pathsView") || "list"); } catch (e) { return A.pathsView || "list"; } }
+function pathsViewToggle() {
+  const mk = (v, label) => el("div", { class: "segbtn" + (pathsView() === v ? " on" : ""),
+    onclick: () => { A.pathsView = v; try { localStorage.setItem("pathsView", v); } catch (e) {} A._ptreeSig = null; renderTree(true); } }, label);
+  return el("div", { class: "seg pathsview", title: "show the explored paths as an indented list or a branching tree" }, mk("list", "List"), mk("tree", "Tree"));
+}
+
+// the path tree drawn as an actual branching tree (nodes + edges), with pan/zoom
+function drawPathTree(pane, T, snap) {
+  if (typeof dagre === "undefined") { pane.textContent = "tree layout unavailable"; return; }
+  const NS = "http://www.w3.org/2000/svg";
+  const short = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : (s || ""));
+  const gr = new dagre.graphlib.Graph();
+  gr.setGraph({ rankdir: "TB", nodesep: 16, ranksep: 30, marginx: 14, marginy: 14 });
+  gr.setDefaultEdgeLabel(() => ({}));
+  const CW = 6.3, PAD = 9;
+  snap.tree.forEach(n => {
+    const leaf = !T.kids[n.id];
+    let label, sub;
+    if (n.parent === null) { label = "start"; sub = `${A.fn ? (A.fn.ida_name || A.fn.name) : "fn"}(${((A.config && A.config.args) || []).map(a => a.name).join(", ")})`; }
+    else { label = short(n.cond || "(branch)", 42); sub = n.decided_at && n.decided_at.line ? "line " + n.decided_at.line : ""; }
+    if (leaf) { const r = leafReason(n, snap); sub = (END_STYLE[r] ? END_STYLE[r][1] : r) + (n.hits.length ? " · finding" : ""); if (n.parent === null) label = "start"; }
+    const w = Math.max(64, Math.min(280, Math.max(label.length, sub.length) * CW + PAD * 2));
+    gr.setNode(n.id, { label, sub, leaf, node: n, width: w, height: 32 });
+  });
+  snap.tree.forEach(n => { if (n.parent !== null && T.byId[n.parent]) gr.setEdge(n.parent, n.id); });
+  dagre.layout(gr);
+  const W = gr.graph().width || 300, H = gr.graph().height || 200;
+
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("width", "100%"); svg.setAttribute("height", "100%");
+  svg.style.cssText = "display:block;background:var(--bg);cursor:grab;touch-action:none;user-select:none";
+  svg.innerHTML = `<defs><marker id="ptarr" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto"><path d="M0,0 L6,2.5 L0,5 Z" fill="var(--line2)"/></marker></defs>`;
+  const viewport = document.createElementNS(NS, "g");
+  svg.append(viewport);
+
+  const nodeEls = {};
+  gr.edges().forEach(eid => {
+    const e = gr.edge(eid), pts = e.points;
+    let d = `M${pts[0].x},${pts[0].y}`;
+    for (let i = 1; i < pts.length; i++) d += ` L${pts[i].x},${pts[i].y}`;
+    const p = document.createElementNS(NS, "path");
+    p.setAttribute("d", d); p.setAttribute("fill", "none"); p.setAttribute("stroke", "var(--line2)");
+    p.setAttribute("stroke-width", "1.3"); p.setAttribute("marker-end", "url(#ptarr)");
+    viewport.append(p);
+  });
+  gr.nodes().forEach(id => {
+    const g = gr.node(id);
+    const gEl = document.createElementNS(NS, "g");
+    gEl.setAttribute("transform", `translate(${g.x - g.width / 2},${g.y - g.height / 2})`);
+    gEl.style.cursor = "pointer";
+    const rect = document.createElementNS(NS, "rect");
+    rect.setAttribute("width", g.width); rect.setAttribute("height", g.height); rect.setAttribute("rx", 6);
+    gEl.append(rect);
+    const t1 = document.createElementNS(NS, "text");
+    t1.setAttribute("x", 8); t1.setAttribute("y", g.sub ? 13 : 19);
+    t1.setAttribute("font-family", "var(--mono)"); t1.setAttribute("font-size", "11"); t1.setAttribute("font-weight", "600");
+    t1.textContent = g.label; gEl.append(t1);
+    let t2 = null;
+    if (g.sub) {
+      t2 = document.createElementNS(NS, "text");
+      t2.setAttribute("x", 8); t2.setAttribute("y", 25);
+      t2.setAttribute("font-family", "var(--sans)"); t2.setAttribute("font-size", "9.5");
+      t2.textContent = g.sub; gEl.append(t2);
+    }
+    gEl.addEventListener("click", () => { if (!dragged) selectPathNode(+id); });
+    nodeEls[id] = { rect, t1, t2, node: g.node, leaf: g.leaf };
+    viewport.append(gEl);
+  });
+
+  function recolor() {
+    const css = getComputedStyle(document.documentElement);
+    const v = (k, fb) => (css.getPropertyValue(k).trim() || fb);
+    const node = v("--panel2", "#1a1e25"), line2 = v("--line2", "#30363f"), ink = v("--ink"), dim = v("--dim");
+    const accent = v("--accent", "#4c9aff"), bad = v("--bad", "#f85149"), ok = v("--ok", "#3fb950"), warn = v("--warn", "#e3b341");
+    const tint = (hex, a) => { const m = /^#?([0-9a-f]{6})$/i.exec(hex); if (!m) return hex; const x = parseInt(m[1], 16); return `rgba(${x >> 16 & 255},${x >> 8 & 255},${x & 255},${a})`; };
+    const sel = A.selNode, onChain = new Set(sel != null && T.byId[sel] ? T.chain(sel).map(c => c.id) : []);
+    for (const id in nodeEls) {
+      const ne = nodeEls[id], n = ne.node, seld = +id === sel, hit = n.hits.length > 0;
+      const reason = ne.leaf ? leafReason(n, snap) : null;
+      let stroke = line2, fill = node, accentCol = null;
+      if (hit) { accentCol = bad; }
+      else if (ne.leaf) { accentCol = reason === "returned" ? ok : reason === "unconstrained" ? bad : (reason === "exit" || reason === "error") ? warn : line2; }
+      if (seld) stroke = accent; else if (onChain.has(+id)) stroke = accent; else if (accentCol) stroke = accentCol;
+      fill = seld ? tint(accent, .18) : hit ? tint(bad, .14) : node;
+      ne.rect.setAttribute("fill", fill);
+      ne.rect.setAttribute("stroke", stroke);
+      ne.rect.setAttribute("stroke-width", (seld || onChain.has(+id) || hit) ? 2 : 1);
+      ne.t1.setAttribute("fill", hit ? bad : ink);
+      if (ne.t2) ne.t2.setAttribute("fill", dim);
+    }
+  }
+
+  // pan + zoom, view persisted across re-renders (keyed to the tree's structure)
+  const sig = snap.tree.length + ":" + JSON.stringify(snap.tree).length;
+  const fresh = A._ptreeSig !== sig;
+  const view = (!fresh && A._ptreeView) ? A._ptreeView : (A._ptreeView = { x: 12, y: 14, k: 1 });
+  A._ptreeSig = sig;
+  const apply = () => viewport.setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`);
+  let dragging = false, dragged = false, sx = 0, sy = 0;
+  svg.addEventListener("mousedown", ev => { dragging = true; dragged = false; sx = ev.clientX; sy = ev.clientY; svg.style.cursor = "grabbing"; });
+  const onMove = ev => { if (!dragging) return; const dx = ev.clientX - sx, dy = ev.clientY - sy; if (Math.abs(dx) + Math.abs(dy) > 3) dragged = true; view.x += dx; view.y += dy; sx = ev.clientX; sy = ev.clientY; apply(); };
+  const onUp = () => { dragging = false; svg.style.cursor = "grab"; };
+  window.addEventListener("mousemove", onMove); window.addEventListener("mouseup", onUp);
+  svg.addEventListener("wheel", ev => {
+    ev.preventDefault();
+    const r = svg.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    const f = ev.deltaY < 0 ? 1.12 : 1 / 1.12, nk = Math.max(0.2, Math.min(3, view.k * f));
+    view.x = mx - (mx - view.x) * (nk / view.k); view.y = my - (my - view.y) * (nk / view.k); view.k = nk; apply();
+  }, { passive: false });
+
+  pane.replaceChildren(svg);
+  apply();
+  if (fresh) requestAnimationFrame(() => {
+    const r = svg.getBoundingClientRect(); if (!r.width) return;
+    view.k = Math.max(0.25, Math.min(1, (r.width - 24) / W));
+    view.x = (r.width - W * view.k) / 2; view.y = 12; apply();
+  });
+  recolor();
 }
 
 // the selected path's detail, shown in the resizable bottom panel (distinct from the tree)

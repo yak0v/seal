@@ -120,6 +120,10 @@ select{font-family:var(--sans)}
 .dockttl{font-weight:600;text-transform:uppercase;letter-spacing:.5px;font-size:10px;color:var(--ink)}
 #dockGraph{height:44%;flex:0 0 auto;min-height:120px;overflow:hidden;position:relative;background:var(--bg)}
 #dockPaths{flex:1;overflow:auto;min-height:0;padding:8px 10px 30px}
+#dockPaths.treemode{display:flex;flex-direction:column;overflow:hidden;padding:8px 10px}
+#dockPaths.treemode .checksbar,#dockPaths.treemode .psum{flex:0 0 auto}
+.ptreegraph{flex:1;min-height:180px;position:relative;margin:0 -10px -8px;border-top:1px solid var(--line)}
+.seg.pathsview{margin-left:auto}
 .splitter-h{flex:0 0 5px;cursor:row-resize;background:var(--line);opacity:.5}
 .splitter-h:hover,.splitter-h.dragging{opacity:1;background:var(--accent)}
 #right{width:360px;border-right:none;border-left:1px solid var(--line)}
