@@ -850,6 +850,9 @@ function highlightHits() {
   $$(".insn", pane).forEach(r => {
     r.classList.remove("hit");
     r.classList.toggle("onpath", !!A.pathHighlight && A.pathHighlight.has(+r.dataset.block));
+    const isBranch = !!A.branchPts && A.branchPts.has(+r.dataset.addr);
+    r.classList.toggle("branchpt", isBranch);
+    if (isBranch) r.title = "branch taken on this flow: " + (A.branchCond[+r.dataset.addr] || "?");
   });
   const hits = A.run?.snapshot?.hits || [];
   for (const h of hits) {
@@ -1181,12 +1184,27 @@ function selectPathNode(id) {
 }
 
 function updatePathHighlight() {
-  // the blocks executed from the function entry down to the selected node
+  // the blocks executed from the function entry down to the selected node, plus the
+  // branch decisions taken along the way (the conditional at each split, and which side)
   const snap = A.run?.snapshot;
-  A.pathHighlight = null;
+  A.pathHighlight = null; A.branchPts = null; A.branchBlocks = null; A.branchCond = null;
   if (snap && snap.tree && A.selNode != null) {
     const T = pathModel(snap);
-    if (T.byId[A.selNode]) A.pathHighlight = new Set(T.chain(A.selNode).flatMap(n => n.blocks));
+    if (T.byId[A.selNode]) {
+      const chain = T.chain(A.selNode);
+      A.pathHighlight = new Set(chain.flatMap(n => n.blocks));
+      A.branchPts = new Set(); A.branchBlocks = new Set(); A.branchCond = {}; A.branchBlockCond = {};
+      const a2b = decompAddrBlock();
+      chain.forEach(n => {
+        if (n.parent !== null && n.decided_at && n.decided_at.addr != null) {
+          const ad = n.decided_at.addr;
+          A.branchPts.add(ad);
+          A.branchCond[ad] = n.cond || "";
+          const bl = a2b[ad];
+          if (bl != null) { A.branchBlocks.add(bl); A.branchBlockCond[bl] = n.cond || ""; }
+        }
+      });
+    }
   }
   highlightHits();
   if ($("#pane-decomp").classList.contains("sel")) renderDecomp();   // re-tint decompilation lines (cached, no refetch)
@@ -1282,6 +1300,10 @@ function renderDecompLines(code, into) {
       div.title = hx64(addr) + " — click for checks";
       const blk = a2b[addr];
       if (path && blk != null && path.has(blk)) div.classList.add("onpath");
+      if (A.branchBlocks && blk != null && A.branchBlocks.has(blk)) {
+        div.classList.add("branchpt");
+        div.title = hx64(addr) + " — branch taken on this flow: " + (A.branchBlockCond[blk] || "?");
+      }
       if (hits.has(addr) || (blk != null && hitBlocks.has(blk))) div.classList.add("hitline");
       highlightC(text.length ? text : " ", div);
       const acts = el("span", { class: "clacts" },
@@ -2152,20 +2174,21 @@ function drawCFG(pane, g) {
     const v = (name, fb) => (css.getPropertyValue(name).trim() || fb);
     const node = v("--panel2", "#1a1e25"), line2 = v("--line2", "#30363f");
     const ink = v("--ink", "#e8ecf1"), dim = v("--dim", "#98a1ad");
-    const accent = v("--accent", "#4c9aff"), bad = v("--bad", "#f85149");
+    const accent = v("--accent", "#4c9aff"), accent2 = v("--accent2", "#7c5cff"), bad = v("--bad", "#f85149");
+    const branchBlocks = A.branchBlocks || new Set();
     const tint = (hex, a) => { const m = /^#?([0-9a-f]{6})$/i.exec(hex); if (!m) return hex; const n = parseInt(m[1], 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`; };
     for (const addr in nodeEls) {
-      const ne = nodeEls[addr], onPath = pathBlocks.has(+addr), hasHit = ne.insns.some(i => hitAddrs.has(i.addr));
-      ne.rect.setAttribute("fill", hasHit ? tint(bad, .16) : onPath ? tint(accent, .16) : node);
-      ne.rect.setAttribute("stroke", hasHit ? bad : onPath ? accent : line2);
-      ne.rect.setAttribute("stroke-width", (hasHit || onPath) ? 2 : 1);
-      ne.head.setAttribute("fill", hasHit ? bad : dim);
+      const ne = nodeEls[addr], onPath = pathBlocks.has(+addr), hasHit = ne.insns.some(i => hitAddrs.has(i.addr)), isBranch = branchBlocks.has(+addr);
+      ne.rect.setAttribute("fill", hasHit ? tint(bad, .16) : isBranch ? tint(accent2, .18) : onPath ? tint(accent, .16) : node);
+      ne.rect.setAttribute("stroke", hasHit ? bad : isBranch ? accent2 : onPath ? accent : line2);
+      ne.rect.setAttribute("stroke-width", (hasHit || onPath || isBranch) ? 2 : 1);
+      ne.head.setAttribute("fill", hasHit ? bad : isBranch ? accent2 : dim);
       (ne.lineEls || []).forEach(t => t.setAttribute("fill", ink));
     }
     for (const e of edgeEls) {
       const hi = pathBlocks.has(e.v) && pathBlocks.has(e.w);
-      const color = e.kind === "call" ? "#7c5cff" : e.kind === "return" ? "#3fb950" : "#5a6577";
-      e.p.setAttribute("stroke", hi ? "#4c9aff" : color);
+      const color = e.kind === "call" ? accent2 : e.kind === "return" ? v("--ok", "#3fb950") : "#5a6577";
+      e.p.setAttribute("stroke", hi ? accent : color);
       e.p.setAttribute("stroke-width", hi ? 2.5 : 1.3);
       e.p.setAttribute("marker-end", hi ? "url(#arrhi)" : "url(#arr)");
     }

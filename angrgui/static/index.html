@@ -218,6 +218,7 @@ select{font-family:var(--sans)}
 .stats b{color:var(--ink)}
 
 .insn.onpath{border-left-color:var(--accent);background:rgba(76,154,255,.07)}
+.insn.branchpt{border-left-color:var(--accent2);background:color-mix(in srgb,var(--accent2) 15%,transparent)}
 
 /* paths tab */
 #pane-paths.sel{overflow:hidden}
@@ -338,7 +339,8 @@ select{font-family:var(--sans)}
 .ccode .cline[data-addr]{cursor:pointer}
 .ccode .cline[data-addr]:hover{background:#1a2230}
 .ccode .cline.onpath{background:rgba(76,154,255,.12);border-left-color:var(--accent)}
-.ccode .cline.hitline{background:rgba(248,81,73,.14);border-left-color:var(--bad)}
+.ccode .cline.branchpt{background:color-mix(in srgb,var(--accent2) 22%,transparent);border-left-color:var(--accent2);box-shadow:inset 3px 0 0 var(--accent2)}
+.ccode .cline.hitline{background:rgba(248,81,73,.14);border-left-color:var(--bad);box-shadow:none}
 .ccode .cline{position:relative;padding-right:80px}
 .clacts{position:absolute;right:6px;top:0;display:none;gap:3px}
 .ccode .cline:hover .clacts{display:inline-flex}
