@@ -307,7 +307,7 @@ function hitExport(h) {
 function exportScenario() {
   const sc = A.config, snap = A.run && A.run.snapshot;
   const payload = {
-    tool: "angr-bug-hunter", exported_at: new Date().toISOString(),
+    tool: "seal", exported_at: new Date().toISOString(),
     binary: A.binary ? { name: A.binary.name, path: A.binary.path, arch: A.binary.arch, bits: A.binary.bits } : null,
     function: A.fn ? { addr: hx64(A.fn.addr), name: A.fn.ida_name || A.fn.name } : null,
     scenario: sc ? { name: sc.name, args: sc.args, buffers: sc.buffers,
@@ -744,10 +744,8 @@ function sectionRun() {
     "skip calls ", el("span", { class: "faint" }, "(explore only this function)")));
 
   const running = A.run && (A.run.snapshot?.status === "running" || A.run.snapshot?.status === "pending");
-  const hasChecks = A.config.checks.some(c => c.enabled);
   const runBtn = el("button", { class: "primary", style: "width:100%;padding:8px", onclick: startRun,
-    title: hasChecks ? "explore the paths and watch for the enabled checks" : "explore the paths (no checks — just enumerate the control flow)" },
-    hasChecks ? "▶  Run checks" : "▶  Explore paths");
+    title: "explore the paths; any enabled checks are watched for along the way" }, "▶  Explore paths");
   const cancelBtn = el("button", { style: "width:100%;padding:8px", onclick: cancelRun }, "■  Cancel");
   b.append(running ? cancelBtn : runBtn);
 
@@ -1326,10 +1324,13 @@ function renderDecompLines(code, into) {
 
 // "graphite" = default (no data-theme). bg = page colour swatch, dot = accent.
 const THEMES = [
+  { id: "ocean", name: "Ocean", bg: "#0b1620", dot: "#36c6c0" },
+  { id: "abyss", name: "Abyss", bg: "#07131e", dot: "#2ec5d3" },
+  { id: "lagoon", name: "Lagoon", bg: "#0a1a1e", dot: "#3fd6b0" },
+  { id: "tide", name: "Tide", bg: "#0c1824", dot: "#5bb3e6" },
   { id: "graphite", name: "Graphite", bg: "#0c0e12", dot: "#46d07e" },
   { id: "navy", name: "Navy", bg: "#0e1117", dot: "#4c9aff" },
   { id: "slate", name: "Slate", bg: "#111318", dot: "#9a86ff" },
-  { id: "ocean", name: "Ocean", bg: "#0b1620", dot: "#36c6c0" },
   { id: "forest", name: "Forest", bg: "#0c130e", dot: "#5fd38a" },
   { id: "grape", name: "Grape", bg: "#120e18", dot: "#b58cff" },
   { id: "crimson", name: "Crimson", bg: "#140d10", dot: "#ff6b7a" },
@@ -1345,7 +1346,7 @@ const THEMES = [
   { id: "tokyonight", name: "Tokyo Night", bg: "#1a1b26", dot: "#7aa2f7" },
   { id: "nightowl", name: "Night Owl", bg: "#011627", dot: "#82aaff" },
 ];
-function curTheme() { try { return localStorage.getItem("theme") || "graphite"; } catch (e) { return "graphite"; } }
+function curTheme() { try { return localStorage.getItem("theme") || "ocean"; } catch (e) { return "ocean"; } }
 function applyTheme() {
   const t = curTheme();
   if (t === "graphite") document.documentElement.removeAttribute("data-theme");
@@ -1872,13 +1873,13 @@ async function openDocsModal() {
   const body = el("div", { class: "docbody" });
 
   body.append(
-    p(el("b", {}, "angr bug hunter"), " drives ", el("b", {}, "angr"),
+    p(el("b", {}, "SEAL"), " (Symbolic Execution Analysis Lab) drives ", el("b", {}, "angr"),
       " symbolic execution behind a visual UI. An agent sets up a function's initial state, adds checks, runs them, and reads back concrete inputs that trigger each finding — while a human watches every action live in this window."));
 
   body.append(h("1 · Connect"));
   body.append(p("The tool exposes a built-in ", el("b", {}, "MCP server"), " (", (d.transport || "Streamable HTTP"), "). Point your MCP client at:"));
   body.append(pre(mcpUrl));
-  body.append(p("Protocol ", code(d.protocol || "2025-06-18"), ", server name ", code(d.server_name || "angr-bug-hunter"),
+  body.append(p("Protocol ", code(d.protocol || "2025-06-18"), ", server name ", code(d.server_name || "seal"),
     ". Standard MCP handshake: ", code("initialize"), " → ", code("tools/list"), " → ", code("tools/call"),
     ". No auth. Everything you do appears in the GUI's ", el("b", {}, "Activity"), " feed in real time, and the human can follow along (the view auto-jumps to your runs)."));
 

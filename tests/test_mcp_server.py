@@ -56,7 +56,7 @@ def _addr(binary, name):
 
 def test_initialize_and_tools_list(loaded):
     init = srv._handle_mcp({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-    assert init["result"]["serverInfo"]["name"] == "angr-bug-hunter"
+    assert init["result"]["serverInfo"]["name"] == "seal"
     names = {t["name"] for t in srv._handle_mcp(
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]}
     assert {"list_functions", "configure", "add_assumption", "add_check", "run", "get_run"} <= names

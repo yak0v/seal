@@ -747,7 +747,7 @@ def _mcp_guide():
     return {"guide": GUIDE}
 
 
-GUIDE = r"""# angr bug hunter — guide for agents
+GUIDE = r"""# SEAL (Symbolic Execution Analysis Lab) — guide for agents
 
 ## What this tool does (plain terms)
 It runs ONE function with its inputs left UNKNOWN ("symbolic") and asks a solver
@@ -980,7 +980,7 @@ def _handle_mcp(msg: dict):
     if method == "initialize":
         return {"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": MCP_PROTOCOL, "capabilities": {"tools": {}},
-            "serverInfo": {"name": "angr-bug-hunter", "version": "0.1"},
+            "serverInfo": {"name": "seal", "version": "0.1"},
             "instructions": (
                 "This server drives angr symbolic execution: it runs ONE function with "
                 "its inputs left symbolic (unknown) and finds CONCRETE inputs that reach a "
@@ -1038,7 +1038,7 @@ def agent_docs(request: Request):
     the connection details, the expression language and the available checks."""
     base = str(request.base_url).rstrip("/")
     return {
-        "server_name": "angr-bug-hunter",
+        "server_name": "seal",
         "protocol": MCP_PROTOCOL,
         "mcp_url": base + "/mcp",
         "transport": "MCP Streamable HTTP (POST JSON-RPC; responses are JSON or SSE)",

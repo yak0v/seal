@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>angr bug hunter</title>
+<title>SEAL — Symbolic Execution Analysis Lab</title>
 <style>
 :root{
   --bg:#0c0e12; --panel:#13161b; --panel2:#1a1e25; --line:#252a33; --line2:#30363f;
@@ -23,7 +23,17 @@ html[data-theme="navy"]{--bg:#0e1117;--panel:#161b22;--panel2:#1c2230;--line:#2a
 html[data-theme="slate"]{--bg:#111318;--panel:#1a1d24;--panel2:#22262f;--line:#2f343e;--line2:#3b414c;
   --ink:#edf0f4;--field:#0f1217}
 html[data-theme="ocean"]{--bg:#0b1620;--panel:#102230;--panel2:#16303f;--line:#1f3d4e;--line2:#2b5062;
-  --green:#36c6c0;--green-dim:rgba(54,198,192,.16);--accent:#49b3ff;--field:#081219}
+  --green:#36c6c0;--green-dim:rgba(54,198,192,.16);--accent:#49b3ff;--field:#081219;
+  --syn-kw:#6cb6ff;--syn-ty:#56d4dd;--syn-str:#5fd3b2;--syn-cm:#5f7d8d;--syn-mn:#49b3ff;--syn-cond:#56d4dd}
+html[data-theme="abyss"]{--bg:#07131e;--panel:#0c1f2e;--panel2:#112b3b;--line:#1b3848;--line2:#274c5e;
+  --ink:#dce8ee;--dim:#a9bfca;--faint:#6b8494;--green:#2ec5d3;--green-dim:rgba(46,197,211,.16);--accent:#3d9be0;--accent2:#7c9cff;--field:#050e17;--chip:#112b3b;
+  --syn-kw:#6cb6ff;--syn-ty:#56d4dd;--syn-str:#5fd3b2;--syn-cm:#5f7d8d;--syn-mn:#3d9be0;--syn-cond:#56d4dd}
+html[data-theme="lagoon"]{--bg:#0a1a1e;--panel:#0f262b;--panel2:#163238;--line:#20454c;--line2:#2c5a62;
+  --ink:#dcebe8;--dim:#a8c5c0;--faint:#6b8c88;--green:#3fd6b0;--green-dim:rgba(63,214,176,.16);--accent:#45c8d8;--accent2:#6fd0ff;--field:#06151a;--chip:#163238;
+  --syn-kw:#58c8e0;--syn-ty:#57d6bb;--syn-str:#8fe0a0;--syn-cm:#5f8580;--syn-mn:#45c8d8;--syn-cond:#57d6bb}
+html[data-theme="tide"]{--bg:#0c1824;--panel:#122636;--panel2:#1a3348;--line:#254359;--line2:#33587a;
+  --ink:#dde7f2;--dim:#aabccf;--faint:#6d8298;--green:#5bb3e6;--green-dim:rgba(91,179,230,.16);--accent:#5bb3e6;--accent2:#8f9cff;--field:#08121c;--chip:#1a3348;
+  --syn-kw:#7cb0ff;--syn-ty:#5cc8e0;--syn-str:#6fd3bb;--syn-cm:#5f768c;--syn-mn:#5bb3e6;--syn-cond:#5cc8e0}
 html[data-theme="forest"]{--bg:#0c130e;--panel:#111b14;--panel2:#17261c;--line:#213025;--line2:#2d4433;
   --green:#5fd38a;--green-dim:rgba(95,211,138,.16);--accent:#4fb3a0;--field:#0a1009;--chip:#17261c}
 html[data-theme="grape"]{--bg:#120e18;--panel:#1a1424;--panel2:#241a33;--line:#322744;--line2:#43345c;
@@ -99,8 +109,11 @@ select{font-family:var(--sans)}
 /* layout */
 #top{height:48px;display:flex;align-items:center;gap:12px;padding:0 14px;
   background:var(--panel);border-bottom:1px solid var(--line)}
-#top .brand{font-weight:700;letter-spacing:.2px;font-size:14px}
-#top .brand b{color:var(--green)}
+#top .brand{display:flex;align-items:center;gap:9px}
+#top .logo{width:28px;height:28px;flex:0 0 auto}
+#top .brandtext{display:flex;flex-direction:column;line-height:1.08}
+#top .bname{font-weight:800;letter-spacing:1.5px;font-size:15px;color:var(--ink)}
+#top .bfull{font-size:8px;letter-spacing:.4px;color:var(--faint);text-transform:uppercase;white-space:nowrap}
 #top .binfo{font-family:var(--mono);color:var(--dim);font-size:12px}
 #main{display:flex;height:calc(100% - 48px)}
 #centerCol{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0}
@@ -116,10 +129,10 @@ select{font-family:var(--sans)}
 /* collapsible side panels */
 #left,#right{position:relative}
 #left.collapsed,#right.collapsed{display:none}
-.pcollapse{position:absolute;top:9px;right:7px;z-index:5;width:20px;height:20px;padding:0;line-height:1;
-  background:transparent;border:none;color:var(--faint);font-size:14px;cursor:pointer;border-radius:4px}
+.pcollapse{position:absolute;top:8px;right:6px;z-index:6;width:20px;height:20px;padding:0;line-height:18px;text-align:center;
+  background:var(--panel);border:none;color:var(--faint);font-size:14px;cursor:pointer;border-radius:4px}
 .pcollapse:hover{color:var(--ink);background:var(--panel2)}
-.pcollapse.right{right:auto;left:7px}
+#left .phead,#right .phead{padding-right:30px}
 .edgebtn{position:fixed;top:58px;z-index:45;padding:7px 8px;font-size:11px;font-weight:600;letter-spacing:.3px;
   background:var(--panel2);color:var(--dim);border:1px solid var(--line2);cursor:pointer;writing-mode:vertical-rl;text-orientation:mixed}
 .edgebtn:hover{color:var(--green);border-color:var(--green)}
@@ -450,7 +463,17 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
 </head>
 <body>
 <div id="top">
-  <div class="brand"><b>angr</b> bug hunter</div>
+  <div class="brand" title="SEAL — Symbolic Execution Analysis Lab">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="14" fill="none" stroke="var(--line2)" stroke-width="1.3"/>
+      <circle cx="16" cy="16" r="11.5" fill="none" stroke="var(--green)" stroke-width="2"/>
+      <path d="M16 9.5 V14.5 M16 14.5 L11 20.5 M16 14.5 L21 20.5" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="16" cy="9.3" r="2.1" fill="var(--green)"/>
+      <circle cx="11" cy="20.7" r="2.1" fill="var(--green)"/>
+      <circle cx="21" cy="20.7" r="2.1" fill="var(--accent)"/>
+    </svg>
+    <span class="brandtext"><b class="bname">SEAL</b><span class="bfull">Symbolic Execution Analysis Lab</span></span>
+  </div>
   <button id="openBtn" class="tiny">Open binary…</button>
   <button id="idaBtn" class="tiny" title="Connect to an IDA MCP server for real names + decompilation">IDA: off</button>
   <button id="actBtn" class="tiny" title="Live activity — actions from you and from agents (MCP)">Activity <span id="actBadge" class="actbadge"></span></button>
