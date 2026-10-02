@@ -408,6 +408,24 @@ select{font-family:var(--sans)}
 .dtbl td:first-child{white-space:nowrap}
 .dargs{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:3px}
 .dcheck{margin:7px 0;color:var(--dim)}
+/* struct editor */
+.structtbl{max-height:46vh;overflow:auto;border:1px solid var(--line);border-radius:6px;margin-top:10px}
+.strow{display:flex;align-items:center;gap:6px;padding:3px 8px;border-bottom:1px solid var(--line);font-size:12px}
+.strow:last-child{border-bottom:none}
+.strow.sthead{position:sticky;top:0;background:var(--panel2);color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.4px;z-index:1}
+.strow.nest{background:color-mix(in srgb,var(--accent2) 8%,transparent)}
+.strow .stoff{width:46px;flex:0 0 auto;color:var(--dim);text-align:right}
+input.stoff{width:48px;padding:2px 4px;text-align:right}
+.strow .stname,input.stname{min-width:0}
+input.stname{padding:2px 6px}
+.strow .stsz{width:42px;flex:0 0 auto}
+input.stsz{width:44px;padding:2px 4px;text-align:right}
+.strow .sttype{width:120px;flex:0 0 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.strow .stmode{width:120px;flex:0 0 auto}
+.seg.stseg{padding:1px;flex:0 0 auto}
+.seg.stseg .segbtn{padding:2px 7px;font-size:10px}
+.strow .stval{width:78px;flex:0 0 auto}
+.strow .stvalph{width:78px;flex:0 0 auto;font-size:10px;color:var(--faint)}
 .field{margin-bottom:12px}
 .field label{display:block;font-size:11px;color:var(--dim);margin-bottom:4px;text-transform:uppercase;letter-spacing:.4px}
 .field input,.field select,.field textarea{width:100%}

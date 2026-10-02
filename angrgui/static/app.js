@@ -548,12 +548,17 @@ function sectionState() {
         "floating-point ", a.float ? el("span", { class: "faint" }, a.size === 4 ? "(float)" : "(double)") : el("span", { class: "faint" }, "(for float-point checks)")));
     }
     // buffer toggle for pointer-ish args
-    const isBuf = A.config.buffers.some(x => x.arg === a.name);
-    const bufRow = el("label", { class: "row", style: "font-size:11px;color:var(--faint);margin:-2px 0 8px 2px;gap:4px" },
-      el("input", { type: "checkbox", checked: isBuf ? "" : null, style: "width:auto", onchange: e => toggleBuffer(a.name, e.target.checked) }),
-      "points at a symbolic buffer",
-      isBuf ? el("input", { value: (A.config.buffers.find(x => x.arg === a.name) || {}).size || 64, style: "width:56px;margin-left:4px", oninput: e => { const bb = A.config.buffers.find(x => x.arg === a.name); if (bb) { bb.size = +e.target.value; scheduleSave(); } } }) : null,
-      isBuf ? el("span", {}, "bytes") : null);
+    const bufr = A.config.buffers.find(x => x.arg === a.name);
+    const isBuf = !!bufr;
+    const bufRow = el("div", { class: "row", style: "font-size:11px;color:var(--faint);margin:-2px 0 8px 2px;gap:4px;flex-wrap:wrap" },
+      el("label", { class: "row", style: "gap:4px" },
+        el("input", { type: "checkbox", checked: isBuf ? "" : null, style: "width:auto", onchange: e => toggleBuffer(a.name, e.target.checked) }),
+        "points at a symbolic buffer"),
+      isBuf ? el("input", { value: bufr.size || 64, style: "width:52px;margin-left:4px", oninput: e => { bufr.size = +e.target.value; scheduleSave(); } }) : null,
+      isBuf ? el("span", {}, "bytes") : null,
+      isBuf ? el("button", { class: "tiny", style: "margin-left:4px", title: "define struct members (from IDA or custom)",
+        onclick: () => openStructEditor(a.name) },
+        (bufr.layout && bufr.layout.length) ? `⚙ struct (${bufr.layout.length})` : "⚙ as struct") : null);
     b.append(bufRow);
   });
 
@@ -584,6 +589,72 @@ function toggleBuffer(argName, on) {
   A.config.buffers = A.config.buffers.filter(x => x.arg !== argName);
   if (on) A.config.buffers.push({ arg: argName, size: 64 });
   renderRight(); scheduleSave();
+}
+
+// edit the struct a pointer argument points at: load the member layout from IDA (or
+// build an anonymous one), choose sym/fixed + value per member, expand nested structs.
+function openStructEditor(argName) {
+  const bufr = A.config.buffers.find(x => x.arg === argName);
+  if (!bufr) return;
+  bufr.layout = bufr.layout || [];
+  const typeI = el("input", { value: bufr.struct_type || "", placeholder: "struct type name, e.g. TIFF", style: "flex:1;min-width:0" });
+  typeI.addEventListener("keydown", e => { if (e.key === "Enter") loadFromIda(); });
+  const tbl = el("div", { class: "structtbl" });
+  const sizeI = el("input", { value: bufr.size || 64, style: "width:72px", oninput: e => { bufr.size = +e.target.value; scheduleSave(); } });
+
+  const render = () => {
+    bufr.layout.sort((a, b) => a.offset - b.offset);
+    tbl.replaceChildren(el("div", { class: "strow sthead" },
+      el("span", { class: "stoff" }, "offset"), el("span", { class: "grow" }, "member"),
+      el("span", { class: "sttype" }, "type"), el("span", { class: "stmode" }, "value"), el("span", { style: "width:40px" })));
+    if (!bufr.layout.length) { tbl.append(el("div", { class: "faint", style: "padding:10px" }, "No members yet — Load a struct from IDA above, or + member for a custom layout.")); return; }
+    bufr.layout.forEach((m, i) => tbl.append(memberRow(m, i)));
+  };
+  const memberRow = (m, i) => {
+    const sym = m.mode !== "fixed";
+    return el("div", { class: "strow" + (m.is_struct ? " nest" : "") },
+      el("input", { class: "stoff mono", value: m.offset, title: "byte offset", oninput: e => { m.offset = parseIntLoose(e.target.value); scheduleSave(); } }),
+      el("input", { class: "stname grow", value: m.name || "", oninput: e => { m.name = e.target.value; scheduleSave(); } }),
+      el("input", { class: "stsz mono", value: m.size || 1, title: "size (bytes)", oninput: e => { m.size = parseIntLoose(e.target.value) || 1; scheduleSave(); } }),
+      el("span", { class: "sttype mono faint", title: m.type || "" }, (m.type || "").slice(0, 16) + (m.is_ptr ? " *" : "")),
+      el("div", { class: "seg stseg" },
+        el("div", { class: "segbtn" + (sym ? " on" : ""), onclick: () => { m.mode = "sym"; scheduleSave(); render(); } }, "sym"),
+        el("div", { class: "segbtn" + (!sym ? " on" : ""), onclick: () => { m.mode = "fixed"; scheduleSave(); render(); } }, "fix")),
+      sym ? el("span", { class: "faint stvalph" }, "symbolic")
+          : el("input", { class: "stval mono", value: m.value ?? 0, oninput: e => { m.value = parseIntLoose(e.target.value); scheduleSave(); } }),
+      (m.is_struct && m.type_name) ? btn("⤷", () => expandMember(m, i), "tiny ghost", "expand nested struct into its fields") : null,
+      btn("✕", () => { bufr.layout.splice(i, 1); scheduleSave(); render(); }, "tiny ghost"));
+  };
+  async function expandMember(m, i) {
+    try {
+      const sd = await api("/api/ida/struct/" + encodeURIComponent(m.type_name));
+      const subs = (sd.members || []).map(s => ({ offset: m.offset + s.offset, size: s.size,
+        name: (m.name || argName) + "." + s.name, mode: "sym", type: s.type, is_ptr: s.is_ptr, is_struct: s.is_struct, type_name: s.type_name }));
+      bufr.layout.splice(i, 1, ...subs);
+      scheduleSave(); render();
+    } catch (e) { toast("expand failed: " + e.message, true); }
+  }
+  async function loadFromIda() {
+    const name = typeI.value.trim(); if (!name) { toast("enter a struct type name", true); return; }
+    try {
+      const sd = await api("/api/ida/struct/" + encodeURIComponent(name));
+      bufr.struct_type = name;
+      bufr.size = Math.max(bufr.size || 0, sd.size || 0); sizeI.value = bufr.size;
+      bufr.layout = (sd.members || []).map(s => ({ offset: s.offset, size: s.size, name: argName + "." + s.name,
+        mode: "sym", type: s.type, is_ptr: s.is_ptr, is_struct: s.is_struct, type_name: s.type_name }));
+      scheduleSave(); render(); toast(`loaded ${name}: ${bufr.layout.length} members, ${sd.size} bytes`);
+    } catch (e) { toast("load failed: " + e.message, true); }
+  }
+  const body = el("div", {},
+    field("Struct type (from IDA)", el("div", { class: "row" }, typeI, btn("Load", loadFromIda, "tiny primary")),
+      "Pull the member layout from IDA by type name. Members default to symbolic (named, so they show in witnesses); flip any to fixed and give a value. Unlisted bytes stay symbolic."),
+    el("div", { class: "row", style: "margin:8px 0 2px" }, el("span", { class: "faint" }, "buffer size"), sizeI, el("span", { class: "faint grow" }, "bytes"),
+      btn("+ member", () => { bufr.layout.push({ offset: 0, size: 4, name: argName + ".m" + bufr.layout.length, mode: "sym" }); scheduleSave(); render(); }, "tiny")),
+    tbl);
+  render();
+  const m = modal("Struct editor · " + argName, body, [el("button", { class: "primary", onclick: () => { renderRight(); m.remove(); } }, "Done")]);
+  m.querySelector(".modal").classList.add("docs");
+  $("#modalHost").append(m);
 }
 const parseIntLoose = (v) => { v = (v || "").trim(); if (!v) return 0; return v.startsWith("0x") ? parseInt(v, 16) : parseInt(v, 10) || 0; };
 
