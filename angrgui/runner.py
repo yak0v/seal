@@ -790,6 +790,26 @@ class Run:
                     break
 
                 simgr.step()
+                # On-demand arm64e PAC support: a path can error by reaching a pointer-
+                # auth instruction libVEX can't decode OUTSIDE the statically scanned
+                # range (a tail-call target / helper the code jumps to). Hook it and
+                # revive the path, so a run isn't bounded to code we scanned up front.
+                if simgr.errored and getattr(self.arch, "name", "") == "AARCH64":
+                    from . import angr_arm_patch
+                    self._pac_rescued = getattr(self, "_pac_rescued", 0)
+                    keep = []
+                    for er in list(simgr.errored):
+                        st = getattr(er, "state", None)
+                        addr = getattr(st, "addr", None) if st is not None else None
+                        msg = str(getattr(er, "error", "")).lower()
+                        if (addr is not None and self._pac_rescued < 500
+                                and ("decod" in msg or "no bytes" in msg or "nodecode" in msg)
+                                and angr_arm_patch.hook_pac_at(self.project, addr)):
+                            simgr.active.append(st)
+                            self._pac_rescued += 1
+                        else:
+                            keep.append(er)
+                    simgr.errored[:] = keep
                 self._absorb(simgr, find, avoid)
 
                 step += 1

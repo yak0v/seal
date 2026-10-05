@@ -158,6 +158,7 @@ class Binary:
         self.lazy = auto_lazy if lazy is None else lazy
         self._cfgs: dict[int, object] = {}       # func addr -> its scoped CFGFast
         self._analyzed: set[int] = set()
+        self._regions: list[tuple] = []          # accumulated CFG regions (see analyze_function)
         self._index: list[dict] = []             # all functions (lazy): {addr,name,size}
         self._index_addrs: list[int] = []
         self._name_by_addr: dict[int, str] = {}
@@ -225,8 +226,15 @@ class Binary:
         ent = next((e for e in self._index if e["addr"] == fa), None)
         size = ent["size"] if ent else 0x8000
         self._progress(f"analysing function @ {hex(fa)}")
+        # ACCUMULATE regions: a fresh CFGFast rebuilds kb.functions for only the regions
+        # it is given, EVICTING every previously-analysed function (so a second analyse
+        # made the first "no such function"). Re-run over the union of all analysed
+        # regions so the knowledge base keeps every function we've looked at.
+        region = (fa, fa + size)
+        if region not in self._regions:
+            self._regions.append(region)
         cfg = self.project.analyses.CFGFast(
-            regions=[(fa, fa + size)], normalize=True, data_references=False)
+            regions=list(self._regions), normalize=True, data_references=False)
         try:
             self.project.analyses.CompleteCallingConventions(recover_variables=False)
         except Exception as e:

@@ -775,11 +775,66 @@ class BufferBoundsCheck(BaseCheck):
                      dedup_key=(ins_addr, base_v))
 
 
+class NullDerefCheck(BaseCheck):
+    """A memory read or write through a pointer the inputs can drive into the null page
+    — a null-pointer dereference. Fires when the access address is SYMBOLIC and can be
+    made to fall in [0, PAGE). angr zero-fills unmapped memory, so these never crash on
+    their own; this check surfaces them. Add "addr" to pin one instruction; omit it to
+    scan the whole function. Set "page" to widen the "near-null" window (default 0x1000)."""
+    kind = "null_deref"
+    installs_breakpoint = True
+
+    def __init__(self, spec, ctx):
+        super().__init__(spec, ctx)
+        self.addr = spec.get("addr")
+        self.page = int(spec.get("page", 0x1000))
+
+    def install(self, state):
+        state.inspect.b("mem_read", when=angr.BP_BEFORE, action=lambda s: self._on_access(s, "read"))
+        state.inspect.b("mem_write", when=angr.BP_BEFORE, action=lambda s: self._on_access(s, "write"))
+
+    def _on_access(self, state, access):
+        ins_addr = state.scratch.ins_addr
+        if ins_addr is None:
+            return
+        if self.addr is not None:
+            if ins_addr != self.addr:
+                return
+        elif not self.ctx.in_target_function(ins_addr):
+            return
+        a = (state.inspect.mem_read_address if access == "read"
+             else state.inspect.mem_write_address)
+        # only attacker-influenced (symbolic) pointers — concrete stack/global accesses
+        # are not null-deref candidates and keep the hook cheap.
+        if a is None or not isinstance(a, claripy.ast.BV) or not a.symbolic:
+            return
+        cond = claripy.ULT(a, self.page)
+        try:
+            if not state.solver.satisfiable(extra_constraints=[cond]):
+                return
+        except Exception:
+            return
+        witness = self._witness_with(state, [cond])
+        where = None
+        try:
+            tmp = state.copy()
+            tmp.add_constraints(cond)
+            where = tmp.solver.eval(a)
+        except Exception:
+            pass
+        msg = f"null-pointer {access} at {hex(ins_addr)}: the address can be NULL"
+        self._record(state, ins_addr, msg, witness,
+                     extra={"access": access, "addr": hex(where) if where is not None else None,
+                            "src_line": self.ctx.line_for(ins_addr), "path": self.ctx.path_of(state)},
+                     dedup_key=(ins_addr, access))
+
+
 CHECK_TYPES = {
     "int_overflow": IntOverflowCheck,
     "narrowing_cast": NarrowingCastCheck,
     "float_anomaly": FloatAnomalyCheck,
     "oob_write": BufferBoundsCheck,
+    "null_deref": NullDerefCheck,
     "assert": AssertCheck,
     "reach": ReachCheck,
     "avoid": AvoidCheck,

@@ -267,6 +267,62 @@ def apply() -> dict:
     return status
 
 
+_PAC_RET = {"retaa", "retab"}
+_PAC_BR = {"braa", "brab", "braaz", "brabz", "blraa", "blrab", "blraaz", "blrabz"}
+
+
+def is_pac_mnemonic(mn: str) -> bool:
+    return mn in _PAC_RET or mn in _PAC_BR or mn.startswith(("pac", "aut", "xpac"))
+
+
+def _install_pac_hook(project, ins) -> str | None:
+    """Install the non-authenticated hook for one capstone PAC instruction, or None if
+    it isn't a PAC op. Shared by the static scan (patch_pac) and the on-demand path."""
+    import angr
+    mn = ins.mnemonic
+    if mn in _PAC_RET:                      # retaa/retab -> return (jump to LR)
+        class _Ret(angr.SimProcedure):
+            def run(self):
+                self.jump(self.state.regs.lr)
+        proc = _Ret()
+    elif mn in _PAC_BR:                      # braa/blraa/… -> jump/call the target register
+        reg = ins.op_str.split(",")[0].strip()
+        class _Br(angr.SimProcedure):
+            def run(self):
+                self.jump(getattr(self.state.regs, reg))
+        proc = _Br()
+    elif mn.startswith(("pac", "aut", "xpac")):
+        # pacibsp/autibsp/xpaclri/… sign or authenticate — a no-op for data-flow, but it
+        # must ADVANCE to the next instruction. A bare SimProcedure that returns None does
+        # an implicit Ijk_Ret to LR (a SimProcedure models a *called function*), which
+        # silently returns from the function at the first signing op; jump to the next
+        # instruction instead (AArch64 is 4-byte fixed width).
+        class _Nop(angr.SimProcedure):
+            def run(self):
+                self.jump(self.state.addr + 4)
+        proc = _Nop()
+    else:
+        return None
+    project.hook(ins.address, proc, length=ins.size, replace=True)
+    return mn
+
+
+def hook_pac_at(project, addr: int) -> str | None:
+    """Hook the SINGLE instruction at `addr` if it is an arm64e PAC op libVEX can't
+    decode; return its mnemonic or None. Used ON DEMAND when execution reaches a PAC op
+    outside any pre-scanned range (a tail-call target, a helper the function jumps to) —
+    so a run isn't bounded to code we scanned up front."""
+    import capstone
+    try:
+        code = bytes(project.loader.memory.load(addr, 4))
+    except Exception:
+        return None
+    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+    md.detail = True
+    ins = next(iter(md.disasm(code, addr)), None)
+    return _install_pac_hook(project, ins) if ins is not None else None
+
+
 def patch_pac(project, start: int, end: int) -> dict:
     """libVEX can't decode arm64e pointer-authentication instructions, so scan
     [start, end) and hook them with their non-authenticated meaning:
@@ -276,47 +332,16 @@ def patch_pac(project, start: int, end: int) -> dict:
         pac* / aut* / xpac*      -> nop  (signing/auth, no data effect we model)
 
     Per-project (lives with the analysis, not the global op table). Returns a
-    {hex_addr: mnemonic} map of what was hooked. Requires capstone."""
-    import angr
+    {hex_addr: mnemonic} map of what was hooked. Requires capstone. For PAC ops OUTSIDE
+    the scanned range that execution reaches at run time, see hook_pac_at()."""
     import capstone
 
     md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
     md.detail = True
     code = bytes(project.loader.memory.load(start, end - start))
-
-    class _Ret(angr.SimProcedure):
-        def run(self):
-            self.jump(self.state.regs.lr)
-
-    def _reg_branch(regname):
-        class _Br(angr.SimProcedure):
-            def run(self):
-                self.jump(getattr(self.state.regs, regname))
-        return _Br
-
-    class _Nop(angr.SimProcedure):
-        # A signing/auth op (pacibsp, autibsp, xpaclri, …) is a no-op for data-flow: it
-        # must ADVANCE to the next instruction. A bare SimProcedure that returns None
-        # would instead do an implicit Ijk_Ret to LR (a SimProcedure models a *called
-        # function*), which silently returns from the function at the first PAC op — so
-        # jump explicitly to the next instruction. AArch64 instructions are 4 bytes.
-        def run(self):
-            self.jump(self.state.addr + 4)
-
     hooked: dict[str, str] = {}
-    _RET = {"retaa", "retab"}
-    _BR = {"braa", "brab", "braaz", "brabz", "blraa", "blrab", "blraaz", "blrabz"}
     for ins in md.disasm(code, start):
-        mn = ins.mnemonic
-        proc = length = None
-        if mn in _RET:
-            proc, length = _Ret(), ins.size
-        elif mn in _BR:
-            reg = ins.op_str.split(",")[0].strip()
-            proc, length = _reg_branch(reg)(), ins.size
-        elif mn.startswith(("pac", "aut", "xpac")):
-            proc, length = _Nop(), ins.size
-        if proc is not None:
-            project.hook(ins.address, proc, length=length, replace=True)
+        mn = _install_pac_hook(project, ins)
+        if mn is not None:
             hooked[hex(ins.address)] = mn
     return hooked

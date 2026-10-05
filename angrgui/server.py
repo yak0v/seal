@@ -740,8 +740,12 @@ def _mcp_get_run(run_id):
     if r is None:
         raise HTTPException(404, "no such run")
     snap = r.snapshot()
+    # expose the end REASON plus its human text, so an agent can see WHY a path ended —
+    # e.g. the exact angr/decode error or the undetermined indirect-call site — not just
+    # a bare "error"/"unknown_call" code.
     tree = [{"id": n["id"], "parent": n["parent"], "cond": n["cond"], "kind": n["kind"],
-             "end": (n["end"] or {}).get("reason"), "hits": n["hits"]} for n in snap["tree"]]
+             "end": (n["end"] or {}).get("reason"), "detail": (n["end"] or {}).get("text"),
+             "hits": n["hits"]} for n in snap["tree"]]
     return {"status": snap["status"], "error": snap["error"], "summary": snap["summary"],
             "findings": snap["hits"], "paths": tree}
 
@@ -1081,6 +1085,11 @@ flow). Add checks to hunt specific conditions. Every check may take an optional
         argument name / expression and "size" its length. OMIT base to check every
         write against the allocations tracked by your alloc models (PART 9) — that is
         how you find heap overflows across library calls.
+  • null_deref  {"kind":"null_deref"}
+        A memory read/write through a pointer the inputs can drive into the null page.
+        angr zero-fills unmapped memory, so these never crash on their own — this check
+        surfaces them. Witness = the input that makes the pointer NULL. Optional "page"
+        widens the near-null window (default 0x1000).
   • custom  {"kind":"custom","addr":"0x..","code":"def check(state, api): ..."}
         Run your own Python predicate at a point; return a dict to record a finding.
 
@@ -1374,6 +1383,9 @@ CHECK_KINDS = [
     {"kind": "oob_write", "summary": "a memory write that can fall outside a buffer. Explicit: give base+size. Modeled: omit base to check writes against every buffer an 'alloc' call model handed out (heap overflows).",
      "fields": {"base": "expression for the buffer start, e.g. a1 or rsp-0x40 (omit for modeled mode)",
                 "size": "buffer size in bytes (with base)", "addr": "0x.. (optional single write instruction)"}},
+    {"kind": "null_deref", "summary": "a memory read/write through a pointer the inputs can drive into the null page (a null-pointer dereference). angr zero-fills unmapped memory so these never crash on their own — this surfaces them.",
+     "fields": {"addr": "0x.. (optional single instruction; omit to scan the whole function)",
+                "page": "size of the near-null window in bytes (default 0x1000)"}},
     {"kind": "custom", "summary": "your own Python predicate run at a point (advanced)",
      "fields": {"code": "python (required)", "addr": "0x.. (optional point)"}},
 ]
