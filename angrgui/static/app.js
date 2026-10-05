@@ -449,6 +449,7 @@ function renderState() {
     el("span", {}, "Initial state · "),
     el("span", { class: "fn" }, init && init.kind === "snapshot" ? "concolic snapshot" : "fresh call (symbolic args)"),
     el("span", { class: "grow" }),
+    el("button", { class: "tiny", onclick: openSnapshotGuide, title: "How to capture a snapshot" }, "ⓘ How to capture"),
     el("button", { class: "tiny primary", onclick: openSnapshotLoader }, "Load snapshot…"),
     init ? el("button", { class: "tiny", onclick: clearInitialState }, "Clear → fresh call") : null);
   wrap.append(bar);
@@ -474,11 +475,25 @@ function renderState() {
   const symKey = {};                         // reg/addr -> symbolic name
   sym.forEach(s => { if (s.reg) symKey["reg:" + s.reg] = s.name; if (s.addr != null) symKey["mem:" + s.addr] = s.name; });
 
+  // Editable symbolic set — add/remove without reloading the snapshot. Each pill opens the
+  // edit form; the "+ mark symbolic" button adds a new field; or just click a variable in
+  // the decompilation. (snapSymbolicForm persists + re-renders.)
+  const symBox = el("div", { style: "margin-top:4px" }, el("b", {}, "symbolic (attacker-controlled): "));
+  if (sym.length) sym.forEach(s => {
+    const label = (s.reg || hx64(s.addr)) + " = " + (s.name || "sym");
+    symBox.append(el("span", { class: "pill bad", style: "margin-right:4px;cursor:pointer",
+      title: "click to edit this symbolic field", onclick: (e) => snapSymbolicForm(init, s, e) },
+      label, el("span", { style: "margin-left:6px;opacity:.7",
+        onclick: (e) => { e.stopPropagation(); init.symbolic = (init.symbolic || []).filter(x => x !== s); A._vars = null; saveConfig().then(() => { renderState(); rerenderCodeViews(); toast("removed " + (s.name || "field")); }); } }, "✕")));
+  });
+  else symBox.append(el("span", { class: "faint" }, "nothing symbolic yet — click a variable in the decompilation, or:"));
+  symBox.append(el("button", { class: "tiny primary", style: "margin-left:6px",
+    onclick: (e) => snapSymbolicForm(init, {}, e) }, "+ mark symbolic"));
+
   wrap.append(el("div", { class: "statebox" },
-    el("div", {}, el("b", {}, "PC: "), el("span", { class: "mono" }, hx64(init.pc))),
-    sym.length ? el("div", { style: "margin-top:4px" }, el("b", {}, "symbolic (attacker-controlled): "),
-      ...sym.map(s => el("span", { class: "pill bad", style: "margin-right:4px" },
-        (s.reg || hx64(s.addr)) + " = " + (s.name || "sym")))) : el("div", { class: "faint" }, "nothing symbolic yet")));
+    el("div", {}, el("b", {}, "PC: "), el("span", { class: "mono" }, hx64(init.pc)),
+      el("span", { class: "faint", style: "margin-left:10px" }, "the run starts here; click a variable in the decompilation to make it symbolic")),
+    symBox));
 
   const regs = init.regs || {};
   const rtbl = el("table", { class: "statetbl" });
@@ -2523,8 +2538,43 @@ function assumptionsBar() {
 // which decompilation tokens are the function's input arguments, and whether
 // each is symbolic (free for angr to search) or fixed to a concrete value.
 // a1 (IDA) <-> arg0 (ours) <-> your name all resolve to the same slot.
+// The calling-convention argument registers, so a decompiled argument (a1, a2, …) can
+// be mapped to the register it arrives in when the initial state is a concolic SNAPSHOT
+// (snapshots mark symbolic fields by register/address, not by "arg").
+function abiArgRegs() {
+  const arch = (A.binary && A.binary.arch) || "";
+  if (/AARCH64|ARM64/i.test(arch)) return ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
+  if (/AMD64|X86_64|X64/i.test(arch)) return ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+  return [];
+}
+// The active scenario's snapshot initial_state, or null (fresh-call mode).
+function activeSnapshot() {
+  const i = A.config && A.config.initial_state;
+  return i && i.kind === "snapshot" ? i : null;
+}
+
 function varModel() {
   const tok = {};
+  const snap = activeSnapshot();
+  if (snap) {
+    // SNAPSHOT mode: there are no "args" — symbolic inputs are fields of initial_state.
+    // Make (a) the ABI argument registers clickable via their decompiler names (a1..),
+    // so you can symbolize an argument by clicking it, and (b) every current symbolic
+    // field clickable by the name you gave it, so it shows tinted and can be edited.
+    abiArgRegs().forEach((reg, idx) => {
+      const ex = (snap.symbolic || []).find(s => s.reg === reg);
+      const info = { snap: true, reg, name: ex ? ex.name : ("a" + (idx + 1)),
+                     size: ex ? ex.size : 8, mode: ex ? "symbolic" : "concrete" };
+      tok["a" + (idx + 1)] = info; tok["arg" + idx] = info;
+      if (ex) for (const t of aliasesOf(ex.name)) tok[t] = info;
+    });
+    (snap.symbolic || []).forEach(s => {
+      const info = { snap: true, reg: s.reg, addr: s.addr, name: s.name, size: s.size || 8, mode: "symbolic" };
+      for (const t of aliasesOf(s.name)) tok[t] = info;
+      if (s.reg) tok[s.reg] = info;
+    });
+    return tok;
+  }
   const args = (A.config && A.config.args) || [];
   args.forEach((a, idx) => {
     const info = { name: a.name || ("arg" + idx), idx, mode: a.mode, value: a.value, size: a.size, signed: a.signed };
@@ -2567,8 +2617,127 @@ function annotate(text) {                  // mark argument variables + assumpti
 }
 
 // click a variable in the decompilation: flip symbolic/fixed or add a constraint on it
+// re-render whichever code view is showing so symbolic tinting / values update in place
+function rerenderCodeViews() {
+  if ($("#pane-code") && $("#pane-code").classList.contains("sel")) renderCode();
+  if ($("#pane-decomp") && $("#pane-decomp").classList.contains("sel") && typeof renderDecomp === "function") renderDecomp();
+}
+
+// The one place to add/edit/remove a SNAPSHOT symbolic field — no reload of the snapshot
+// needed. Reached by clicking a variable/argument in the code, or "+ mark symbolic" in the
+// State tab. `prefill` may carry {name, reg, addr, size} guessed from the clicked token.
+function snapSymbolicForm(snap, prefill, ev) {
+  $("#varMenu")?.remove();
+  prefill = prefill || {};
+  // the field already in the symbolic list that this click refers to (by name, reg, or addr)
+  const existing = (snap.symbolic || []).find(s =>
+    (prefill.name && s.name === prefill.name) ||
+    (prefill.reg && s.reg === prefill.reg) ||
+    (prefill.addr != null && s.addr === prefill.addr));
+  const f = existing || {};
+  const m = el("div", { class: "popmenu vmenu", id: "varMenu" });
+  m.append(el("div", { class: "vmhead" }, el("b", {}, f.name || prefill.name || "mark symbolic"),
+    el("span", { class: "faint" }, existing ? "symbolic — attacker-controlled" : "currently concrete (from the snapshot)")));
+  m.append(el("div", { class: "faint", style: "margin-bottom:6px;font-size:11px" },
+    "Make this field unknown so the solver searches over it. Bind it to the register it lives in, or to a memory address."));
+
+  m.append(el("div", { class: "vmlbl" }, "name (shows up in the witness)"));
+  const nameI = el("input", { value: f.name || prefill.name || "", placeholder: "coord", style: "width:100%;box-sizing:border-box;margin-bottom:6px" });
+  m.append(nameI);
+
+  m.append(el("div", { class: "vmlbl" }, "bind to"));
+  const kind = (f.addr != null) ? "addr" : "reg";
+  const kindS = el("select", { style: "width:100%;box-sizing:border-box;margin-bottom:6px" },
+    el("option", { value: "reg", selected: kind === "reg" ? "" : null }, "register"),
+    el("option", { value: "addr", selected: kind === "addr" ? "" : null }, "memory address"));
+  const bindI = el("input", {
+    value: f.addr != null ? ("0x" + f.addr.toString(16)) : (f.reg || prefill.reg || ""),
+    placeholder: "x1 / v0  ·  or  0x16fdfe670", style: "width:100%;box-sizing:border-box;margin-bottom:6px" });
+  m.append(kindS, bindI);
+
+  m.append(el("div", { class: "vmlbl" }, "size (bytes)"));
+  const sizeI = el("input", { value: f.size || prefill.size || 8, style: "width:100%;box-sizing:border-box;margin-bottom:6px" });
+  m.append(sizeI);
+
+  const persist = (msg) => { m.remove(); A._vars = null; saveConfig().then(() => { renderState(); rerenderCodeViews(); toast(msg); }); };
+  const apply = () => {
+    const name = (nameI.value.trim() || "sym");
+    const bind = bindI.value.trim();
+    if (!bind) { toast("enter a register or address to bind to", true); return; }
+    const nf = { name, size: parseInt(sizeI.value) || 8 };
+    if (kindS.value === "addr") nf.addr = parseInt(bind, 16); else nf.reg = bind;
+    // drop any prior field this one replaces (same clicked target, same name, or same binding)
+    snap.symbolic = (snap.symbolic || []).filter(s =>
+      s !== existing && s.name !== name &&
+      !(nf.reg && s.reg === nf.reg) && !(nf.addr != null && s.addr === nf.addr) &&
+      !(prefill.reg && s.reg === prefill.reg) && !(prefill.name && s.name === prefill.name));
+    snap.symbolic.push(nf);
+    persist("marked " + name + " symbolic");
+  };
+  const buttons = el("div", { class: "row", style: "justify-content:flex-end;margin-top:8px;gap:6px" });
+  if (existing) buttons.append(el("button", { class: "tiny ghost", onclick: () => {
+    snap.symbolic = (snap.symbolic || []).filter(s => s !== existing);
+    persist("removed " + (existing.name || "field"));
+  } }, "Remove"));
+  buttons.append(el("button", { class: "tiny ghost", onclick: () => m.remove() }, "Cancel"),
+                 el("button", { class: "tiny primary", onclick: apply }, existing ? "Update" : "Make symbolic"));
+  m.append(buttons);
+
+  document.body.append(m);
+  const x = ev ? ev.clientX : window.innerWidth / 2, y = ev ? ev.clientY : 160;
+  m.style.left = Math.min(x, window.innerWidth - m.offsetWidth - 10) + "px";
+  m.style.top = Math.min(y + 8, window.innerHeight - m.offsetHeight - 10) + "px";
+  setTimeout(() => nameI.focus(), 0);
+  const close = (e) => { if (!m.contains(e.target) && !e.target.classList?.contains("dvar")) { m.remove(); document.removeEventListener("mousedown", close); } };
+  setTimeout(() => document.addEventListener("mousedown", close), 0);
+}
+
+// "How do I generate a snapshot?" — the capture workflow, shown from the State tab.
+function openSnapshotGuide() {
+  const code = (t) => el("code", {}, t);
+  const pre = (t) => el("pre", { class: "dcode", style: "white-space:pre-wrap" }, t);
+  const body = el("div", { class: "docbody" });
+  body.append(el("p", { class: "dp" },
+    el("b", {}, "What a snapshot is. "),
+    "A concolic seed: a dump of a REAL run's registers + memory, so SEAL starts this function" +
+    " from a realistic state and you make only the attacker-controlled fields symbolic. That turns" +
+    " a bug from “every path looks dangerous” into a precise condition."));
+  body.append(el("p", { class: "dp" }, el("b", {}, "1 · Capture it with lldb"),
+    " — the repo ships an lldb script that dumps exactly the shape SEAL loads:"));
+  body.append(pre(
+    "# attach lldb to (or launch) the process that runs this function, then:\n" +
+    "(lldb) command script import angrgui/snapshot/capture.py\n" +
+    "# stop at the TRUE function entry (args are live there). For a normal symbol:\n" +
+    "(lldb) breakpoint set --name <func> --skip-prologue false\n" +
+    "(lldb) run <args>\n" +
+    "(lldb) seal_snapshot --out snapshot.json --sym x1:coord\n" +
+    "#   --sym marks attacker-controlled fields (reg:name or 0xADDR:name), comma-separated"));
+  body.append(el("p", { class: "dp" }, el("b", {}, "For a dyld-shared-cache image"),
+    " (iOS/macOS framework), break by ADDRESS — a local symbol name hangs lldb:"));
+  body.append(pre(
+    "(lldb) command script import seal_validation/snapshot/live_bp.py\n" +
+    "(lldb) b main\n(lldb) run\n" +
+    "(lldb) seal_setbp CoreGraphics 0x186a24e80   # the file address of the function\n" +
+    "(lldb) continue\n" +
+    "(lldb) seal_snapshot --out snapshot.json --sym x1:coord"));
+  body.append(el("p", { class: "dp" }, el("b", {}, "2 · Load it"), " — use ",
+    code("Load snapshot…"), " here and paste ", code("snapshot.json"), ". A live capture holds" +
+    " ASLR-slid addresses; include the ", code("image.slide"), " the capture prints and SEAL rebases it" +
+    " to the binary's file addresses automatically."));
+  body.append(el("p", { class: "dp" }, el("b", {}, "3 · Make inputs symbolic"), " — click a variable or" +
+    " argument in the decompilation (or use ", code("+ mark symbolic"), " below) to add it to the snapshot's" +
+    " symbolic set without reloading. Then add a check and Explore."));
+  body.append(el("p", { class: "dp faint" }, "Full details, including the exact CoreGraphics CVE walkthrough, are in ",
+    code("docs/ARCHITECTURE.md"), " §7 and ", code("angrgui/snapshot/"), "."));
+  const m = modal("How to generate a snapshot", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
+  m.querySelector(".modal").classList.add("docs");
+  $("#modalHost").append(m);
+}
+
 function openVarMenu(info0, ev) {
   $("#varMenu")?.remove();
+  const snap = activeSnapshot();
+  if (snap) { snapSymbolicForm(snap, info0, ev); return; }   // concolic: edit initial_state.symbolic
   const a = (A.config.args || [])[info0.idx]; if (!a) return;
   const info = { name: a.name || ("arg" + info0.idx), idx: info0.idx, mode: a.mode, value: a.value, size: a.size, signed: a.signed };
   const m = el("div", { class: "popmenu vmenu", id: "varMenu" });
