@@ -16,6 +16,9 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--binary", default=None, help="binary to load on startup")
+    ap.add_argument("--target-func", action="append", default=None,
+                    help="scope analysis to this function address (hex ok); repeatable. "
+                         "Needed for big arm64 dylibs where whole-binary CFG is impractical.")
     ap.add_argument("--open", action="store_true", help="open a browser tab")
     args = ap.parse_args()
 
@@ -24,9 +27,10 @@ def main():
         from angrgui.server import S
         from angrgui.engine import Binary
         from angrgui.workspace import Workspace
-        S.binary = Binary(args.binary, progress=lambda m: print("  ", m))
+        tf = [int(x, 0) for x in args.target_func] if args.target_func else None
+        S.binary = Binary(args.binary, progress=lambda m: print("  ", m), target_funcs=tf)
         S.workspace = Workspace(args.binary)
-        print(f"loaded {args.binary}")
+        print(f"loaded {args.binary}" + (f" (scoped to {args.target_func})" if tf else ""))
 
     url = f"http://{args.host}:{args.port}"
     print(f"\n  angr GUI running at {url}\n")

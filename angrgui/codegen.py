@@ -5,6 +5,43 @@ can see what your clicks mean in angr terms, copy it, and extend it.
 
 Expressions from the mini-language (assumptions, asserts) are compiled to the
 equivalent claripy code by running the same parser with a code-emitting backend.
+
+ROLE
+    The "export" / transparency layer. `generate_script(binary, spec)` turns the same
+    flat spec the runner executes into a self-contained, runnable angr Python script:
+    it builds the state, sets up inputs, installs the checks, explores, and prints
+    findings — no SEAL import required. It is how a result leaves SEAL (reproduce on
+    another machine, hand to a colleague, or extend by hand).
+
+WHY IT'S LIKE THIS
+    - It emits SOURCE, not a pickled run: the whole point is a human-readable artifact
+      that shows "what your clicks mean in angr terms" and can be edited afterwards.
+    - Expressions reuse the exprlang `Parser` with a code-emitting backend
+      (`ExprCompiler`/`CodeOps`) instead of a second grammar — one parser, two
+      backends (evaluate-to-AST in exprlang, emit-Python here), so assumptions/asserts
+      can never drift between what SEAL runs and what the script runs.
+    - `_pyname`/RESERVED keep generated identifiers valid and non-colliding with the
+      script's own names (project, state, simgr, report, ...).
+
+EXTENDING
+    - New check kind: emit its setup/breakpoint code in `generate_script` and, if it
+      needs a runtime helper, add it to the emitted preamble (see `report`/`overflows`
+      and the `Api` class, which are emitted verbatim into the script).
+    - New expression op/function: add it to `CodeOps`/`ExprCompiler` so it compiles to
+      the matching Python, mirroring the exprlang evaluator.
+
+PITFALLS
+    - THIS MUST STAY IN SYNC WITH runner.py. The runner is the source of truth for how
+      a run really behaves; codegen re-implements the same semantics as emitted source.
+      If you change how the runner builds the state, binds args/buffers, installs
+      checks, or bounds exploration, update codegen too or the generated script will
+      quietly diverge from what SEAL actually ran.
+    - KNOWN CURRENT GAPS (codegen trails the runner): it builds a `call_state` only and
+      does NOT yet emit the concolic snapshot seed (`initial_state` kind="snapshot"),
+      call `models`, or `skip_calls`/CALLLESS. A script generated for a snapshot-seeded
+      or call-modeled run will not reproduce that run. Close these when you touch it.
+    - The emitted preamble (`report`, `overflows`, `Api`, `new_states`) is copied into
+      every script; keep it dependency-free and self-contained.
 """
 from __future__ import annotations
 
@@ -78,6 +115,11 @@ class CodeOps:
 
     def not_(self, a):
         return Code(f"claripy.Not({_truth_code(a).src})", None)
+
+    def ite(self, c, a, b):
+        a, b = _match_code(a, b)
+        bits = a.bits if isinstance(a, Code) else (b.bits if isinstance(b, Code) else 64)
+        return Code(f"claripy.If({_truth_code(c).src}, {_operand(a)}, {_operand(b)})", bits)
 
     def cmp(self, op, a, b):
         if not isinstance(a, Code) and not isinstance(b, Code):

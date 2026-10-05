@@ -96,6 +96,50 @@ def test_loop_bound_and_overflow_node(binary):
     assert ov and ov[0]["extra"]["node"] == 0
 
 
+def test_return_model_replaces_called_function(binary):
+    """A global return model should replace a called function's result. route()
+    does `return scale(x,3)` for cmd==3; modelling scale to a constant / an
+    expression over its args must change what that path returns."""
+    scale = _addr(binary, "scale")
+    def route_rets(model):
+        snap = _run(binary, {"func_addr": _addr(binary, "route"), **ROUTE,
+                             "models": [model]})
+        T = {n["id"]: n for n in snap["tree"]}
+        leaves = [n for n in snap["tree"] if not any(m["parent"] == n["id"] for m in snap["tree"])]
+        # the cmd==3 path (returns scale(x,3))
+        out = []
+        for n in leaves:
+            chain, cur = [], n
+            while cur["parent"] is not None:
+                chain.append(cur["cond"]); cur = T[cur["parent"]]
+            if "cmd == 3" in chain and n["end"]["reason"] == "returned":
+                out.append(n["ret"])
+        return out
+
+    assert "7" in route_rets({"func": "scale", "addr": scale, "kind": "concrete", "value": 7})
+    # expr over the callee's first argument (scale(x,3) -> arg0 == x)
+    exprs = route_rets({"func": "scale", "addr": scale, "kind": "expr", "expr": "arg0 * 100"})
+    assert any("100" in str(r) for r in exprs)
+
+
+def test_symbolic_ip_does_not_crash_absorb(binary):
+    """A state about to jump to an input-controlled address (e.g. a call through a
+    symbolic function pointer) has a symbolic IP; ``state.addr`` then raises
+    SimValueError. _resolve_addr must absorb that instead of aborting the run."""
+    r = Run(binary, {"func_addr": _addr(binary, "route"), "args": [_sym("cmd"), _sym("x")],
+                     "limits": {"steps": 5, "seconds": 10}})
+    state = r._build_state()
+    ip = claripy.BVS("ip", binary.arch.bits)
+    state.add_constraints(claripy.Or(ip == 0x400761, ip == 0x400800))
+    state.regs.ip = ip
+    # plain .addr can't resolve a 2-valued IP
+    with pytest.raises(Exception):
+        _ = state.addr
+    addr, symbolic = r._resolve_addr(state)
+    assert symbolic is True
+    assert addr in (0x400761, 0x400800)
+
+
 def test_assert_at_return_reads_final_value(binary):
     """An `at_return` assert must read the return value AFTER the return block runs.
     scale() returns a*b+100; the counterexample to `ret != 0` must really make it 0."""

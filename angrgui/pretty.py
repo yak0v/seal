@@ -7,6 +7,44 @@ angr names symbolic variables `cmd_3_32`; the run knows which BVS belongs to
 which argument / buffer / stdin, so we map them back.  A few idioms VEX emits
 (sign-bit tests, sign extension spelled as a Concat of repeated bits) are
 recognised and folded into the form a human would write.
+
+ROLE
+    The human-facing inverse of exprlang. exprlang turns a STRING into a claripy AST;
+    this turns a claripy AST (a branch condition on a path, a return value, a witness
+    expression) back into a short STRING over the user's input names. It is what makes
+    path conditions and findings readable instead of `cmd_3_32[7:0] == 0x5a`.
+
+WHY IT'S LIKE THIS
+    - Output deliberately matches the exprlang GRAMMAR (`x s> 1000`, `u16(x)+8 < u16(x)`),
+      so what SEAL prints reads the same way as what you'd type as an assumption/assert —
+      the two modules are a matched pair (AST→text here, text→AST in exprlang). Keep them
+      consistent: a syntax added to one should be renderable/parseable by the other.
+    - Name remapping (via `Names`) exists because angr's auto-generated BVS names are
+      meaningless to a human; the run records which BVS is which argument/buffer/stdin and
+      we substitute the friendly name, tagging each as a number value or a byte string.
+    - VEX-idiom folding (sign-bit tests, sign-extension spelled as a Concat of repeated
+      top bits, value-preserving unsigned zero-extends) collapses machine-level spellings
+      into the comparison a person actually means — otherwise conditions are unreadable.
+    - `_num` prints numbers as hex, and as a signed decimal when the signed context and the
+      top bit say so, because that's how a reverse engineer reads a value.
+
+EXTENDING
+    - New operator/idiom: add it to the CMP/ARITH/FLIP/NEGATE maps and, if it's a machine
+      idiom that should be folded, add a recogniser (see `_signbit_of`, `_sext_concat`,
+      `_zext_inner`) and handle it in `Printer.p`.
+    - New value KIND (beyond number / byte-string): extend `Names` and the formatting so
+      the GUI/MCP can tell how to display it.
+
+PITFALLS
+    - KEEP OUTPUT STABLE AND PARSEABLE. The GUI shows these strings and the MCP returns
+      them in witnesses/conditions; some flows feed a printed condition back as an
+      assumption. If you change the rendering, keep it valid exprlang syntax and keep the
+      operator spellings (`s<`, `s>>`, `u16(...)`) exactly as exprlang expects, or the
+      round-trip breaks.
+    - Signedness shows as `s`-prefixed operators and signed decimals — mirror exprlang's
+      unsigned-by-default convention so a printed form means what it would mean if typed.
+    - Folding is best-effort: when an idiom isn't recognised it falls back to a faithful
+      (if uglier) rendering — never "simplify" in a way that changes meaning.
 """
 from __future__ import annotations
 
@@ -41,8 +79,10 @@ class Names:
     where byte 0 is the most significant byte of the BVS.
     """
 
-    def __init__(self, named: dict | None = None, byte_names=()):
+    def __init__(self, named: dict | None = None, byte_names=(), bufmembers: dict | None = None):
         self.map: dict[str, tuple[str, str]] = {}
+        # buffer display-name -> sorted [[byte_offset, byte_size, member_name], ...]
+        self.members: dict[str, list] = bufmembers or {}
         for user, ast in (named or {}).items():
             if isinstance(ast, claripy.ast.Base) and ast.op == "BVS":
                 kind = "bytes" if user in byte_names or user.endswith("_buf") or user == "stdin" else "value"
@@ -193,6 +233,9 @@ class Printer:
             if kind == "bytes" and (hi + 1) % 8 == 0 and lo % 8 == 0:
                 first = (n - 1 - hi) // 8
                 count = (hi - lo + 1) // 8
+                label = _member_label(self.names.members.get(name), first, count)
+                if label:
+                    return label
                 return f"{name}[{first}]" if count == 1 else f"{name}[{first}:{first + count}]"
         if lo == 0 and hi + 1 in (8, 16, 32, 64):
             return f"u{hi + 1}({self.p(inner)[0]})"
@@ -216,6 +259,20 @@ class Printer:
         return f"{self.wrap(a, signed)} {sym} {self.wrap(b, signed)}"
 
 
+def _member_label(mm, first, count):
+    """Name a buffer byte range [first, first+count) by the struct member covering it."""
+    if not mm:
+        return None
+    for off, size, nm in mm:
+        if off <= first and first + count <= off + size:
+            if first == off and count == size:
+                return nm
+            sub = first - off                      # a slice inside one member
+            return f"{nm}[{sub}]" if count == 1 else f"{nm}[{sub}:{sub + count}]"
+    return None
+
+
 def printer_for_state(state) -> Printer:
     named = state.globals.get("angrgui_vars", {}) if "angrgui_vars" in state.globals else {}
-    return Printer(Names(named))
+    bufmembers = state.globals.get("angrgui_bufmembers", {}) if "angrgui_bufmembers" in state.globals else {}
+    return Printer(Names(named, bufmembers=bufmembers))

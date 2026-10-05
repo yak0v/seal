@@ -49,6 +49,7 @@ const A = {
   cfgCache: {},
   selNode: null,        // selected path-tree node id
   collapsed: new Set(), // folded path-tree node ids
+  loopCollapsed: new Set(), // folded loop regions (by entry node id)
   pathHighlight: null,  // Set of block addrs on the selected path
   scriptCode: "",
   scriptJump: null,
@@ -58,7 +59,23 @@ const A = {
   activity: [],
   actOpen: false,
   followAgent: true,
+  models: { by_name: {}, by_site: {} },   // global function-return models (apply to every run)
 };
+
+// ---- global function-return models (persisted in the workspace, applied to all runs)
+async function loadModels() {
+  try {
+    const r = await api("/api/models");
+    A.models = { by_name: r.by_name || {}, by_site: r.by_site || {} };
+  } catch (e) { A.models = { by_name: {}, by_site: {} }; }
+}
+let _modelSaveT = null;
+function saveModels() {
+  clearTimeout(_modelSaveT);
+  _modelSaveT = setTimeout(() => { jpost("/api/models", A.models).catch(() => {}); }, 250);
+}
+const modelForName = (name) => name && A.models.by_name[name];
+const modelForSite = (addr) => addr != null && A.models.by_site[hx64(addr)];
 
 // ==================================================================== boot
 window.addEventListener("DOMContentLoaded", init);
@@ -80,6 +97,21 @@ async function init() {
   ["left", "right"].forEach(s => { try { if (localStorage.getItem("collapse:" + s) === "1") setPanelCollapsed(s, true); } catch (e) {} });
   $$("#viewMode .segbtn").forEach(x => x.addEventListener("click", () => setViewMode(x.dataset.mode)));
   try { setViewMode(localStorage.getItem("viewMode") || "setup", true); } catch (e) {}
+  try { A.pathsOrient = localStorage.getItem("pathsOrient") || "horizontal"; } catch (e) { A.pathsOrient = "horizontal"; }
+  $$("#pathsToggle .segbtn").forEach(x => x.addEventListener("click", () => {
+    // idempotent: clicking a side always selects that orientation and shows the strip;
+    // re-clicking the active one keeps it (use the × on the strip to hide)
+    A.pathsOrient = x.dataset.orient; try { localStorage.setItem("pathsOrient", A.pathsOrient); } catch (e) {}
+    if (A.pathsDock) setPathsOrient(A.pathsOrient); else setPathsDock(true);
+  }));
+  $("#pbClose").addEventListener("click", () => setPathsDock(false));
+  // code text size (decompilation / disassembly / angr script)
+  const applyCodeFs = () => { $("#mainView").style.setProperty("--code-fs", A.codeFs + "px"); try { localStorage.setItem("codeFs", A.codeFs); } catch (e) {} };
+  try { A.codeFs = Math.max(8, Math.min(28, +localStorage.getItem("codeFs") || 12)); } catch (e) { A.codeFs = 12; }
+  $("#fsDown").addEventListener("click", () => { A.codeFs = Math.max(8, A.codeFs - 1); applyCodeFs(); });
+  $("#fsUp").addEventListener("click", () => { A.codeFs = Math.min(28, A.codeFs + 1); applyCodeFs(); });
+  applyCodeFs();
+  try { setPathsDock(localStorage.getItem("pathsDock") === "1", true); } catch (e) { setPathsDock(false, true); }
   $("#followChk").addEventListener("change", e => { A.followAgent = e.target.checked; });
   $("#bottomClose").addEventListener("click", () => {
     const bp = $("#bottomPanel"); bp.classList.toggle("collapsed");
@@ -164,6 +196,7 @@ const fmtSize = (n) => n > 1e6 ? (n / 1e6).toFixed(1) + "M" : n > 1e3 ? (n / 1e3
 async function loadFunctions() {
   const r = await api("/api/functions");
   A.functions = r.functions;
+  await loadModels();
   $("#fnCount").textContent = r.functions.length;
   // stripped binary: almost nothing has a symbol name, so don't hide the sub_* functions
   if (r.functions.filter(f => f.named).length < 10) $("#onlyNamed").checked = false;
@@ -200,7 +233,7 @@ function renderFunctions() {
 
 // ==================================================================== select function
 async function selectFunction(f) {
-  A.fn = f; A.run = null; A.selectedHit = null; A.selNode = null; A.pathHighlight = null; A.collapsed.clear();
+  A.fn = f; A.run = null; A.selectedHit = null; A.selNode = null; A.pathHighlight = null; A.collapsed.clear(); A.loopCollapsed.clear();
   try { localStorage.setItem("lastFn:" + (A.binary && A.binary.name), f.addr); } catch (e) {}
   stopPolling();
   renderFunctions();
@@ -218,7 +251,7 @@ async function selectFunction(f) {
   }
   renderCode();
   renderRight();
-  selectTab(A.ida && A.ida.connected ? "decomp" : "code");   // decompilation is the main view when IDA is on
+  selectTab("decomp");   // decompilation is always the default view
   renderDock();                                               // graph + paths, always visible
 }
 
@@ -227,7 +260,7 @@ async function selectFunction(f) {
 // initial state). A.func holds the structure; A.config is a live view onto the
 // active scenario, with the shared checks array exposed as A.config.checks so
 // all the existing per-field editors keep working unchanged.
-const SCEN_FIELDS = ["name", "args", "buffers", "assumptions", "stdin", "files", "limits"];
+const SCEN_FIELDS = ["name", "args", "buffers", "assumptions", "stdin", "files", "limits", "initial_state"];
 function normalizeScenario(s, i) {
   s = s || {};
   s.name = s.name || ("Scenario " + (i + 1));
@@ -237,6 +270,7 @@ function normalizeScenario(s, i) {
   s.stdin = s.stdin || null;
   s.files = s.files || [];
   s.limits = Object.assign({ steps: 150, active: 300, seconds: 30, loop_bound: 12, find: null, avoid: [] }, s.limits || {});
+  s.initial_state = s.initial_state || null;   // null = fresh call (symbolic args); else {kind:"snapshot",...}
   return s;
 }
 function normalizeFunc(cfg) {
@@ -394,6 +428,117 @@ function selectTab(name) {
   if (name === "code" && A.detail) renderCode();
   if (name === "script") renderScript();
   if (name === "decomp") renderDecomp();
+  if (name === "state") renderState();
+}
+
+// ===================================================================== State tab
+// View the function's INITIAL STATE: a fresh symbolic call (default), or a concolic
+// snapshot (real registers + memory captured from a live run) with the attacker-
+// controlled fields symbolized. Also the place to load a snapshot.
+function activeScenario() {
+  return A.func && A.func.scenarios ? A.func.scenarios[A.func.active] : null;
+}
+function renderState() {
+  const pane = $("#pane-state"); if (!pane) return;
+  if (!A.fn || !A.func) { pane.replaceChildren(el("div", { class: "empty" }, "Select a function.")); return; }
+  const sc = activeScenario();
+  const init = sc && sc.initial_state;
+  const wrap = el("div", { class: "statewrap" });
+
+  const bar = el("div", { class: "decompbar" },
+    el("span", {}, "Initial state · "),
+    el("span", { class: "fn" }, init && init.kind === "snapshot" ? "concolic snapshot" : "fresh call (symbolic args)"),
+    el("span", { class: "grow" }),
+    el("button", { class: "tiny primary", onclick: openSnapshotLoader }, "Load snapshot…"),
+    init ? el("button", { class: "tiny", onclick: clearInitialState }, "Clear → fresh call") : null);
+  wrap.append(bar);
+
+  if (!init || init.kind !== "snapshot") {
+    const t = el("div", { class: "statebox" },
+      el("div", { class: "faint", style: "margin-bottom:6px" },
+        "No snapshot. The run starts from a fresh call with the arguments below symbolic — so every input is unknown and many paths look feasible."));
+    const args = (sc.args || []);
+    if (args.length) {
+      const tbl = el("table", { class: "statetbl" });
+      args.forEach(a => tbl.append(el("tr", {}, el("td", {}, a.name), el("td", {}, a.mode || "symbolic"),
+        el("td", {}, a.mode === "concrete" ? String(a.value ?? 0) : "symbolic"))));
+      t.append(tbl);
+    }
+    wrap.append(t);
+    pane.replaceChildren(wrap);
+    return;
+  }
+
+  // snapshot view: PC, symbolic overlays, registers, memory
+  const sym = init.symbolic || [];
+  const symKey = {};                         // reg/addr -> symbolic name
+  sym.forEach(s => { if (s.reg) symKey["reg:" + s.reg] = s.name; if (s.addr != null) symKey["mem:" + s.addr] = s.name; });
+
+  wrap.append(el("div", { class: "statebox" },
+    el("div", {}, el("b", {}, "PC: "), el("span", { class: "mono" }, hx64(init.pc))),
+    sym.length ? el("div", { style: "margin-top:4px" }, el("b", {}, "symbolic (attacker-controlled): "),
+      ...sym.map(s => el("span", { class: "pill bad", style: "margin-right:4px" },
+        (s.reg || hx64(s.addr)) + " = " + (s.name || "sym")))) : el("div", { class: "faint" }, "nothing symbolic yet")));
+
+  const regs = init.regs || {};
+  const rtbl = el("table", { class: "statetbl" });
+  rtbl.append(el("tr", {}, el("th", {}, "register"), el("th", {}, "value"), el("th", {}, "")));
+  Object.keys(regs).forEach(r => {
+    const isSym = symKey["reg:" + r];
+    rtbl.append(el("tr", { class: isSym ? "symrow" : "" },
+      el("td", { class: "mono" }, r),
+      el("td", { class: "mono" }, isSym ? "symbolic" : hx64(regs[r])),
+      el("td", {}, isSym ? el("span", { class: "pill bad" }, isSym) : "")));
+  });
+  wrap.append(el("div", { class: "statelbl" }, "registers (concrete, from the live run)"), rtbl);
+
+  const mem = init.mem || [];
+  if (mem.length) {
+    const mtbl = el("table", { class: "statetbl" });
+    mtbl.append(el("tr", {}, el("th", {}, "address"), el("th", {}, "bytes"), el("th", {}, "preview")));
+    mem.forEach(m => mtbl.append(el("tr", {},
+      el("td", { class: "mono" }, hx64(m.addr)),
+      el("td", {}, String((m.hex || "").length / 2)),
+      el("td", { class: "mono faint" }, (m.hex || "").slice(0, 32) + ((m.hex || "").length > 32 ? "…" : "")))));
+    wrap.append(el("div", { class: "statelbl" }, "memory regions (concrete)"), mtbl);
+  }
+  pane.replaceChildren(wrap);
+}
+
+async function clearInitialState() {
+  const sc = activeScenario(); if (!sc) return;
+  sc.initial_state = null;
+  await saveConfig();
+  renderState();
+  toast("initial state reset to fresh call");
+}
+
+function openSnapshotLoader() {
+  const sc = activeScenario(); if (!sc) return;
+  const cur = sc.initial_state && sc.initial_state.kind === "snapshot" ? sc.initial_state : null;
+  const ta = el("textarea", { class: "snapjson", placeholder: '{"pc":..., "regs":{...}, "mem":[{"addr":...,"hex":"..."}]}',
+    style: "width:100%;height:160px;font-family:var(--mono);font-size:11px" },
+    cur ? JSON.stringify({ pc: cur.pc, regs: cur.regs, mem: cur.mem }, null, 1) : "");
+  const symIn = el("input", { type: "text", placeholder: "symbolic fields, e.g.  x1:coord, 0x16fdff000:len",
+    style: "width:100%;font-family:var(--mono)", value: (cur && (cur.symbolic || []).map(s => (s.reg || hx64(s.addr)) + ":" + (s.name || "sym")).join(", ")) || "" });
+  const applyBtn = el("button", { class: "primary" }, "Apply");
+  const bg = modal("Load snapshot", el("div", {},
+    el("div", { class: "faint", style: "margin-bottom:6px" }, "Paste a snapshot JSON (registers + memory from a real run, e.g. the lldb capture). Then list the attacker-controlled fields to make symbolic."),
+    el("div", { class: "statelbl" }, "snapshot JSON"), ta,
+    el("div", { class: "statelbl", style: "margin-top:8px" }, "symbolic fields  (reg:name or 0xADDR:name, comma-separated)"), symIn),
+    [applyBtn]);
+  ($("#modalHost") || document.body).append(bg);
+  applyBtn.onclick = () => {
+    let snap;
+    try { snap = JSON.parse(ta.value); } catch (e) { toast("invalid JSON: " + e.message, true); return; }
+    const symbolic = symIn.value.split(",").map(s => s.trim()).filter(Boolean).map(tok => {
+      const [k, name] = tok.split(":").map(x => x.trim());
+      return /^0x/i.test(k) ? { addr: parseInt(k, 16), name: name || "sym", size: 8 } : { reg: k, name: name || "sym", size: 8 };
+    });
+    sc.initial_state = { kind: "snapshot", pc: snap.pc, regs: snap.regs || {}, mem: snap.mem || [], symbolic };
+    bg.remove();
+    saveConfig().then(() => { renderState(); toast("snapshot loaded — Explore to run seeded"); });
+  };
 }
 
 // the docked graph + paths, always visible beside the main code view
@@ -409,6 +554,9 @@ function renderCode() {
   A._vars = varModel();
   const abar = assumptionsBar(); if (abar) pane.append(abar);
   const wrap = el("div", { class: "codewrap" });
+
+  // example inputs for the selected path, pinned at the top where the args arrive
+  wrap.append(el("div", { class: "codeinputs", id: "codeInputs", style: "display:none" }));
 
   // source strip (if available)
   if (di.source && di.source.available) {
@@ -433,6 +581,7 @@ function renderCode() {
     }
     const acts = el("span", { class: "acts" });
     if (ins.arith) acts.append(btn("+ overflow", () => addOverflowCheck(ins), "primary tiny"));
+    if (/call/.test(ins.mnemonic)) acts.append(btn("ƒ model", () => modelCall(ins), "tiny"));
     acts.append(btn("assert", () => openAssertModal(ins.addr), "tiny"));
     acts.append(btn("reach", () => addReachCheck(ins.addr, "reach"), "tiny"));
     acts.append(btn("⋯", () => openInsnMenu(ins), "tiny ghost"));
@@ -441,8 +590,16 @@ function renderCode() {
       el("span", { class: "ad" }, hx64(ins.addr)),
       el("span", { class: "mn" }, ins.mnemonic),
       el("span", { class: "op" }, annotate(ins.op_str), ins.is_call && di.call_targets[ins.addr] ? "   ; " + (di.call_targets[ins.addr].name || "") : ""),
+      callModelTag(ins),
       ins.src_line ? el("span", { class: "faint", style: "flex:0 0 auto;margin-right:6px" }, ":" + ins.src_line) : null,
       acts);
+    // concrete value written here on the selected (seeded) path
+    const av = A.pathAsgn && A.pathAsgn["0x" + ins.addr.toString(16)];
+    if (av) {
+      const val = av.store ? av.store.val : av.val;
+      const dst = av.store ? "[" + av.store.addr + "]" : av.reg;
+      if (val != null) row.append(el("span", { class: "cvals asgn", style: "flex:0 0 auto" }, `  ${dst} = ${val}`));
+    }
     wrap.append(row);
   }
   pane.append(wrap);
@@ -452,8 +609,16 @@ const btn = (label, on, cls) => el("button", { class: cls || "tiny", onclick: (e
 
 function openInsnMenu(ins) {
   const host = $("#modalHost");
+  const isCall = /call/.test(ins.mnemonic);
+  const direct = isCall && /^0x[0-9a-fA-F]+$/.test((ins.op_str || "").trim());
+  const callTargetName = direct ? funcNameAt(parseInt(ins.op_str, 16)) : null;
   const m = modal("At " + hx64(ins.addr) + "  " + ins.mnemonic + " " + ins.op_str,
     el("div", { class: "col", style: "gap:8px" },
+      // model a call's return value
+      (isCall && direct && callTargetName) ? menuItem("Set return model for " + callTargetName + "()",
+        "replace this function with a modelled return, wherever it is called", () => { m.remove(); openReturnModelEditor({ name: callTargetName, addr: parseInt(ins.op_str, 16) }); }) : null,
+      (isCall && !direct) ? menuItem("Model this indirect call", "replace this call-through-pointer with a modelled return",
+        () => { m.remove(); openReturnModelEditor({ site: ins.addr, siteText: ins.mnemonic + " " + ins.op_str }); }) : null,
       ins.arith ? menuItem("Integer-overflow check here", "flag this add/sub/mul as possibly wrapping", () => { m.remove(); addOverflowCheck(ins); }) : null,
       menuItem("Assert an invariant here", "a boolean that should always hold at this point", () => { m.remove(); openAssertModal(ins.addr); }),
       menuItem("Reach check", "record any path that reaches this address", () => { m.remove(); addReachCheck(ins.addr, "reach"); }),
@@ -461,6 +626,28 @@ function openInsnMenu(ins) {
       menuItem("Custom Python check here", "run your own predicate at this point", () => { m.remove(); openCustomModal(ins.addr); })),
     [el("button", { onclick: () => m.remove() }, "Close")]);
   host.append(m);
+}
+function funcNameAt(addr) {
+  const f = (A.functions || []).find(x => x.addr === addr);
+  return f ? (f.ida_name || f.name) : null;
+}
+// open the right model editor for a call instruction (named function vs indirect site)
+function modelCall(ins) {
+  const direct = /^0x[0-9a-fA-F]+$/.test((ins.op_str || "").trim());
+  const name = direct ? funcNameAt(parseInt(ins.op_str, 16)) : null;
+  if (name) return openReturnModelEditor({ name, addr: parseInt(ins.op_str, 16) });
+  return openReturnModelEditor({ site: ins.addr, siteText: ins.mnemonic + " " + ins.op_str });
+}
+// a tag shown next to a call in the code when a return model is set for it
+function callModelTag(ins) {
+  if (!/call/.test(ins.mnemonic)) return null;
+  const direct = /^0x[0-9a-fA-F]+$/.test((ins.op_str || "").trim());
+  let mdl = null, target = null;
+  if (direct) { const nm = funcNameAt(parseInt(ins.op_str, 16)); mdl = modelForName(nm); if (mdl) target = { name: nm, addr: parseInt(ins.op_str, 16) }; }
+  if (!mdl) { mdl = modelForSite(ins.addr); if (mdl) target = { site: ins.addr, siteText: ins.mnemonic + " " + ins.op_str }; }
+  if (!mdl) return null;
+  return el("span", { class: "modeltag", title: "modelled return — click to edit",
+    onclick: (e) => { e.stopPropagation(); openReturnModelEditor(target); } }, "ƒ " + describeRetModel(mdl));
 }
 const menuItem = (title, sub, on) => {
   const r = el("div", { class: "fbrow", style: "flex-direction:column;align-items:flex-start;gap:2px;padding:10px" },
@@ -493,6 +680,7 @@ function renderRight() {
   if (!A.fn) { body.append(el("div", { class: "empty" }, "Pick a function.")); return; }
 
   body.append(sectionState());
+  body.append(sectionReturnModel());
   body.append(sectionAssumptions());
   body.append(sectionModels());
   body.append(sectionChecks());
@@ -528,40 +716,50 @@ function sectionState() {
 
   A.config.args.forEach((a, i) => {
     const nameI = el("input", { class: "name", value: a.name || ("arg" + i), oninput: e => { a.name = e.target.value; scheduleSave(); } });
-    const setMode = m => { a.mode = m; renderRight(); scheduleSave(); };
+    const bufr = A.config.buffers.find(x => x.arg === a.name);
+    // One mutually-exclusive mode per argument: a scalar the solver chooses
+    // (symbolic), a constant you supply (fixed), or a pointer at a symbolic
+    // buffer / struct (buffer). "buffer" overrides the pointer value, so it
+    // can't coexist with symbolic/fixed — hence a single 3-way selector.
+    const curMode = bufr ? "buffer" : (a.mode === "concrete" ? "fixed" : "symbolic");
+    const setMode = m => {
+      if (m === "buffer") { toggleBuffer(a.name, true); return; }          // toggleBuffer re-renders
+      if (bufr) A.config.buffers = A.config.buffers.filter(x => x.arg !== a.name);
+      a.mode = (m === "fixed") ? "concrete" : "symbolic";
+      renderRight(); scheduleSave();
+    };
+    const seg = (m, label, title) => el("div", { class: "segbtn" + (curMode === m ? " on" : ""), title, onclick: () => setMode(m) }, label);
     const modeS = el("div", { class: "seg" },
-      el("div", { class: "segbtn" + (a.mode !== "concrete" ? " on" : ""), onclick: () => setMode("symbolic") }, "sym"),
-      el("div", { class: "segbtn" + (a.mode === "concrete" ? " on" : ""), onclick: () => setMode("concrete") }, "fixed"));
+      seg("symbolic", "sym", "the solver chooses this value"),
+      seg("fixed", "fixed", "a constant you supply"),
+      seg("buffer", "buffer", "a pointer at a symbolic buffer / struct"));
     const sizeS = el("select", { onchange: e => { a.size = +e.target.value; scheduleSave(); } });
     [1, 2, 4, 8].forEach(sz => sizeS.append(el("option", { value: sz, selected: a.size === sz ? "" : null }, sz + "B")));
-    let last;
-    if (a.mode === "concrete") {
+    let last = null;
+    if (curMode === "fixed")
       last = el("input", { value: a.value ?? 0, placeholder: "value", oninput: e => { a.value = parseIntLoose(e.target.value); scheduleSave(); }, style: "width:78px" });
-    } else {
+    else if (curMode === "symbolic")
       last = el("label", { class: "row", style: "font-size:11px;color:var(--dim);gap:3px" },
         el("input", { type: "checkbox", checked: a.signed ? "" : null, style: "width:auto", onchange: e => { a.signed = e.target.checked; scheduleSave(); } }), "signed");
-    }
-    b.append(el("div", { class: "arg" }, nameI, modeS, sizeS, last));
+    // buffer mode hides the byte-size select (pointer width is fixed); the buffer size lives below
+    b.append(el("div", { class: "arg" }, nameI, modeS, curMode === "buffer" ? null : sizeS, last));
     // float toggle: passes this argument in an SSE register as a symbolic float/double
-    if (a.mode !== "concrete") {
+    if (curMode === "symbolic") {
       b.append(el("label", { class: "row", style: "font-size:11px;color:var(--faint);margin:-2px 0 8px 2px;gap:4px" },
         el("input", { type: "checkbox", checked: a.float ? "" : null, style: "width:auto",
           onchange: e => { a.float = e.target.checked; if (a.float && ![4, 8].includes(a.size)) a.size = 8; scheduleSave(); renderRight(); } }),
         "floating-point ", a.float ? el("span", { class: "faint" }, a.size === 4 ? "(float)" : "(double)") : el("span", { class: "faint" }, "(for float-point checks)")));
     }
-    // buffer toggle for pointer-ish args
-    const bufr = A.config.buffers.find(x => x.arg === a.name);
-    const isBuf = !!bufr;
-    const bufRow = el("div", { class: "row", style: "font-size:11px;color:var(--faint);margin:-2px 0 8px 2px;gap:4px;flex-wrap:wrap" },
-      el("label", { class: "row", style: "gap:4px" },
-        el("input", { type: "checkbox", checked: isBuf ? "" : null, style: "width:auto", onchange: e => toggleBuffer(a.name, e.target.checked) }),
-        "points at a symbolic buffer"),
-      isBuf ? el("input", { value: bufr.size || 64, style: "width:52px;margin-left:4px", oninput: e => { bufr.size = +e.target.value; scheduleSave(); } }) : null,
-      isBuf ? el("span", {}, "bytes") : null,
-      isBuf ? el("button", { class: "tiny", style: "margin-left:4px", title: "define struct members (from IDA or custom)",
-        onclick: () => openStructEditor(a.name) },
-        (bufr.layout && bufr.layout.length) ? `⚙ struct (${bufr.layout.length})` : "⚙ as struct") : null);
-    b.append(bufRow);
+    // buffer details: size + struct-layout editor (only in buffer mode)
+    if (bufr) {
+      b.append(el("div", { class: "row", style: "font-size:11px;color:var(--faint);margin:-2px 0 8px 2px;gap:4px;flex-wrap:wrap" },
+        el("span", {}, "buffer"),
+        el("input", { value: bufr.size || 64, style: "width:52px", oninput: e => { bufr.size = +e.target.value; scheduleSave(); } }),
+        el("span", {}, "bytes · pointer is concrete, contents symbolic"),
+        el("button", { class: "tiny", style: "margin-left:4px", title: "define struct members (from IDA or custom)",
+          onclick: () => openStructEditor(a.name) },
+          (bufr.layout && bufr.layout.length) ? `⚙ struct (${bufr.layout.length})` : "⚙ as struct")));
+    }
   });
 
   // stdin
@@ -599,8 +797,73 @@ function openStructEditor(argName) {
   const bufr = A.config.buffers.find(x => x.arg === argName);
   if (!bufr) return;
   bufr.layout = bufr.layout || [];
-  const typeI = el("input", { value: bufr.struct_type || "", placeholder: "struct type name, e.g. TIFF", style: "flex:1;min-width:0" });
-  typeI.addEventListener("keydown", e => { if (e.key === "Enter") loadFromIda(); });
+  // A real combobox: a text field + a dropdown LIST of every struct IDA knows.
+  // Click the caret (or focus) to open the whole list; typing filters it live;
+  // click an entry (or Enter on the highlighted one) to load it.
+  const combo = el("div", { class: "combo" });
+  const typeI = el("input", { value: bufr.struct_type || "", placeholder: "choose or type a struct…", autocomplete: "off" });
+  const caret = el("div", { class: "combo-caret", title: "show all structs" }, "▾");
+  const listEl = el("div", { class: "combo-list", style: "display:none" });
+  combo.append(typeI, caret, listEl);
+  let allStructs = [];
+  let activeIdx = -1;
+  let loadErr = null;
+  const highlight = (name, q) => {
+    const i = q ? name.toLowerCase().indexOf(q) : -1;
+    if (i < 0) return name;
+    return [name.slice(0, i), el("span", { class: "cm-hit" }, name.slice(i, i + q.length)), name.slice(i + q.length)];
+  };
+  const matchesNow = () => {
+    const q = typeI.value.trim().toLowerCase();
+    return allStructs.filter(n => n.toLowerCase().includes(q));
+  };
+  const renderList = () => {
+    const q = typeI.value.trim().toLowerCase();
+    const matches = matchesNow();
+    listEl.replaceChildren();
+    if (!allStructs.length) {
+      listEl.append(el("div", { class: "combo-empty" }, loadErr ? "IDA not connected — type a name and press Load" : "loading structs from IDA…"));
+      return;
+    }
+    listEl.append(el("div", { class: "combo-head" }, matches.length + " of " + allStructs.length + " structs"));
+    if (!matches.length) { listEl.append(el("div", { class: "combo-empty" }, "no match — press Load to try this name anyway")); return; }
+    matches.slice(0, 300).forEach((n, i) => listEl.append(el("div", {
+      class: "combo-item" + (i === activeIdx ? " active" : ""),
+      // mousedown (not click) so it fires before the input's blur hides the list
+      onmousedown: e => { e.preventDefault(); typeI.value = n; closeList(); loadFromIda(); },
+    }, ...[].concat(highlight(n, q)))));
+  };
+  const openList = () => { listEl.style.display = ""; renderList(); };
+  const closeList = () => { listEl.style.display = "none"; activeIdx = -1; };
+  const toggleList = () => { listEl.style.display === "none" ? (typeI.focus(), openList()) : closeList(); };
+  caret.addEventListener("mousedown", e => { e.preventDefault(); toggleList(); });
+  typeI.addEventListener("focus", openList);
+  typeI.addEventListener("input", () => { activeIdx = -1; openList(); });
+  typeI.addEventListener("blur", () => setTimeout(closeList, 150));
+  typeI.addEventListener("keydown", e => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (listEl.style.display === "none") { openList(); return; }
+      const n = matchesNow().length;
+      activeIdx = e.key === "ArrowDown" ? Math.min(activeIdx + 1, n - 1) : Math.max(activeIdx - 1, 0);
+      renderList();
+      listEl.querySelectorAll(".combo-item")[activeIdx]?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const matches = matchesNow();
+      if (activeIdx >= 0 && matches[activeIdx]) typeI.value = matches[activeIdx];
+      closeList(); loadFromIda();
+    } else if (e.key === "Escape") { closeList(); }
+  });
+  // populate the list with every struct IDA knows, so the user picks instead of recalling a name
+  (async () => {
+    try {
+      const r = await api("/api/ida/structs");
+      allStructs = r.structs || [];
+      typeI.placeholder = allStructs.length ? `choose or type a struct (${allStructs.length})…` : "struct type name, e.g. TIFF";
+    } catch (e) { loadErr = e; typeI.placeholder = "IDA not connected — type a name, e.g. TIFF"; }
+    if (listEl.style.display !== "none") renderList();
+  })();
   const tbl = el("div", { class: "structtbl" });
   const sizeI = el("input", { value: bufr.size || 64, style: "width:72px", oninput: e => { bufr.size = +e.target.value; scheduleSave(); } });
 
@@ -648,8 +911,9 @@ function openStructEditor(argName) {
     } catch (e) { toast("load failed: " + e.message, true); }
   }
   const body = el("div", {},
-    field("Struct type (from IDA)", el("div", { class: "row" }, typeI, btn("Load", loadFromIda, "tiny primary")),
-      "Pull the member layout from IDA by type name. Members default to symbolic (named, so they show in witnesses); flip any to fixed and give a value. Unlisted bytes stay symbolic."),
+    field("Struct type (from IDA)", el("div", { class: "row" }, combo, btn("Load", loadFromIda, "tiny primary"),
+      btn("Label only", () => { const nm = typeI.value.trim(); if (!nm) { toast("pick a struct first", true); return; } bufr.struct_type = nm; scheduleSave(); toast(`buffer bytes will be labelled as ${nm} members in conditions`); }, "tiny")),
+      "<b>Load</b> pulls the members in as editable rows (each becomes a symbolic/fixed field). <b>Label only</b> just records the type, so the whole buffer stays one symbolic blob but branch conditions read <code>tif-&gt;member</code> instead of <code>tif_buf[16]</code>. Click ▾ to browse every struct IDA knows."),
     el("div", { class: "row", style: "margin:8px 0 2px" }, el("span", { class: "faint" }, "buffer size"), sizeI, el("span", { class: "faint grow" }, "bytes"),
       btn("+ member", () => { bufr.layout.push({ offset: 0, size: 4, name: argName + ".m" + bufr.layout.length, mode: "sym" }); scheduleSave(); render(); }, "tiny")),
     tbl);
@@ -696,54 +960,57 @@ function sectionModels() {
     btn("+ model", () => openModelModal(), "tiny")));
   const b = el("div", { class: "body" });
   const models = A.config.models || (A.config.models = []);
-  if (!models.length) b.append(el("div", { class: "faint", style: "font-size:11px" },
-    "Replace a function this one calls with a model, so it isn't stepped into. Needed for bugs that span library calls (e.g. model malloc + size functions, then check for OOB writes)."));
   models.forEach((m, i) => {
+    const label = m.site != null ? hx64(m.site) : (m.func || "(unset)");
     b.append(el("div", { class: "modelrow" },
-      el("span", { class: "mono mfn", title: MODEL_KIND_DESC[m.kind] || "" }, m.func || "(unset)"),
-      el("span", { class: "msum" }, describeModel(m)),
+      el("span", { class: "mono mfn", title: RETMODEL_KINDS[m.kind] || "" }, m.site != null ? label + " (indirect)" : label + "()"),
+      el("span", { class: "msum" }, describeRetModel(m)),
       btn("✎", () => openModelModal(i), "tiny ghost"),
       btn("✕", () => { models.splice(i, 1); renderRight(); scheduleSave(); }, "tiny ghost")));
   });
   s.append(b);
   return s;
 }
-function openModelModal(editIdx) {
+function openModelModal(editIdx, preset) {
   const models = A.config.models || (A.config.models = []);
-  const m = editIdx != null ? { ...models[editIdx] } : { kind: "symbolic", func: "" };
-  const funcI = el("input", { value: m.func || "", placeholder: "function name or 0x…", style: "width:100%;box-sizing:border-box" });
-  // suggestions: functions this one calls (from the disassembly's call targets)
-  const dl = el("datalist", { id: "modelFuncs" });
-  calledFunctionNames().forEach(n => dl.append(el("option", { value: n })));
-  funcI.setAttribute("list", "modelFuncs");
+  const m = editIdx != null ? { ...models[editIdx] } : (preset ? { kind: "symbolic", ...preset } : { kind: "symbolic", func: "" });
+  const isSite = m.site != null;
+  // target: a named function (pick from the dropdown) OR an indirect call site (address)
+  const targetSeg = el("div", { class: "seg" },
+    el("div", { class: "segbtn" + (!isSite ? " on" : ""), "data-t": "func" }, "named function"),
+    el("div", { class: "segbtn" + (isSite ? " on" : ""), "data-t": "site" }, "indirect call (by address)"));
+  const combo = comboBox(allFunctionItems(), m.func || "", "choose or type a function (or 0x…)…");
+  const siteCombo = comboBox(indirectCallSites().map(siteItemLabel), m.site != null ? hx64(m.site) : "", "choose an indirect call site in this function…");
+  const targetWrap = el("div");
   const kindS = el("select", {});
-  Object.entries(MODEL_KIND_DESC).forEach(([k, d]) => kindS.append(el("option", { value: k, selected: m.kind === k ? "" : null }, k + " — " + d)));
+  Object.entries(RETMODEL_KINDS).forEach(([k, d]) => kindS.append(el("option", { value: k, selected: m.kind === k ? "" : null }, k + " — " + d)));
   const params = el("div", { style: "margin-top:8px" });
-  const rebuild = () => {
-    params.replaceChildren();
-    const k = kindS.value;
-    if (k === "symbolic") {
-      params.append(field("Symbol name (shows in witnesses)", el("input", { value: m.name || "", placeholder: "e.g. scanline_size", oninput: e => m.name = e.target.value })),
-        field("Return width (bits)", el("input", { value: m.bits || 64, oninput: e => m.bits = parseIntLoose(e.target.value) || 64, style: "width:90px" })));
-    } else if (k === "concrete") {
-      params.append(field("Return value", el("input", { value: m.value ?? 0, oninput: e => m.value = parseIntLoose(e.target.value), style: "width:120px" }), "e.g. 0 for success, or a NULL/handle."));
-    } else if (k === "return_arg") {
-      params.append(field("Argument index", el("input", { value: m.arg ?? 0, oninput: e => m.arg = parseIntLoose(e.target.value), style: "width:90px" }), "0 = first argument."));
-    } else if (k === "alloc") {
-      params.append(field("Size argument index", el("input", { value: m.size_arg ?? 0, oninput: e => m.size_arg = parseIntLoose(e.target.value), style: "width:90px" }), "which argument holds the allocation size."),
-        field("Name the pointer (optional)", el("input", { value: m.name || "", placeholder: "e.g. out_buf", oninput: e => m.name = e.target.value })));
-    }
+  let mode = isSite ? "site" : "func";
+  const drawTarget = () => {
+    targetWrap.replaceChildren(mode === "site"
+      ? field("Indirect call site", siteCombo.wrap, "Pick a <code>call [reg+…]</code> (through a function pointer) in this function. You can also click <b>ƒ model</b> on the call in the code view.")
+      : field("Function to model", combo.wrap, "Any function the analysis calls — pick from the list (includes library/implicit functions) or type a name / 0x address."));
   };
-  kindS.addEventListener("change", () => { m.kind = kindS.value; rebuild(); });
-  rebuild();
+  targetSeg.querySelectorAll(".segbtn").forEach(b => b.addEventListener("click", () => {
+    mode = b.dataset.t; targetSeg.querySelectorAll(".segbtn").forEach(x => x.classList.toggle("on", x === b)); drawTarget();
+  }));
+  drawTarget();
+  kindS.addEventListener("change", () => { m.kind = kindS.value; fillModelFields(m, params); });
+  fillModelFields(m, params);
   const body = el("div", {},
-    field("Function to model", funcI, "A function the analysed function calls. Tip: angr's skip-calls bypasses models, so model every heavy call (reads/writes/allocs) to keep the run bounded."),
-    field("Behavior", kindS), params);
+    field("What to model", targetSeg, "angr's skip-calls bypasses models, so model the calls that matter (size/alloc/read-write, or a pointer call it can't resolve)."),
+    targetWrap, field("Behavior", kindS), params);
   const mo = modal(editIdx != null ? "Edit call model" : "Add call model", body, [
     el("button", { onclick: () => mo.remove() }, "Cancel"),
     el("button", { class: "primary", onclick: () => {
-      m.func = funcI.value.trim(); m.kind = kindS.value;
-      if (!m.func) { toast("enter the function to model", true); return; }
+      m.kind = kindS.value;
+      if (mode === "site") {
+        const a = parseIntLoose((siteCombo.get().split(/\s+/)[0]) || ""); if (!a) { toast("choose the indirect call site", true); return; }
+        m.site = a; delete m.func;
+      } else {
+        const f = combo.get(); if (!f) { toast("choose the function to model", true); return; }
+        m.func = f; delete m.site;
+      }
       if (editIdx != null) models[editIdx] = m; else models.push(m);
       mo.remove(); renderRight(); scheduleSave();
     } }, editIdx != null ? "Save" : "Add model")]);
@@ -761,6 +1028,158 @@ function calledFunctionNames() {
   return [...names].sort();
 }
 
+// ==================================================================== global return models
+const RETMODEL_KINDS = {
+  concrete: "returns a constant",
+  symbolic: "returns a fresh symbolic value",
+  constrained: "symbolic, limited to a set of values (and/or a predicate)",
+  expr: "returns an expression of the arguments",
+  return_arg: "returns one of its arguments",
+  alloc: "allocates a buffer sized by one arg (tracked for OOB-write)",
+};
+function describeRetModel(m) {
+  if (!m) return "";
+  if (m.kind === "concrete") return "→ " + (m.value ?? 0);
+  if (m.kind === "symbolic") return "→ symbolic " + (m.name || "ret");
+  if (m.kind === "constrained") return "→ ∈ {" + (m.values || []).join(", ") + "}" + (m.constraint ? " · " + m.constraint : "");
+  if (m.kind === "expr") return "→ " + (m.expr || "");
+  if (m.kind === "return_arg") return "→ arg" + (m.arg ?? 0);
+  if (m.kind === "alloc") return "→ alloc(arg" + (m.size_arg ?? 0) + ")";
+  return "→ " + m.kind;
+}
+// the per-kind field editor, shared by the call-model and return-model editors
+function fillModelFields(m, params) {
+  params.replaceChildren();
+  const k = m.kind;
+  if (k === "concrete")
+    params.append(field("Return value", el("input", { value: m.value ?? 0, oninput: e => m.value = parseIntLoose(e.target.value), style: "width:140px" }), "e.g. 0 for success / failure, or a NULL/handle."));
+  else if (k === "symbolic")
+    params.append(field("Symbol name (shows in witnesses & conditions)", el("input", { value: m.name || "", placeholder: "e.g. scanline_size", oninput: e => m.name = e.target.value })),
+      field("Return width (bits)", el("input", { value: m.bits || 64, oninput: e => m.bits = parseIntLoose(e.target.value) || 64, style: "width:90px" })));
+  else if (k === "constrained")
+    params.append(
+      field("Allowed values (comma-separated)", el("input", { value: (m.values || []).join(", "), placeholder: "e.g. 0, 1", oninput: e => { m.values = e.target.value.split(",").map(x => x.trim()).filter(x => s_num(x)).map(x => parseIntLoose(x)); } }), "The return is symbolic but limited to this set — the solver won't explore other values."),
+      field("Extra predicate (optional)", el("input", { value: m.constraint || "", placeholder: "e.g. ret s>= 0 && ret s< 100", oninput: e => m.constraint = e.target.value, style: "width:100%;box-sizing:border-box" }), "A boolean over <code>ret</code> (and arg0, arg1…)."));
+  else if (k === "expr")
+    params.append(field("Return = expression of the arguments", el("input", { value: m.expr || "", placeholder: "e.g. arg0 & 1   ·   arg0 == 0 ? 0 : 1", oninput: e => m.expr = e.target.value, style: "width:100%;box-sizing:border-box" }), "Replace the function with a formula over <code>arg0, arg1…</code> (ternary <code>cond ? a : b</code> supported)."));
+  else if (k === "return_arg")
+    params.append(field("Argument index", el("input", { value: m.arg ?? 0, oninput: e => m.arg = parseIntLoose(e.target.value), style: "width:90px" }), "0 = first argument."));
+  else if (k === "alloc")
+    params.append(field("Size argument index", el("input", { value: m.size_arg ?? 0, oninput: e => m.size_arg = parseIntLoose(e.target.value), style: "width:90px" }), "which argument holds the allocation size."),
+      field("Name the pointer (optional)", el("input", { value: m.name || "", placeholder: "e.g. out_buf", oninput: e => m.name = e.target.value })));
+}
+// a reusable filterable dropdown (combobox): items = array of strings; returns {wrap, get}
+function comboBox(items, value, placeholder) {
+  const combo = el("div", { class: "combo" });
+  const input = el("input", { value: value || "", placeholder: placeholder || "choose or type…", autocomplete: "off" });
+  const caret = el("div", { class: "combo-caret", title: "show all" }, "▾");
+  const list = el("div", { class: "combo-list", style: "display:none" });
+  combo.append(input, caret, list);
+  let active = -1;
+  const matches = () => { const q = input.value.trim().toLowerCase(); return items.filter(n => n.toLowerCase().includes(q)); };
+  const render = () => {
+    const q = input.value.trim().toLowerCase(), ms = matches();
+    list.replaceChildren();
+    list.append(el("div", { class: "combo-head" }, ms.length + " of " + items.length));
+    if (!ms.length) { list.append(el("div", { class: "combo-empty" }, "no match — type a name/0x… anyway")); return; }
+    ms.slice(0, 300).forEach((n, i) => {
+      const hit = q ? n.toLowerCase().indexOf(q) : -1;
+      const label = hit < 0 ? n : [n.slice(0, hit), el("span", { class: "cm-hit" }, n.slice(hit, hit + q.length)), n.slice(hit + q.length)];
+      list.append(el("div", { class: "combo-item" + (i === active ? " active" : ""),
+        onmousedown: e => { e.preventDefault(); input.value = n; close(); } }, ...[].concat(label)));
+    });
+  };
+  const open = () => { list.style.display = ""; render(); };
+  const close = () => { list.style.display = "none"; active = -1; };
+  caret.addEventListener("mousedown", e => { e.preventDefault(); list.style.display === "none" ? (input.focus(), open()) : close(); });
+  input.addEventListener("focus", open);
+  input.addEventListener("input", () => { active = -1; open(); });
+  input.addEventListener("blur", () => setTimeout(close, 150));
+  input.addEventListener("keydown", e => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); if (list.style.display === "none") { open(); return; } const n = matches().length; active = e.key === "ArrowDown" ? Math.min(active + 1, n - 1) : Math.max(active - 1, 0); render(); list.querySelectorAll(".combo-item")[active]?.scrollIntoView({ block: "nearest" }); }
+    else if (e.key === "Enter") { e.preventDefault(); const ms = matches(); if (active >= 0 && ms[active]) input.value = ms[active]; close(); }
+    else if (e.key === "Escape") close();
+  });
+  return { wrap: combo, get: () => input.value.trim() };
+}
+// all functions (named + unnamed) as dropdown items: "name  0xADDR"
+function allFunctionItems() {
+  return (A.functions || []).map(f => (f.ida_name || f.name)).filter(Boolean).sort();
+}
+// indirect call sites in the current function (call through a register/pointer)
+function indirectCallSites() {
+  const out = [];
+  for (const i of (A.detail && A.detail.disasm ? A.detail.disasm.instructions : [])) {
+    if (/call/.test(i.mnemonic) && /\[/.test(i.op_str || "")) out.push({ addr: i.addr, text: i.op_str, line: i.src_line });
+  }
+  return out;
+}
+const siteItemLabel = (s) => `${hx64(s.addr)}  ${s.text}${s.line ? "  ·L" + s.line : ""}`;
+// target: {name, addr} for a statically-named function, or {site, siteText} for one call site.
+function openReturnModelEditor(target) {
+  const isSite = target.site != null;
+  const key = isSite ? hx64(target.site) : target.name;
+  const store = isSite ? A.models.by_site : A.models.by_name;
+  const existing = store[key];
+  const m = existing ? { ...existing } : { kind: isSite ? "concrete" : "symbolic", enabled: true };
+  const kindS = el("select", {});
+  Object.entries(RETMODEL_KINDS).forEach(([k, d]) => kindS.append(el("option", { value: k, selected: m.kind === k ? "" : null }, k + " — " + d)));
+  const params = el("div", { style: "margin-top:8px" });
+  const rebuild = () => fillModelFields(m, params);
+  kindS.addEventListener("change", () => { m.kind = kindS.value; rebuild(); });
+  rebuild();
+  const head = isSite
+    ? el("div", { class: "help", html: `Replace the <b>indirect call</b> at <code>${hx64(target.site)}</code>${target.siteText ? " (<code>" + esc(target.siteText) + "</code>)" : ""} with this return — handy for a call through a function pointer whose target angr can't resolve. Applies at this call site, in every run.` })
+    : el("div", { class: "help", html: `Replace <b>${esc(target.name)}</b> with this return <b>wherever it is called</b>, in every analysis.` });
+  const body = el("div", {}, head, field("Behavior", kindS), params);
+  const foot = [
+    existing ? el("button", { onclick: () => { delete store[key]; saveModels(); mo.remove(); afterModelChange(); toast("model removed"); } }, "Remove") : null,
+    el("button", { onclick: () => mo.remove() }, "Cancel"),
+    el("button", { class: "primary", onclick: () => {
+      m.kind = kindS.value; m.enabled = true;
+      if (isSite) m.site = target.site;
+      else { m.func = target.name; if (target.addr != null) m.addr = target.addr; }
+      store[key] = m; saveModels(); mo.remove(); afterModelChange(); toast("return model saved");
+    } }, existing ? "Save" : "Add model"),
+  ];
+  const mo = modal((existing ? "Edit" : "Set") + " return model · " + (isSite ? hx64(target.site) : target.name), body, foot);
+  $("#modalHost").append(mo);
+}
+const s_num = (s) => s !== "" && !isNaN(parseIntLoose(s));
+function afterModelChange() {
+  renderRight();
+  if ($("#pane-code") && $("#pane-code").classList.contains("sel")) renderCode();
+  if ($("#pane-decomp") && $("#pane-decomp").classList.contains("sel")) renderDecomp(true);
+}
+// the Setup-panel section for THIS function's own return model (+ any indirect-call
+// models that live inside its body)
+function sectionReturnModel() {
+  const s = el("div", { class: "sec" });
+  const name = A.fn.ida_name || A.fn.name;
+  const mdl = modelForName(name);
+  s.append(el("h3", {}, "Return model", el("span", { class: "grow" }),
+    btn(mdl ? "✎ edit" : "+ set", () => openReturnModelEditor({ name, addr: A.fn.addr }), "tiny")));
+  const b = el("div", { class: "body" });
+  if (mdl) {
+    b.append(el("div", { class: "modelrow" },
+      el("span", { class: "mono mfn" }, name + "()"),
+      el("span", { class: "msum" }, describeRetModel(mdl)),
+      btn("✕", () => { delete A.models.by_name[name]; saveModels(); afterModelChange(); }, "tiny ghost")));
+  }
+  const lo = A.fn.addr, hi = A.fn.addr + (A.fn.size || 0x100000);
+  const sites = Object.entries(A.models.by_site).filter(([h]) => { const a = parseInt(h, 16); return a >= lo && a < hi; });
+  if (sites.length) {
+    b.append(el("div", { class: "dlabel", style: "margin-top:10px" }, "Indirect calls modelled in this function"));
+    sites.forEach(([h, m]) => b.append(el("div", { class: "modelrow" },
+      el("span", { class: "mono mfn", style: "cursor:pointer", onclick: () => showAddr(parseInt(h, 16)) }, h),
+      el("span", { class: "msum" }, describeRetModel(m)),
+      btn("✎", () => openReturnModelEditor({ site: parseInt(h, 16) }), "tiny ghost"),
+      btn("✕", () => { delete A.models.by_site[h]; saveModels(); afterModelChange(); }, "tiny ghost"))));
+  }
+  s.append(b);
+  return s;
+}
+
 function sectionChecks() {
   const s = el("div", { class: "sec" });
   s.append(el("h3", {}, "Checks", el("span", { class: "grow" }),
@@ -769,7 +1188,6 @@ function sectionChecks() {
     btn("+ assert", () => openAssertModal(null), "tiny"),
     btn("+ custom", () => openCustomModal(null), "tiny")));
   const b = el("div", { class: "body" });
-  if (!A.config.checks.length) b.append(el("div", { class: "faint", style: "font-size:11px" }, "No checks yet. Use ", el("b", {}, "+ detect"), " for a bug class, ", el("b", {}, "+ assert"), " for an invariant, or add checks from the code view."));
   A.config.checks.forEach((c, i) => b.append(renderCheck(c, i)));
   s.append(b);
   return s;
@@ -849,7 +1267,7 @@ async function startRun() {
   try {
     const r = await jpost("/api/run", currentSpec());
     A.run = { id: r.run_id, snapshot: { status: "pending", progress: { message: "queued" } } };
-    A.selectedHit = null; A.selNode = null; A.pathHighlight = null; A.collapsed.clear();
+    A.selectedHit = null; A.selNode = null; A.pathHighlight = null; A.collapsed.clear(); A.loopCollapsed.clear();
     renderRight();
     startPolling();
     selectTab("paths");
@@ -886,7 +1304,6 @@ function sectionHits() {
   const hits = A.run?.snapshot?.hits || [];
   s.append(el("h3", {}, "Findings", el("span", { class: "grow" }), hits.length ? el("span", { class: "pill bad" }, hits.length) : el("span", { class: "faint", style: "font-weight:400;text-transform:none" }, "none yet")));
   const b = el("div", { class: "body" });
-  if (!hits.length) b.append(el("div", { class: "faint", style: "font-size:11px" }, "Run to collect findings. Each finding comes with concrete input values that trigger it."));
   hits.forEach((h, i) => b.append(renderHit(h, i)));
   s.append(b);
   return s;
@@ -900,7 +1317,7 @@ function renderHit(h, i) {
     h.extra?.src_line ? el("span", { class: "faint" }, h.extra.src_line.file + ":" + h.extra.src_line.line) : null));
   box.append(el("div", { class: "msg" }, h.message));
   const wit = h.witness || {};
-  const scalars = Object.entries(wit).filter(([k, v]) => typeof v === "object");
+  const scalars = Object.entries(wit).filter(([k, v]) => typeof v === "object" && !k.includes("->"));
   const byteInputs = Object.entries(wit).filter(([k, v]) => typeof v === "string" && v);
   if (scalars.length) box.append(el("div", { class: "wit" }, "inputs: " + scalars.map(([k, v]) => `${k}=${fmtOne(k, v)}`).join(", ")));
   for (const [k, v] of byteInputs) {                 // file / stdin contents = the solution
@@ -923,20 +1340,75 @@ function scrollToAddr(addr) {
   const row = $(`.insn[data-addr="${addr}"]`, $("#pane-code"));
   if (row) { row.scrollIntoView({ block: "center", behavior: "smooth" }); row.classList.add("oncur"); setTimeout(() => row.classList.remove("oncur"), 1500); }
 }
+// The findings to light red RIGHT NOW: a clicked finding lights only its own line;
+// a clicked path lights the findings that occur on that path (matched by node); no
+// selection => nothing. Shared by the disassembly and decompilation views so they
+// never diverge. Returns { addr -> hit }.
+function litFindings() {
+  const hits = (A.run && A.run.snapshot && A.run.snapshot.hits) || [];
+  const m = {};
+  if (A.selectedHit != null && hits[A.selectedHit]) {
+    const h = hits[A.selectedHit]; m[h.addr] = h;
+  } else if (A.pathNodeIds) {
+    for (const h of hits) {
+      const nd = h.extra && h.extra.node;
+      if (nd != null && A.pathNodeIds.has(nd)) m[h.addr] = h;
+    }
+  }
+  return m;
+}
+// the concrete inputs of the currently selected path/finding (the "example"),
+// shown once at the top of the function where the arguments arrive.
+function selectedInputs() {
+  const hits = (A.run && A.run.snapshot && A.run.snapshot.hits) || [];
+  if (A.selectedHit != null && hits[A.selectedHit]) return hits[A.selectedHit].witness;
+  if (A.selNode != null && A.run && A.run.snapshot && A.run.snapshot.tree) {
+    const n = A.run.snapshot.tree.find(x => x.id === A.selNode);
+    if (n && n.example && Object.keys(n.example).length) return n.example;
+    const first = Object.values(litFindings())[0];
+    if (first) return first.witness;
+  }
+  return null;
+}
+function fmtInputs(wit) {
+  return Object.entries(wit || {})
+    .filter(([k, v]) => typeof v === "object" && v && !k.includes("->")
+                        && !/_buf$/.test(k) && !/^(stdin|file:)/.test(k))   // skip buffer blobs / stdin / files
+    .map(([k, v]) => `${k} = ${fmtOne(k, v)}`);
+}
 function highlightHits() {
   const pane = $("#pane-code"); if (!pane) return;
-  $$(".insn", pane).forEach(r => {
-    r.classList.remove("hit");
-    r.classList.toggle("onpath", !!A.pathHighlight && A.pathHighlight.has(+r.dataset.block));
-    const isBranch = !!A.branchPts && A.branchPts.has(+r.dataset.addr);
-    r.classList.toggle("branchpt", isBranch);
-    if (isBranch) r.title = "branch taken on this flow: " + (A.branchCond[+r.dataset.addr] || "?");
-  });
-  const hits = A.run?.snapshot?.hits || [];
-  for (const h of hits) {
-    const row = $(`.insn[data-addr="${h.addr}"]`, pane);
-    if (row) row.classList.add("hit");
+  const path = A.pathHighlight;            // blocks on the selected path (or null)
+  const litByAddr = litFindings();
+
+  // the example inputs for this path, at the top (near where the args arrive)
+  const banner = $("#codeInputs", pane);
+  if (banner) {
+    const parts = fmtInputs(selectedInputs());
+    banner.replaceChildren();
+    if (parts.length) {
+      banner.append(el("span", { class: "cilbl" }, "example inputs on this path:"),
+                    el("span", { class: "civals" }, parts.join("    ")));
+      banner.style.display = "";
+    } else banner.style.display = "none";
   }
+
+  $$(".insn", pane).forEach(r => {
+    const addr = +r.dataset.addr, blk = +r.dataset.block;
+    r.classList.toggle("onpath", !!path && path.has(blk));
+    const h = litByAddr[addr];
+    r.classList.toggle("hit", !!h);
+    const old = r.querySelector(".exannot"); if (old) old.remove();
+    if (h) {                               // on the offending line, the value of what it writes to
+      const tgt = h.extra && h.extra.write_addr
+        ? `dest = ${h.extra.write_addr}  (outside ${h.extra.buffer_base || "buf"} + ${h.extra.buffer_size ?? "?"})`
+        : "";
+      if (tgt) r.append(el("span", { class: "exannot" }, "  ; " + tgt));
+    }
+    const isBranch = !!A.branchPts && A.branchPts.has(addr);
+    r.classList.toggle("branchpt", isBranch);
+    if (isBranch) r.title = "branch taken on this flow: " + (A.branchCond[addr] || "?");
+  });
 }
 
 // ==================================================================== path tree
@@ -946,12 +1418,12 @@ function highlightHits() {
 const END_STYLE = {
   returned: ["ok", "returned"], exit: ["warn", "exit"], ended: ["", "ended"],
   loop_bound: ["", "loop bound"], dropped: ["", "dropped"], unconstrained: ["bad", "hijackable"],
-  error: ["warn", "error"], unfinished: ["info", "unfinished"], running: ["info", "running"],
+  unknown_call: ["warn", "unknown call"], error: ["warn", "error"], unfinished: ["info", "unfinished"], running: ["info", "running"],
 };
 let treeKey = "";
 
 function renderTree(force) {
-  const pane = $("#dockPaths"); if (!pane) return;
+  const pane = pathsPaneEl(); if (!pane) return;
   const snap = A.run?.snapshot;
   if (!snap || !snap.tree || !snap.tree.length) {
     treeKey = "";
@@ -959,7 +1431,7 @@ function renderTree(force) {
       ? '<div class="empty">Exploring…</div>' : '<div class="empty">Run the checks to see the paths angr explored.</div>';
     return;
   }
-  const key = snap.status + "|" + JSON.stringify(snap.tree).length + "|" + snap.hits.length + "|" + A.selNode + "|" + [...A.collapsed].join(",");
+  const key = snap.status + "|" + JSON.stringify(snap.tree).length + "|" + snap.hits.length + "|" + A.selNode + "|" + [...A.collapsed].join(",") + "|L" + [...A.loopCollapsed].join(",");
   if (!force && key === treeKey) return;
   treeKey = key;
 
@@ -990,26 +1462,90 @@ function pathsViewToggle() {
   return el("div", { class: "seg pathsview", title: "show the explored paths as an indented list or a branching tree" }, mk("list", "List"), mk("tree", "Tree"));
 }
 
+// find loops in the path tree: a node whose starting block was already executed by
+// an ancestor is the loop header revisited (angr unrolls loops into repeated stretches).
+function detectLoops(snap) {
+  const byId = {}; snap.tree.forEach(n => byId[n.id] = n);
+  const ancOrSelf = (aId, x) => { for (let c = x; c; c = byId[c.parent]) if (c.id === aId) return true; return false; };
+  // group by the shallowest node that shares each reentry's block addr (the loop entry)
+  const byEntry = {};
+  snap.tree.forEach(n => {
+    let entry = null;                               // shallowest strict ancestor with n's addr
+    for (let c = byId[n.parent]; c; c = byId[c.parent]) if (c.addr === n.addr) entry = c;
+    if (!entry) return;                             // not a loop reentry
+    (byEntry[entry.id] = byEntry[entry.id] || { entry, header: n.addr, reentries: [] }).reentries.push(n);
+  });
+  const loops = [];
+  for (const eid in byEntry) {
+    const L = byEntry[eid], E = L.entry;
+    // the loop spine: the entry down through every node that still leads to another iteration
+    const nodeIds = new Set();
+    snap.tree.forEach(x => {
+      if (!ancOrSelf(E.id, x)) return;
+      if (L.reentries.some(R => ancOrSelf(x.id, R))) nodeIds.add(x.id);
+    });
+    let iters = 1;                                  // header visits along the deepest chain
+    L.reentries.forEach(R => { let c = 0; for (let p = R; p; p = byId[p.parent]) { if (p.addr === L.header) c++; if (p.id === E.id) break; } iters = Math.max(iters, c); });
+    loops.push({ entryId: E.id, parentId: E.parent, header: L.header,
+      line: (E.start && E.start.line) || (byId[L.reentries[0].id].start || {}).line || null,
+      nodeIds, iters });
+  }
+  // every block inside a loop body repeats each iteration, so each would look like its
+  // own loop. Keep only maximal regions: one box per real loop (the back-edge target).
+  loops.sort((a, b) => b.nodeIds.size - a.nodeIds.size);
+  const kept = [];
+  for (const L of loops) {
+    if (kept.some(K => [...L.nodeIds].every(id => K.nodeIds.has(id)))) continue;
+    kept.push(L);
+  }
+  return kept;
+}
+
+// build the node list actually drawn: collapsed loops become one synthetic "⟳ loop" node
+function displayTree(snap, loops) {
+  const collapsed = loops.filter(L => A.loopCollapsed.has(L.entryId));
+  if (!collapsed.length) return { nodes: snap.tree, loops, loopByEntry: {} };
+  const hidden = new Set(), ownerOf = {}, loopByEntry = {};
+  collapsed.forEach(L => { loopByEntry[L.entryId] = L; L.nodeIds.forEach(id => { hidden.add(id); ownerOf[id] = L.entryId; }); });
+  const nodes = [];
+  snap.tree.forEach(n => {
+    if (loopByEntry[n.id]) nodes.push({ ...n, __loop: loopByEntry[n.id], end: null, hits: [] });
+    else if (!hidden.has(n.id)) nodes.push({ ...n });
+  });
+  nodes.forEach(n => { if (!n.__loop && n.parent != null && hidden.has(n.parent)) n.parent = ownerOf[n.parent]; });
+  return { nodes, loops, loopByEntry };
+}
+
 // the path tree drawn as an actual branching tree (nodes + edges), with pan/zoom
 function drawPathTree(pane, T, snap) {
   if (typeof dagre === "undefined") { pane.textContent = "tree layout unavailable"; return; }
   const NS = "http://www.w3.org/2000/svg";
   const short = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : (s || ""));
   const gr = new dagre.graphlib.Graph();
-  gr.setGraph({ rankdir: "TB", nodesep: 16, ranksep: 30, marginx: 14, marginy: 14 });
+  // horizontal (left→right) in the wide Paths strip, top-down in the narrow dock
+  // in the strip, the toggle picks horizontal (left→right) vs vertical (top→down); the narrow dock is always top→down
+  const lr = A.pathsDock && A.pathsOrient !== "vertical";
+  gr.setGraph({ rankdir: lr ? "LR" : "TB", nodesep: 16, ranksep: lr ? 46 : 30, marginx: 14, marginy: 14 });
   gr.setDefaultEdgeLabel(() => ({}));
+  // loop boxes: fold detected loops to synthetic nodes, keep expanded ones for box overlay
+  const loops = detectLoops(snap);
+  const disp = displayTree(snap, loops);
+  const dnodes = disp.nodes, dById = {}; dnodes.forEach(n => dById[n.id] = n);
+  const dKids = {}; dnodes.forEach(n => { if (n.parent != null && dById[n.parent]) (dKids[n.parent] = dKids[n.parent] || []).push(n.id); });
   const CW = 6.3, PAD = 9;
-  snap.tree.forEach(n => {
-    const leaf = !T.kids[n.id];
+  dnodes.forEach(n => {
+    const leaf = !dKids[n.id];
     let label, sub;
-    if (n.parent === null) { label = "start"; sub = `${A.fn ? (A.fn.ida_name || A.fn.name) : "fn"}(${((A.config && A.config.args) || []).map(a => a.name).join(", ")})`; }
+    if (n.__loop) { label = "⟳ loop ×" + n.__loop.iters; sub = n.__loop.line ? "line " + n.__loop.line + " · click to expand" : "click to expand"; }
+    else if (n.parent === null) { label = "start"; sub = `${A.fn ? (A.fn.ida_name || A.fn.name) : "fn"}(${((A.config && A.config.args) || []).map(a => a.name).join(", ")})`; }
     else { label = short(n.cond || "(branch)", 42); sub = n.decided_at && n.decided_at.line ? "line " + n.decided_at.line : ""; }
-    if (leaf) { const r = leafReason(n, snap); sub = (END_STYLE[r] ? END_STYLE[r][1] : r) + (n.hits.length ? " · finding" : ""); if (n.parent === null) label = "start"; }
+    if (leaf && !n.__loop) { const r = leafReason(n, snap); sub = (END_STYLE[r] ? END_STYLE[r][1] : r) + (n.hits.length ? " · finding" : ""); if (n.parent === null) label = "start"; }
     const w = Math.max(64, Math.min(280, Math.max(label.length, sub.length) * CW + PAD * 2));
-    gr.setNode(n.id, { label, sub, leaf, node: n, width: w, height: 32 });
+    gr.setNode(n.id, { label, sub, leaf, node: n, loop: n.__loop || null, width: w, height: 32 });
   });
-  snap.tree.forEach(n => { if (n.parent !== null && T.byId[n.parent]) gr.setEdge(n.parent, n.id); });
+  dnodes.forEach(n => { if (n.parent != null && dById[n.parent]) gr.setEdge(n.parent, n.id); });
   dagre.layout(gr);
+  const expandedLoops = loops.filter(L => !A.loopCollapsed.has(L.entryId) && [...L.nodeIds].every(id => gr.hasNode(id)));
   const W = gr.graph().width || 300, H = gr.graph().height || 200;
 
   const svg = document.createElementNS(NS, "svg");
@@ -1018,6 +1554,31 @@ function drawPathTree(pane, T, snap) {
   svg.innerHTML = `<defs><marker id="ptarr" markerWidth="7" markerHeight="7" refX="6" refY="2.5" orient="auto"><path d="M0,0 L6,2.5 L0,5 Z" fill="var(--line2)"/></marker></defs>`;
   const viewport = document.createElementNS(NS, "g");
   svg.append(viewport);
+
+  // labeled boxes around expanded loops (drawn first, so they sit behind the nodes)
+  expandedLoops.forEach(L => {
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    L.nodeIds.forEach(id => { const g = gr.node(id); if (!g) return; x0 = Math.min(x0, g.x - g.width / 2); y0 = Math.min(y0, g.y - g.height / 2); x1 = Math.max(x1, g.x + g.width / 2); y1 = Math.max(y1, g.y + g.height / 2); });
+    if (x1 < x0) return;
+    const PADB = 10, hdr = 15;
+    const box = document.createElementNS(NS, "g");
+    const rect = document.createElementNS(NS, "rect");
+    rect.setAttribute("x", x0 - PADB); rect.setAttribute("y", y0 - PADB - hdr);
+    rect.setAttribute("width", x1 - x0 + PADB * 2); rect.setAttribute("height", y1 - y0 + PADB * 2 + hdr);
+    rect.setAttribute("rx", 8); rect.setAttribute("fill", "var(--accent)"); rect.setAttribute("fill-opacity", "0.05");
+    rect.setAttribute("stroke", "var(--accent)"); rect.setAttribute("stroke-opacity", "0.5");
+    rect.setAttribute("stroke-width", "1.2"); rect.setAttribute("stroke-dasharray", "5 3");
+    box.append(rect);
+    const lbl = document.createElementNS(NS, "text");
+    lbl.setAttribute("x", x0 - PADB + 8); lbl.setAttribute("y", y0 - PADB - hdr + 11);
+    lbl.setAttribute("font-family", "var(--sans)"); lbl.setAttribute("font-size", "10"); lbl.setAttribute("font-weight", "600");
+    lbl.setAttribute("fill", "var(--accent)");
+    lbl.textContent = `⟳ loop${L.line ? " · line " + L.line : ""} · ${L.iters} iteration${L.iters === 1 ? "" : "s"} · ▸ collapse`;
+    lbl.style.cursor = "pointer";
+    lbl.addEventListener("click", ev => { ev.stopPropagation(); if (!dragged) { A.loopCollapsed.add(L.entryId); renderTree(true); } });
+    box.append(lbl);
+    viewport.append(box);
+  });
 
   const nodeEls = {};
   gr.edges().forEach(eid => {
@@ -1048,8 +1609,8 @@ function drawPathTree(pane, T, snap) {
       t2.setAttribute("font-family", "var(--sans)"); t2.setAttribute("font-size", "9.5");
       t2.textContent = g.sub; gEl.append(t2);
     }
-    gEl.addEventListener("click", () => { if (!dragged) selectPathNode(+id); });
-    nodeEls[id] = { rect, t1, t2, node: g.node, leaf: g.leaf };
+    gEl.addEventListener("click", () => { if (dragged) return; if (g.loop) { A.loopCollapsed.delete(g.loop.entryId); renderTree(true); } else selectPathNode(+id); });
+    nodeEls[id] = { rect, t1, t2, node: g.node, leaf: g.leaf, loop: g.loop };
     viewport.append(gEl);
   });
 
@@ -1062,6 +1623,13 @@ function drawPathTree(pane, T, snap) {
     const sel = A.selNode, onChain = new Set(sel != null && T.byId[sel] ? T.chain(sel).map(c => c.id) : []);
     for (const id in nodeEls) {
       const ne = nodeEls[id], n = ne.node, seld = +id === sel, hit = n.hits.length > 0;
+      if (ne.loop) {
+        ne.rect.setAttribute("fill", tint(accent, .12));
+        ne.rect.setAttribute("stroke", accent);
+        ne.rect.setAttribute("stroke-width", "1.5"); ne.rect.setAttribute("stroke-dasharray", "4 2");
+        ne.t1.setAttribute("fill", accent); if (ne.t2) ne.t2.setAttribute("fill", dim);
+        continue;
+      }
       const reason = ne.leaf ? leafReason(n, snap) : null;
       let stroke = line2, fill = node, accentCol = null;
       if (hit) { accentCol = bad; }
@@ -1106,19 +1674,22 @@ function drawPathTree(pane, T, snap) {
 
 // the selected path's detail, shown in the resizable bottom panel (distinct from the tree)
 function updateBottomDetail() {
-  const inner = $("#bottomInner"); if (!inner) return;
+  const inner = detailPaneEl(); if (!inner) return;
+  const paths = A.pathsDock;
   const snap = A.run?.snapshot;
   const T = snap && snap.tree ? pathModel(snap) : null;
   if (!T || A.selNode == null || !T.byId[A.selNode]) {
-    inner.replaceChildren(el("div", { class: "empty" }, "Click a path in the dock to see its full detail here."));
-    $("#bottomTtl").textContent = "Path detail";
+    inner.replaceChildren(el("div", { class: "empty" }, paths ? "Click a path on the left to see its detail here." : "Click a path in the dock to see its full detail here."));
+    if (!paths && $("#bottomTtl")) $("#bottomTtl").textContent = "Path detail";
     return;
   }
   inner.replaceChildren(renderPathDetail(T, snap));
   const n = T.byId[A.selNode];
-  $("#bottomTtl").textContent = "Path detail · " + (T.kids[n.id] ? "branch point" : "path #" + T.leafNo[n.id]);
-  $("#bottomPanel").classList.remove("collapsed");
-  $("#bottomClose").textContent = "▾";
+  if (!paths) {
+    $("#bottomTtl").textContent = "Path detail · " + (T.kids[n.id] ? "branch point" : "path #" + T.leafNo[n.id]);
+    $("#bottomPanel").classList.remove("collapsed");
+    $("#bottomClose").textContent = "▾";
+  }
 }
 
 // the control-flow graph, docked above the paths, highlighting the selected path
@@ -1180,7 +1751,7 @@ function pathsSummary(T, snap) {
   const counts = {};
   leaves.forEach(n => { const r = leafReason(n, snap); counts[r] = (counts[r] || 0) + 1; });
   const names = { returned: "returned", exit: "exited the program", ended: "ended", loop_bound: "stopped by the loop bound",
-    dropped: "dropped (max active)", unconstrained: "hijackable jump", error: "errored", unfinished: "unfinished", running: "still running" };
+    dropped: "dropped (max active)", unconstrained: "hijackable jump", unknown_call: "unknown call target", error: "errored", unfinished: "unfinished", running: "still running" };
   const parts = Object.entries(counts).map(([r, c]) => el("span", { class: "pill " + (END_STYLE[r]?.[0] || "") }, `${c} ${names[r] || r}`));
   const hits = snap.hits.length;
   return el("div", { class: "psum" },
@@ -1257,6 +1828,7 @@ function lineRanges(lines) {
 
 function selectPathNode(id) {
   A.selNode = A.selNode === id ? null : id;
+  A.selectedHit = null;                 // path selection lights the findings ON this path
   updatePathHighlight();
   renderTree(true);
 }
@@ -1265,13 +1837,15 @@ function updatePathHighlight() {
   // the blocks executed from the function entry down to the selected node, plus the
   // branch decisions taken along the way (the conditional at each split, and which side)
   const snap = A.run?.snapshot;
-  A.pathHighlight = null; A.branchPts = null; A.branchBlocks = null; A.branchCond = null;
+  A.pathHighlight = null; A.pathNodeIds = null; A.branchPts = null; A.branchBlocks = null; A.branchCond = null;
+  A.pathAsgn = null;
   if (snap && snap.tree && A.selNode != null) {
     const T = pathModel(snap);
     if (T.byId[A.selNode]) {
       const chain = T.chain(A.selNode);
       A.pathHighlight = new Set(chain.flatMap(n => n.blocks));
-      A.branchPts = new Set(); A.branchBlocks = new Set(); A.branchCond = {}; A.branchBlockCond = {};
+      A.pathNodeIds = new Set(chain.map(n => n.id));
+      A.branchPts = new Set(); A.branchBlocks = new Set(); A.branchCond = {}; A.branchBlockCond = {}; A.branchBlockInsn = {};
       const a2b = decompAddrBlock();
       chain.forEach(n => {
         if (n.parent !== null && n.decided_at && n.decided_at.addr != null) {
@@ -1279,7 +1853,7 @@ function updatePathHighlight() {
           A.branchPts.add(ad);
           A.branchCond[ad] = n.cond || "";
           const bl = a2b[ad];
-          if (bl != null) { A.branchBlocks.add(bl); A.branchBlockCond[bl] = n.cond || ""; }
+          if (bl != null) { A.branchBlocks.add(bl); A.branchBlockCond[bl] = n.cond || ""; A.branchBlockInsn[bl] = ad; }
         }
       });
     }
@@ -1287,6 +1861,22 @@ function updatePathHighlight() {
   highlightHits();
   if ($("#pane-decomp").classList.contains("sel")) renderDecomp();   // re-tint decompilation lines (cached, no refetch)
   renderPathGraph();                                                  // the docked graph, always visible
+  loadPathValues();                                                  // per-line assigned values for this path (async)
+}
+
+// Fetch the concrete value assigned on each line for the selected path, then re-tint.
+async function loadPathValues() {
+  const id = A.run && A.run.id, node = A.selNode;
+  if (id == null || node == null) return;
+  const key = id + ":" + node;
+  A._pvCache = A._pvCache || {};
+  try {
+    A.pathAsgn = A._pvCache[key] || (A._pvCache[key] = (await api(`/api/run/${id}/values?node=${node}`)).values || {});
+  } catch (e) { A.pathAsgn = null; return; }
+  if (A.selNode === node) {   // still the same selection
+    if ($("#pane-decomp").classList.contains("sel")) renderDecomp();
+    if ($("#pane-code").classList.contains("sel")) renderCode();   // disasm also shows per-line values
+  }
 }
 
 function renderPathDetail(T, snap) {
@@ -1310,11 +1900,17 @@ function renderPathDetail(T, snap) {
   colB.append(el("div", { class: "dend" }, leaf
     ? (n.end ? n.end.text + (n.end.reason === "returned" && n.ret ? ": " + n.ret : "") : (leafReason(n, snap) === "running" ? "still running" : "not finished"))
     : "splits further below"));
+  // offer to model an undetermined indirect-call target right here
+  if (leaf && n.end && n.end.reason === "unknown_call" && n.end.site != null)
+    colB.append(el("button", { class: "tiny primary", style: "margin-top:6px",
+      onclick: () => openModelModal(null, { kind: "symbolic", site: n.end.site }) }, "ƒ model this call"));
   if (calls.length) colB.append(el("div", { class: "pchip", style: "margin-top:6px" }, "calls " + calls.map(c => c + "()").join(", ")));
-  if (leaf && n.example && Object.keys(n.example).length) {
+  // top-level inputs only (args / stdin / buffer); per-struct-field values annotate the code view
+  const exTop = leaf && n.example ? Object.entries(n.example).filter(([k]) => !k.includes("->")) : [];
+  if (exTop.length) {
     colB.append(el("div", { class: "dlabel", style: "margin-top:10px" }, "Example input"));
     const tb = el("div", { class: "dex" });
-    Object.entries(n.example).forEach(([k, v]) => tb.append(el("div", {}, el("span", { class: "k" }, k), el("span", {}, fmtOne(k, v)))));
+    exTop.forEach(([k, v]) => tb.append(el("div", {}, el("span", { class: "k" }, k), el("span", {}, fmtOne(k, v)))));
     colB.append(tb);
   }
 
@@ -1358,6 +1954,24 @@ const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;
 // ---------------------------------------------------------------- decompilation overlay
 const _DECOMP_MARK = /\s*\/\*(0x[0-9a-fA-F]+)\*\/\s*$/;
 function stripMarks(code) { return (code || "").replace(/\s*\/\*0x[0-9a-fA-F]+\*\/\s*$/gm, ""); }
+// The concrete values the inputs take on the currently-selected flow (its witness),
+// formatted for display. A branch node borrows a representative descendant leaf's witness.
+function selectedPathValues() {
+  const snap = A.run && A.run.snapshot;
+  if (!snap || !snap.tree || A.selNode == null) return null;
+  const T = pathModel(snap);
+  let n = T.byId[A.selNode];
+  if (!n) return null;
+  while (n && (!n.example || !Object.keys(n.example).length) && T.kids[n.id] && T.kids[n.id].length)
+    n = T.byId[T.kids[n.id][0].id];
+  const ex = n && n.example;
+  if (!ex || !Object.keys(ex).length) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(ex)) out[k] = (typeof v === "string") ? bytesPretty(v) : fmtOne(k, v);
+  return { vals: out, ret: (T.byId[A.selNode] && T.byId[A.selNode].ret) };
+}
+const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 function decompAddrBlock() {
   const m = {};
   for (const ins of (A.detail && A.detail.disasm ? A.detail.disasm.instructions : [])) m[ins.addr] = ins.block;
@@ -1366,33 +1980,115 @@ function decompAddrBlock() {
 function renderDecompLines(code, into) {
   const a2b = decompAddrBlock();
   const path = A.pathHighlight;                       // Set of block addrs, or null
-  const hits = new Set((A.run && A.run.snapshot ? A.run.snapshot.hits : []).map(h => h.addr));
-  const hitBlocks = new Set([...hits].map(a => a2b[a]).filter(b => b != null));
-  for (const raw of code.split("\n")) {
+  const lit = litFindings();                          // addr -> hit, selection-based, per-line
+  // pass 1: parse each source line into {text, addr, blk}
+  const rows = code.split("\n").map(raw => {
     const m = _DECOMP_MARK.exec(raw);
     const addr = m ? parseInt(m[1], 16) : null;
-    const text = m ? raw.slice(0, m.index) : raw;
+    return { text: m ? raw.slice(0, m.index) : raw, addr, blk: addr != null ? a2b[addr] : null };
+  });
+  // For a branch line on the path, did its "then" body actually run? We look at the
+  // next source line in a *different* block (skipping braces / same-block lines) and
+  // check whether that block is on the selected path — robust against jump-polarity.
+  const branchTaken = (i) => {
+    if (!path) return null;
+    const myBlk = rows[i].blk;
+    for (let j = i + 1; j < rows.length; j++) {
+      if (rows[j].addr == null || rows[j].blk == null || rows[j].blk === myBlk) continue;
+      return path.has(rows[j].blk);
+    }
+    return null;
+  };
+  // A branch block can hold several source lines (an assignment + the `if` that ends it).
+  // Only the line that actually *is* the branch — nearest to its conditional-jump
+  // instruction — should carry the taken/not-taken badge.
+  const branchRow = {};   // block addr -> row index of its decision line
+  if (A.branchBlocks) {
+    A.branchBlocks.forEach(blk => {
+      const insn = A.branchBlockInsn ? A.branchBlockInsn[blk] : null;
+      let best = -1, bestAddr = -1;
+      rows.forEach((r, i) => {
+        if (r.blk === blk && r.addr != null && (insn == null || r.addr <= insn) && r.addr > bestAddr) { bestAddr = r.addr; best = i; }
+      });
+      if (best >= 0) branchRow[blk] = best;
+    });
+  }
+  // concrete values of the flow's inputs, to annotate the code where they appear
+  const pvd = path ? selectedPathValues() : null;
+  const pv = pvd && pvd.vals;
+  // annotate inputs: scalar args/locals (whole-word), and struct fields like tif->tif_diroff
+  // (substring). Skip the raw buffer blob and stdin/file byte strings.
+  const pvKeys = pv ? Object.keys(pv).filter(k => !/_buf$/.test(k) && !/^(stdin|file:)/.test(k)) : [];
+  const valAnnot = (line, onPath) => {
+    if (!pv || !onPath) return null;
+    const parts = [];
+    for (const k of pvKeys) {
+      const isField = /[.>]/.test(k);                 // tif->field / tif.field -> substring match
+      const re = isField ? new RegExp(reEsc(k)) : new RegExp("(^|[^\\w.])" + reEsc(k) + "([^\\w]|$)");
+      if (re.test(line)) parts.push(k + " = " + pv[k]);
+    }
+    if (/\breturn\b/.test(line) && pvd.ret) parts.push("⇒ " + pvd.ret);
+    return parts.length ? el("span", { class: "cvals", title: "values on the selected flow" }, parts.join("   ")) : null;
+  };
+  // source line (DWARF) for the gutter: nearest instruction at or before the address —
+  // matches the disassembly's `:NNN` and the `ret_L<line>` names in the path conditions
+  const slArr = [];
+  for (const ins of (A.detail && A.detail.disasm ? A.detail.disasm.instructions : [])) if (ins.src_line) slArr.push([ins.addr, ins.src_line]);
+  slArr.sort((a, b) => a[0] - b[0]);
+  const srcLineAt = (addr) => {
+    let lo = 0, hi = slArr.length - 1, res = null;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (slArr[m][0] <= addr) { res = slArr[m][1]; lo = m + 1; } else hi = m - 1; }
+    return res;
+  };
+  let lastSl = null;
+  rows.forEach((r, i) => {
     const div = el("div", { class: "cline" });
-    if (addr != null) {
-      div.dataset.addr = addr;
-      div.title = hx64(addr) + " — click for checks";
-      const blk = a2b[addr];
-      if (path && blk != null && path.has(blk)) div.classList.add("onpath");
-      if (A.branchBlocks && blk != null && A.branchBlocks.has(blk)) {
+    const gutter = el("span", { class: "clnum" });
+    const content = el("span", { class: "cltext" });
+    if (r.addr != null) {
+      div.dataset.addr = r.addr;
+      div.title = hx64(r.addr) + " — click for checks";
+      const sl = srcLineAt(r.addr);
+      if (sl != null) { gutter.textContent = sl; if (sl === lastSl) gutter.classList.add("dup"); lastSl = sl; }  // dim repeats of the same source line
+      const blk = r.blk;
+      const onPath = !!(path && blk != null && path.has(blk));
+      if (onPath) div.classList.add("onpath");
+      let badge = null;
+      if (A.branchBlocks && blk != null && A.branchBlocks.has(blk) && branchRow[blk] === i) {
         div.classList.add("branchpt");
-        div.title = hx64(addr) + " — branch taken on this flow: " + (A.branchBlockCond[blk] || "?");
+        div.title = hx64(r.addr) + " — branch on this flow: " + (A.branchBlockCond[blk] || "?");
+        const taken = branchTaken(i);
+        if (taken !== null)
+          badge = el("span", { class: "cbadge " + (taken ? "taken" : "nottaken"),
+            title: "on the selected path, this branch was " + (taken ? "taken" : "not taken") },
+            taken ? "✓ taken" : "✗ not taken");
       }
-      if (hits.has(addr) || (blk != null && hitBlocks.has(blk))) div.classList.add("hitline");
-      highlightC(text.length ? text : " ", div);
-      const acts = el("span", { class: "clacts" },
-        btn("reach", () => addReachCheck(addr, "reach"), "tiny"),
-        btn("⋯", () => openAddrMenu(addr), "tiny ghost"));
-      div.append(acts);
+      const litH = lit[r.addr];                       // red only the finding's own line, on selection
+      if (litH) div.classList.add("hitline");
+      highlightC(r.text.length ? r.text : " ", content);
+      if (badge) content.append(badge);
+      if (litH && litH.extra && litH.extra.write_addr)  // offending line: the value it writes to
+        content.append(el("span", { class: "exannot" },
+          `  ; dest = ${litH.extra.write_addr} (outside ${litH.extra.buffer_base || "buf"} + ${litH.extra.buffer_size ?? "?"})`));
+      // value of the variable assigned on this line, on the selected path
+      const av = A.pathAsgn && A.pathAsgn["0x" + r.addr.toString(16)];
+      if (av && !litH) {
+        const m = r.text.match(/^\s*(\*?[A-Za-z_]\w*(?:\[[^\]]*\])?)\s*(?:[|&^+\-*/<>%]*=)(?!=)/);
+        const val = av.store ? av.store.val : av.val;
+        if (m && val != null) content.append(el("span", { class: "cvals asgn" }, `  ${m[1]} = ${val}`));
+      }
+      const vals = valAnnot(r.text, onPath);
+      if (vals) content.append(vals);
+      div.append(gutter, content);
+      div.append(el("span", { class: "clacts" },
+        btn("reach", () => addReachCheck(r.addr, "reach"), "tiny"),
+        btn("⋯", () => openAddrMenu(r.addr), "tiny ghost")));
     } else {
-      highlightC(text.length ? text : " ", div);
+      highlightC(r.text.length ? r.text : " ", content);
+      div.append(gutter, content);
     }
     into.append(div);
-  }
+  });
 }
 
 // "graphite" = default (no data-theme). bg = page colour swatch, dot = accent.
@@ -1424,8 +2120,9 @@ function applyTheme() {
   const t = curTheme();
   if (t === "graphite") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", t);
-  // the graph is rendered with fixed colors from CSS vars; re-draw on theme change
-  const b = $("#dockGraph"); if (b && b._cfg) { delete b._cfg; renderPathGraph(); }
+  // recolor the graph in place (keeps pan/zoom) — only node fills/edges follow the theme;
+  // the instruction syntax colours are fixed, so no re-layout is needed
+  const b = $("#dockGraph"); if (b && b._cfg) b._cfg.recolor();
 }
 function setTheme(id) {
   try { localStorage.setItem("theme", id); } catch (e) {}
@@ -1449,16 +2146,17 @@ function openThemeMenu() {
   setTimeout(() => document.addEventListener("mousedown", close), 0);
 }
 
-const PANEL_FOR = { left: "left", right: "right", dock: "dock" };
+const PANEL_FOR = { left: "left", right: "right", center: "centerCol", pbdetail: "pbDetail" };
 function initSplitters() {
-  // horizontal splitters resize a side panel's width
+  // vertical splitters resize a column's width
   for (const sp of $$(".splitter")) {
     const target = sp.dataset.target, panel = $("#" + PANEL_FOR[target]);
+    if (!panel) continue;
     try { const w = localStorage.getItem("panelW:" + target); if (w) panel.style.width = w; } catch (e) {}
     sp.addEventListener("mousedown", ev => {
       ev.preventDefault(); sp.classList.add("dragging");
       const startX = ev.clientX, startW = panel.getBoundingClientRect().width;
-      const leftGrows = target === "left";                 // left panel grows with +dx; right/dock with -dx
+      const leftGrows = target === "left" || target === "center";   // left/code grow with +dx; right with -dx
       const move = e => { const dx = e.clientX - startX; panel.style.width = Math.max(160, Math.min(1100, startW + (leftGrows ? dx : -dx))) + "px"; };
       const up = () => {
         sp.classList.remove("dragging");
@@ -1471,9 +2169,10 @@ function initSplitters() {
   }
   // the vertical splitter sets the docked graph's height
   for (const sp of $$(".splitter-h")) {
-    const target = sp.dataset.target;                 // "dockv" (graph height) or "bottom" (bottom panel)
-    const box = target === "bottom" ? $("#bottomPanel") : $("#dockGraph");
-    const grow = target === "bottom" ? -1 : 1;        // the bottom panel grows when dragging up
+    const target = sp.dataset.target;                 // "dockv" (graph height), "bottom", or "pathsbottom"
+    const box = target === "bottom" ? $("#bottomPanel") : target === "pathsbottom" ? $("#pathsBottom") : $("#dockGraph");
+    if (!box) continue;
+    const grow = (target === "bottom" || target === "pathsbottom") ? -1 : 1;  // bottom strips grow when dragging up
     try { const h = localStorage.getItem("h:" + target); if (h) box.style.height = h; } catch (e) {}
     sp.addEventListener("mousedown", ev => {
       ev.preventDefault(); sp.classList.add("dragging");
@@ -1483,7 +2182,7 @@ function initSplitters() {
         sp.classList.remove("dragging");
         window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
         try { localStorage.setItem("h:" + target, box.style.height); } catch (e) {}
-        if (target !== "bottom") regraph();
+        if (target === "dockv") regraph();
       };
       window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
     });
@@ -1496,21 +2195,51 @@ function regraph() { const b = $("#dockGraph"); if (b && b._cfg) delete b._cfg; 
 function setViewMode(mode, initial) {
   A.viewMode = mode;
   try { localStorage.setItem("viewMode", mode); } catch (e) {}
-  const dock = $("#dock"), bottom = $("#bottomPanel"), bclose = $("#bottomClose");
+  const bottom = $("#bottomPanel"), bclose = $("#bottomClose");
   if (mode === "explore") {
+    // Explore: maximise the code + graph by hiding BOTH side panels
+    setPanelCollapsed("left", true);
     setPanelCollapsed("right", true);
-    setPanelCollapsed("left", false);
-    if (dock) dock.style.width = "640px";
     if (bottom) { bottom.classList.remove("collapsed"); if (bclose) bclose.textContent = "▾"; }
   } else {
-    setPanelCollapsed("right", false);
+    // Setup: both side panels shown
     setPanelCollapsed("left", false);
-    if (dock) dock.style.width = "380px";
+    setPanelCollapsed("right", false);
     if (bottom && !initial) { bottom.classList.add("collapsed"); if (bclose) bclose.textContent = "▴"; }
   }
   $$("#viewMode .segbtn").forEach(x => x.classList.toggle("on", x.dataset.mode === mode));
   regraph();
 }
+
+// The Paths strip is an INDEPENDENT toggle (works in either Setup or Explore): a wide
+// bottom panel with the path tree (laid left→right) above the path detail.
+function setPathsDock(on, initial) {
+  A.pathsDock = on;
+  try { localStorage.setItem("pathsDock", on ? "1" : "0"); } catch (e) {}
+  document.body.classList.toggle("paths", on);
+  syncPathsToggle();
+  // the paths move between #dockPaths and #pbPaths (and change orientation), so re-render
+  A._ptreeSig = null;
+  renderTree(true);
+  updateBottomDetail();
+  regraph();
+}
+function setPathsOrient(orient) {
+  A.pathsOrient = orient;
+  try { localStorage.setItem("pathsOrient", orient); } catch (e) {}
+  syncPathsToggle();
+  A._ptreeSig = null;
+  renderTree(true);
+}
+// one segment highlighted only while the strip is open, showing which layout is active
+function syncPathsToggle() {
+  $$("#pathsToggle .segbtn").forEach(x => x.classList.toggle("on", A.pathsDock && x.dataset.orient === A.pathsOrient));
+}
+
+// the paths list/tree and the path detail live in different containers depending on
+// whether the Paths strip is open: the right-hand dock, or the wide bottom strip.
+function pathsPaneEl() { return A.pathsDock ? $("#pbPaths") : $("#dockPaths"); }
+function detailPaneEl() { return A.pathsDock ? $("#pbDetail") : $("#bottomInner"); }
 
 // hide a side panel off to the edge, leaving a button to bring it back
 function setPanelCollapsed(side, collapsed) {
@@ -1535,7 +2264,19 @@ function showAddr(addr) {
 }
 
 function openAddrMenu(addr) {
+  // calls on this source line (same block) can have their return modelled
+  const a2b = decompAddrBlock();
+  const blk = a2b[addr];
+  const calls = (A.detail?.disasm?.instructions || []).filter(i =>
+    /call/.test(i.mnemonic) && (i.addr === addr || (blk != null && a2b[i.addr] === blk)));
+  const callItems = calls.map(ins => {
+    const direct = /^0x[0-9a-fA-F]+$/.test((ins.op_str || "").trim());
+    const nm = direct ? funcNameAt(parseInt(ins.op_str, 16)) : null;
+    const label = nm ? ("Set return model for " + nm + "()") : ("Model the indirect call (" + ins.op_str + ")");
+    return menuItem(label, "replace this call's return value with a model", () => { m.remove(); modelCall(ins); });
+  });
   const m = modal("At " + hx64(addr), el("div", { class: "col", style: "gap:8px" },
+    ...callItems,
     menuItem("Reach check", "record any path that reaches this line", () => { m.remove(); addReachCheck(addr, "reach"); }),
     menuItem("Avoid check", "record + mark paths that reach this line", () => { m.remove(); addReachCheck(addr, "avoid"); }),
     menuItem("Assert here", "a boolean that should always hold at this point", () => { m.remove(); openAssertModal(addr); }),
@@ -1575,7 +2316,7 @@ function currentSpec() {
     func_addr: A.fn.addr, args: A.config.args, buffers: A.config.buffers,
     assumptions: A.config.assumptions.filter(x => x.trim()), stdin: A.config.stdin,
     files: (A.config.files || []).filter(f => f.name), checks: A.config.checks.filter(c => c.enabled), limits: A.config.limits,
-    models: (A.config.models || []).filter(m => m.func),
+    models: (A.config.models || []).filter(m => m.func || m.site != null),
   };
 }
 function downloadScript() {
@@ -1617,13 +2358,14 @@ function updateIdaBtn() {
 function openIdaModal() {
   let url = "";
   try { url = localStorage.getItem("idaUrl") || ""; } catch (e) {}
-  const input = el("input", { value: url, placeholder: "http://<vm-ip>:8744/mcp", style: "width:100%" });
+  const input = el("input", { value: url, placeholder: "http://<host>:<port>/mcp", style: "width:100%" });
   const status = el("div", { class: "faint mono", style: "font-size:11px;margin-top:6px" },
     A.ida && A.ida.connected ? `connected · ${A.ida.server || ""} · ${A.ida.flavor || ""} · ${A.ida.name_count || 0} names` : "not connected");
   const body = el("div", {},
     field("IDA MCP server URL", input,
-      "Point at a running IDA MCP server. Official Hex-Rays: <code>http://127.0.0.1:8737/mcp</code> (IDA ≥9.4). " +
-      "Community <b>mrexodia/ida-pro-mcp</b>: run its bridge, e.g. <code>http://&lt;vm-ip&gt;:8744/mcp</code> (IDA ≥8.3). " +
+      "Point at a running IDA MCP server — <code>http://&lt;host&gt;:&lt;port&gt;/mcp</code>. Use <code>127.0.0.1</code> when IDA runs on this machine, " +
+      "or the host's IP/name when it's elsewhere (e.g. a VM). Official Hex-Rays default: <code>http://127.0.0.1:8737/mcp</code> (IDA ≥9.4); " +
+      "community <b>mrexodia/ida-pro-mcp</b> commonly <code>…:8744/mcp</code> (IDA ≥8.3). " +
       "The binary open in IDA must be the same one loaded here."),
     status);
   const connect = el("button", { class: "primary", onclick: async () => {
@@ -1694,7 +2436,14 @@ async function renderDecomp(force) {
     (d.func_start != null ? ` (${hx64(d.func_start)})` : "") + " — showing IDA's function."));
   renderDecompLines(d.code || "(empty)", pre);
   if (d.note) pre.prepend(el("div", { class: "faint", style: "margin-bottom:6px" }, d.note));
-  pane.replaceChildren(el("div", { class: "decompwrap" }, bar, assumptionsBar(), pre));
+  // example inputs for the selected path, pinned at the top (where the args arrive)
+  const inputs = fmtInputs(selectedInputs());
+  const inbar = inputs.length
+    ? el("div", { class: "codeinputs" },
+        el("span", { class: "cilbl" }, "example inputs on this path:"),
+        el("span", { class: "civals" }, inputs.join("    ")))
+    : null;
+  pane.replaceChildren(el("div", { class: "decompwrap" }, bar, inbar, assumptionsBar(), pre));
   pre.scrollTop = keepScroll;
   pane._fnAddr = A.fn.addr;
 }
@@ -1875,7 +2624,13 @@ function scheduleAssumeRefresh() { clearTimeout(assumeTimer); assumeTimer = setT
 function connectEvents() {
   try {
     const es = new EventSource("/api/events");
-    es.onopen = () => setLiveDot(true);
+    es.onopen = () => {
+      setLiveDot(true);
+      // (Re)connect — including after a server restart — so resync the loaded binary and
+      // function list; the server may now have a different binary than this tab last saw.
+      if (A._everConnected) { refreshState(); loadFunctions(); }
+      A._everConnected = true;
+    };
     es.onerror = () => setLiveDot(false);
     es.onmessage = (m) => { try { handleEvent(JSON.parse(m.data)); } catch (e) {} };
     A._es = es;
@@ -1914,7 +2669,7 @@ async function onAgentRun(ev) {
   const f = A.functions.find(x => x.addr === ev.func);
   if (f && (!A.fn || A.fn.addr !== ev.func)) await selectFunction(f);
   A.run = { id: ev.run_id, snapshot: { status: "pending", progress: { message: "agent run" } } };
-  A.selNode = null; A.pathHighlight = null; A.collapsed.clear();
+  A.selNode = null; A.pathHighlight = null; A.collapsed.clear(); A.loopCollapsed.clear();
   renderRight(); startPolling(); selectTab("paths");
 }
 
@@ -1960,27 +2715,44 @@ function openHumanDocs() {
   const h = (t) => el("h4", { class: "dh" }, t);
   const p = (...k) => el("p", { class: "dp" }, ...k);
   const b = (t) => el("b", {}, t);
+  const code = (t) => el("code", {}, t);
   const svg = (markup, style) => { const d = el("div", { class: "docsvg", style: style || "" }); d.innerHTML = markup; return d; };
+  // a framed "screenshot" of a real UI component (reuses the app's own classes)
+  const shot = (label, ...kids) => el("div", { class: "uishot" }, el("div", { class: "uibar" }, label), ...kids);
+  const cap = (...k) => el("div", { class: "uicap" }, ...k);
+  const annot = (n, ...k) => el("div", { class: "annot" }, el("span", { class: "anum" }, "" + n), el("span", {}, ...k));
   const body = el("div", { class: "docbody" });
 
   body.append(p(b("SEAL"), " (Symbolic Execution Analysis Lab) runs one function with its inputs left ", b("unknown"),
     " and finds the ", b("concrete inputs"), " that reach a location or trigger a bug — a visual front-end over ", b("angr"),
-    " symbolic execution, with IDA for names and decompilation."));
+    " symbolic execution, with IDA for names and decompilation. This page is a start-from-zero tour; no prior angr knowledge assumed."));
 
-  // workflow pipeline
-  body.append(h("The workflow"));
+  // ---- the window at a glance (labeled layout "picture") ----
+  body.append(h("The window at a glance"));
+  const lbox = (n, title, sub) => el("div", { class: "lbox" }, el("span", { class: "ln" }, "" + n), el("b", {}, title), sub ? el("div", { style: "margin-top:3px" }, sub) : null);
+  body.append(el("div", { class: "applayout" },
+    el("div", { class: "lbox lbar" }, el("span", { class: "ln" }, "1"), el("b", {}, "Top bar"), " — open binary · IDA status · ", el("b", {}, "Setup / Explore"), " view toggle · 📖 Docs · 🤖 Clanker docs · Theme"),
+    el("div", { class: "lrow lmid" },
+      lbox(2, "Functions", "every function in the binary; filter by name"),
+      el("div", { class: "lbox lgrow" }, el("span", { class: "ln" }, "3"), el("b", {}, "Center"), " — Decompilation · Disassembly · generated angr script, and the ", el("b", {}, "CFG graph"), ". Click a line to add reach / avoid / checks."),
+      lbox(4, "Setup", "initial state · assumptions · call models · checks · Run")),
+    el("div", { class: "lrow lbot" }, el("div", { class: "lbox" }, el("span", { class: "ln" }, "5"), el("b", {}, "Bottom dock"), " — ", el("b", {}, "Findings / paths"), " (list or tree) and the ", el("b", {}, "Path detail"), " for whichever path you click."))));
+  body.append(cap("The ", b("Setup"), " view (shown) is for configuring; the ", b("Explore"), " view rearranges the same panels for reading paths. Collapse either side with ", b("« / »"), "."));
+
+  // ---- workflow pipeline ----
+  body.append(h("The five-step workflow"));
   const step = (t) => el("span", { class: "pipe-step" }, t);
   const arr = () => el("span", { class: "pipe-arr" }, "→");
   body.append(el("div", { class: "pipeline" },
-    step("pick a function"), arr(), step("set its inputs"), arr(), step("add checks"), arr(),
-    step("explore paths"), arr(), step("read findings")));
-  body.append(p("Checks are optional — with none, exploring just enumerates the paths."));
+    step("1 · pick a function"), arr(), step("2 · set its inputs"), arr(), step("3 · add checks"), arr(),
+    step("4 · explore paths"), arr(), step("5 · read findings")));
+  body.append(p("Steps 3 is ", b("optional"), " — with no checks, ", b("Explore paths"), " just enumerates every path the inputs can take. Add checks when you are hunting a specific bug class."));
 
-  // the idea + a tiny path tree
-  body.append(h("The idea"));
+  // ---- the idea + a tiny path tree ----
+  body.append(h("The idea in one picture"));
   body.append(el("div", { class: "docrow" },
     el("div", { class: "grow" }, p("At each branch whose condition depends on an unknown input, execution ", b("forks"),
-      " and follows both sides — building a ", b("tree"), " of paths. Each finding comes with a concrete ", b("witness"),
+      " and follows both sides — building a ", b("tree"), " of paths. Each leaf is an outcome; each finding comes with a concrete ", b("witness"),
       ": the exact input values that take that path and trigger it.")),
     svg(`<svg viewBox="0 0 120 92" width="120" height="92" aria-hidden="true">
       <g fill="none" stroke="var(--line2)" stroke-width="1.5">
@@ -1994,32 +2766,81 @@ function openHumanDocs() {
       <text x="2" y="90" font-size="7" fill="var(--faint)" font-family="var(--sans)">green=returned · purple=branch · red=finding</text>
     </svg>`, "flex:0 0 auto")));
 
-  body.append(h("Setting up inputs"));
+  // ---- setting up inputs, with a mock argument row ----
+  body.append(h("Step 2 · setting up inputs"));
+  body.append(p("Each argument gets one ", b("mutually-exclusive"), " mode (a single 3-way switch):"));
+  // a faithful mock of an argument row in each of the three modes
+  const seg3 = (on) => el("div", { class: "seg" },
+    el("div", { class: "segbtn" + (on === "sym" ? " on" : "") }, "sym"),
+    el("div", { class: "segbtn" + (on === "fixed" ? " on" : "") }, "fixed"),
+    el("div", { class: "segbtn" + (on === "buffer" ? " on" : "") }, "buffer"));
+  body.append(shot("Initial state · one argument, three modes",
+    el("div", { class: "arg", style: "grid-template-columns:minmax(0,1fr) auto 54px auto" },
+      el("input", { class: "name", value: "count", disabled: "" }), seg3("sym"),
+      el("select", { disabled: "" }, el("option", {}, "4B")),
+      el("label", { class: "row", style: "font-size:11px;color:var(--dim);gap:3px" }, el("input", { type: "checkbox", disabled: "", style: "width:auto" }), "signed")),
+    el("div", { class: "arg", style: "grid-template-columns:minmax(0,1fr) auto 54px auto" },
+      el("input", { class: "name", value: "size", disabled: "" }), seg3("fixed"),
+      el("select", { disabled: "" }, el("option", {}, "4B")),
+      el("input", { value: "8", disabled: "", style: "width:78px" })),
+    el("div", { class: "arg", style: "grid-template-columns:minmax(0,1fr) auto" },
+      el("input", { class: "name", value: "tif", disabled: "" }), seg3("buffer")),
+    el("div", { class: "row", style: "font-size:11px;color:var(--faint);margin:2px 0 0 2px;gap:4px;flex-wrap:wrap" },
+      el("span", {}, "buffer"), el("input", { value: "1080", disabled: "", style: "width:52px" }),
+      el("span", {}, "bytes · pointer is concrete, contents symbolic"),
+      el("button", { class: "tiny", disabled: "", style: "margin-left:4px" }, "⚙ struct (69)"))));
   const ul = el("ul", { class: "dul" });
-  [[b("symbolic / fixed"), " — mark each argument unknown (the solver chooses it) or pin it to a value."],
-   [b("pointers → buffers"), " — tick “points at a symbolic buffer”: the pointer is a real address, the contents are symbolic."],
-   [b("struct editor"), " — for a pointer-to-struct, load the layout from IDA (“as struct”) and set each member symbolic or fixed; expand nested structs."],
-   [b("stdin / files"), " — make program input symbolic (e.g. a .password file)."],
-   [b("assumptions"), " — constrain inputs with expressions (e.g. ", el("code", {}, "a1 & 0xff == 0x5a"), ")."],
-   [b("call models"), " — replace a function the target calls (malloc, size helpers, read/write) with a model, so cross-call bugs stay tractable."]].forEach(x =>
-    ul.append(el("li", {}, ...x)));
+  [[b("sym"), " (symbolic) — the value is unknown; the solver chooses it. This is what makes a bug ", b("searchable"), ". Optionally ", code("signed"), " / ", code("floating-point"), "."],
+   [b("fixed"), " — pin the argument to a constant you type."],
+   [b("buffer"), " — the argument is a ", b("pointer"), ": SEAL allocates a real buffer, points the argument at it, and leaves its contents symbolic. The pointer itself is concrete; the bytes it points at are unknown. (This replaces the old separate “points at a symbolic buffer” checkbox — it can’t coexist with sym/fixed, so it’s now the third mode.)"]].forEach(x => ul.append(el("li", {}, ...x)));
   body.append(ul);
 
-  body.append(h("Looking for bugs"));
-  body.append(p(b("+ detect"), " adds a bug-class check: integer overflow/wrap, narrowing cast, floating-point anomaly (NaN/±Inf), or out-of-bounds write (incl. heap overflows of modeled allocations). ",
-    b("+ assert"), " checks an invariant; ", b("+ custom"), " runs your own predicate; and from the code view you can add ", b("reach"), " / ", b("avoid"), " on any line."));
+  // ---- struct editor picture ----
+  body.append(p("In ", b("buffer"), " mode, ", b("⚙ struct"), " opens the struct editor. Type to filter the dropdown of structs IDA knows (you needn’t remember the exact name), ", b("Load"), " the layout, then set each member symbolic or fixed; ⤷ expands a nested struct into its fields."));
+  const strow = (off, name, type, mode, val) => el("div", { class: "strow" },
+    el("input", { class: "stoff mono", value: off, disabled: "", style: "width:46px" }),
+    el("input", { class: "stname grow", value: name, disabled: "" }),
+    el("input", { class: "stsz mono", value: "8", disabled: "", style: "width:34px" }),
+    el("span", { class: "sttype mono faint" }, type),
+    el("div", { class: "seg stseg" }, el("div", { class: "segbtn" + (mode === "sym" ? " on" : "") }, "sym"), el("div", { class: "segbtn" + (mode === "fix" ? " on" : "") }, "fix")),
+    mode === "sym" ? el("span", { class: "faint stvalph" }, "symbolic") : el("input", { class: "stval mono", value: val, disabled: "" }));
+  const tbl = el("div", { class: "structtbl" },
+    el("div", { class: "strow sthead" }, el("span", { class: "stoff" }, "offset"), el("span", { class: "grow" }, "member"), el("span", { class: "sttype" }, "type"), el("span", {}, "value")),
+    strow("0", "tif.tif_fd", "int", "sym", ""),
+    strow("8", "tif.tif_name", "char *", "sym", ""),
+    strow("16", "tif.tif_flags", "uint32", "fix", "0x4"));
+  body.append(shot("Struct editor · tif (from IDA)",
+    el("div", { class: "row", style: "gap:6px" }, el("input", { value: "start typing to filter 312 structs…", disabled: "", style: "flex:1" }), el("button", { class: "tiny primary", disabled: "" }, "Load")),
+    tbl));
 
-  body.append(h("Reading the results"));
-  body.append(p("The ", b("paths dock"), " shows every explored path as a ", b("list"), " or a branching ", b("tree"),
-    " (toggle). Click one and the ", b("Path detail"), " panel shows the conditions to get there, the outcome and the finding with its witness — while the ",
-    b("code"), " and ", b("graph"), " highlight that flow (blue) and the exact branches it took (purple)."));
+  // ---- other input sources ----
+  body.append(p("Beyond arguments: ", b("stdin / symbolic files"), " make program input symbolic (e.g. a ", code(".password"), " a CTF reads); ",
+    b("assumptions"), " constrain inputs with expressions (e.g. ", code("count < 0x100000"), "); ",
+    b("call models"), " replace a function the target calls (malloc, size helpers, read/write) with a simple stand-in, so bugs that span library calls stay tractable."));
 
+  // ---- looking for bugs ----
+  body.append(h("Step 3 · looking for bugs (optional)"));
+  body.append(annot("+", b("+ detect"), " — a bug-class check: integer overflow/wrap, narrowing cast, floating-point anomaly (NaN/±Inf), or out-of-bounds write (including heap overflows of modeled allocations)."));
+  body.append(annot("+", b("+ assert"), " — an invariant that should always hold; the check fires when the solver can make it false (e.g. ", code("total >= count"), " at return)."));
+  body.append(annot("+", b("+ custom"), " — your own Python predicate over the state."));
+  body.append(annot("⌖", "From the ", b("code view"), ", click any line to add ", b("reach"), " (find an input that gets here) or ", b("avoid"), " (prune paths that hit it)."));
+
+  // ---- reading results ----
+  body.append(h("Steps 4–5 · explore, then read findings"));
+  body.append(p("Press ", b("Explore paths"), ". The ", b("bottom dock"), " fills with every explored path as a ", b("list"), " or a branching ", b("tree"),
+    " (toggle at the dock’s top-right). Click one and ", b("Path detail"), " shows the branch conditions to get there, the outcome, and — for a finding — the ", b("witness"),
+    " (concrete inputs). As you click, the ", b("code"), " and ", b("graph"), " highlight that flow (blue) and the exact branches it took (purple)."));
+  body.append(cap("Outcomes you’ll see on leaves: ", b("returned"), " (ran to completion), ", b("exit"), ", ",
+    b("hijack"), " (a jump the inputs control — e.g. a call through a symbolic function pointer), ",
+    b("loop bound / max active"), " (search limits), and any ", b("finding"), " a check raised."));
+
+  // ---- getting around ----
   body.append(h("Getting around"));
-  body.append(p(b("Scenarios"), " keep several initial-state setups per function (shared checks); switch via the chip by the function name. The ",
+  body.append(p(b("Scenarios"), " keep several initial-state setups per function (checks are shared); switch via the chip by the function name. The ",
     b("Setup / Explore"), " toggle (top bar) swaps a configuring layout for a path-reading one. Collapse either side panel with ", b("« / »"),
-    ", and pick a colour theme from ", b("Theme"), "."));
+    ", and pick a colour theme from ", b("Theme"), ". Need IDA names/decompilation? Connect via the IDA button (see Clanker docs for the port-forward)."));
 
-  body.append(el("div", { class: "dnote" }, "Driving SEAL from an AI agent? See ", b("🤖 Clanker docs"), " for the MCP tools, the full guide and caveats."));
+  body.append(el("div", { class: "dnote" }, "Driving SEAL from an AI agent? See ", b("🤖 Clanker docs"), " for the MCP tools, worked tool-call walkthroughs, the full guide and caveats."));
 
   const m = modal("SEAL — overview", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
   m.querySelector(".modal").classList.add("docs");
@@ -2031,102 +2852,55 @@ async function openDocsModal() {
   try { d = await api("/api/agent-docs"); } catch (e) {}
   const origin = location.origin;
   const mcpUrl = d.mcp_url || (origin + "/mcp");
-  const h = (t) => el("h4", { class: "dh" }, t);
-  const p = (...k) => el("p", { class: "dp" }, ...k);
+  const guide = d.guide || "(the server did not return a guide — check /api/agent-docs)";
   const code = (t) => el("code", {}, t);
-  const pre = (t) => el("pre", { class: "dcode" }, t);
   const body = el("div", { class: "docbody" });
 
-  body.append(
-    p(el("b", {}, "SEAL"), " (Symbolic Execution Analysis Lab) drives ", el("b", {}, "angr"),
-      " symbolic execution behind a visual UI. An agent sets up a function's initial state, adds checks, runs them, and reads back concrete inputs that trigger each finding — while a human watches every action live in this window."));
+  // The agent docs are deliberately NOT structured like the human Docs. They are ONE
+  // flat skill — the exact text an agent gets from get_guide / the initialize handshake —
+  // so a human can copy it straight into their agent. Keep this modal a thin presenter of
+  // that single source of truth (server.py GUIDE); don't re-document features here.
+  body.append(el("p", { class: "dp" },
+    el("b", {}, "SEAL agent skill."),
+    " SEAL's complete operating manual for an AI agent driving it over MCP, as one flat" +
+    " document on purpose. Paste it straight into your agent as a skill / system note, or" +
+    " point an MCP client at the endpoint below — the agent then gets the identical text" +
+    " from the ", code("get_guide"), " tool and in the ", code("initialize"), " handshake."));
 
-  body.append(h("1 · Connect"));
-  body.append(p("The tool exposes a built-in ", el("b", {}, "MCP server"), " (", (d.transport || "Streamable HTTP"), "). Point your MCP client at:"));
-  body.append(pre(mcpUrl));
-  body.append(p("Protocol ", code(d.protocol || "2025-06-18"), ", server name ", code(d.server_name || "seal"),
-    ". Standard MCP handshake: ", code("initialize"), " → ", code("tools/list"), " → ", code("tools/call"),
-    ". No auth. Everything you do appears in the GUI's ", el("b", {}, "Activity"), " feed in real time, and the human can follow along (the view auto-jumps to your runs)."));
+  body.append(el("div", { class: "dp", style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" },
+    el("b", {}, "MCP endpoint:"), el("code", {}, mcpUrl),
+    el("span", { class: "faint" }, (d.transport || "Streamable HTTP") + (d.protocol ? " · " + d.protocol : "") + " · no auth")));
 
-  body.append(h("2 · Typical workflow"));
-  const ol = el("ol", { class: "dol" });
-  [["list_functions", "find the function to analyse (by name or address substring)."],
-   ["get_function", "read its current setup (initial state, assumptions, checks, limits)."],
-   ["decompile / disassemble", "read the code to decide what to check."],
-   ["configure / add_assumption / add_check", "mark arguments symbolic or fixed, constrain inputs, and add checks."],
-   ["run", "execute the enabled checks; returns a run_id."],
-   ["get_run", "poll until status is done/error, then read findings — each carries a concrete witness (the exact inputs that trigger it) and the path tree."]].forEach(([t, s]) =>
-    ol.append(el("li", {}, code(t), " — " + s)));
-  body.append(ol);
+  const copyGuide = el("button", { class: "tiny primary" }, "⧉ Copy the whole skill");
+  copyGuide.onclick = () => (navigator.clipboard ? navigator.clipboard.writeText(guide) : Promise.reject())
+    .then(() => toast("skill copied — paste it into your agent")).catch(() => toast("copy failed; select the text below", true));
+  const copyEp = el("button", { class: "tiny" }, "⧉ Copy endpoint");
+  copyEp.onclick = () => (navigator.clipboard ? navigator.clipboard.writeText(mcpUrl) : Promise.reject())
+    .then(() => toast("endpoint copied")).catch(() => {});
+  body.append(el("div", { style: "display:flex;gap:8px;margin:4px 0 10px" }, copyGuide, copyEp));
 
-  body.append(h("3 · Tools"));
-  const tbl = el("table", { class: "dtbl" });
-  tbl.append(el("tr", {}, el("th", {}, "tool"), el("th", {}, "what it does")));
-  (d.tools || []).forEach(t => {
-    const req = (t.inputSchema && t.inputSchema.required) || [];
-    tbl.append(el("tr", {},
-      el("td", {}, code(t.name), req.length ? el("div", { class: "dargs" }, "args: " + req.join(", ")) : null),
-      el("td", {}, t.description)));
-  });
-  body.append(tbl);
+  // the skill itself, verbatim and scrollable
+  body.append(el("pre", { class: "dcode", style: "white-space:pre-wrap;max-height:62vh;overflow:auto;color:var(--ink);line-height:1.45" }, guide));
 
-  body.append(h("4 · Checks (add_check)"));
-  (d.check_kinds || []).forEach(c => {
-    const fields = Object.entries(c.fields || {}).map(([k, v]) => `${k}: ${v}`).join("  ·  ");
-    body.append(el("div", { class: "dcheck" },
-      el("span", { class: "pill info" }, c.kind), " ", c.summary,
-      fields ? el("div", { class: "dargs" }, fields) : null));
-  });
-  body.append(p("Example: ", code('add_check(addr, {"kind":"assert","expr":"total < 0x1000","at_return":true})')));
-
-  body.append(h("5 · Expression language"));
-  body.append(p("Used by assumptions and by ", code("assert"), " checks, over the input names:"));
-  const el2 = el("ul", { class: "dul" });
-  [["names", "the argument names, plus a1../arg0.. (parameters), registers (rdi, eax…), and ret (return value)."],
-   ["compare", "== != < <= > >=  (unsigned); prefix s for signed: s< s<= s> s>="],
-   ["arith / bitwise", "+ - * / %  & | ^ ~ << >>  (s>> = arithmetic shift, s/ s% = signed)"],
-   ["widths", "u8/u16/u32/u64 read N low bits unsigned; s8/s16/s32/s64 sign-extend"],
-   ["memory", "mem(addr, size) reads memory; e.g. mem(a1, 4)"],
-   ["example", 'a1 & 0xff == 0x5a   ·   u32(x) + 8 < u32(x)   ·   ret s>= 0']].forEach(([k, v]) =>
-    el2.append(el("li", {}, el("b", {}, k + ": "), v)));
-  body.append(el2);
-
-  body.append(h("6 · Scenarios"));
-  body.append(p("A function can have several ", el("b", {}, "scenarios"), " — different ways it is reached, each with its own initial state (args, stdin, files, assumptions, limits). ",
-    "The checks are ", el("b", {}, "shared"), " across scenarios. ", code("get_function"), " reports the scenario names and which is active; ",
-    code("configure"), ", ", code("add_assumption"), " and ", code("run"), " all act on the ", el("b", {}, "active"), " one."));
-  body.append(p("Manage them with ", code("add_scenario"), " (optionally ", code("duplicate"), " the active one; the new scenario becomes active), ",
-    code("select_scenario"), ", ", code("rename_scenario"), " and ", code("delete_scenario"), " — each takes a scenario name or index."));
-
-  body.append(h("7 · Modeling calls & structs"));
-  body.append(p("For a pointer-to-struct argument, ", code("get_struct(\"TYPE\")"), " returns the member layout from IDA; set members with ",
-    code("configure buffers[].layout"), " (each member ", code("sym"), " named or ", code("fixed"), "). For functions the target calls, ",
-    code("add_model"), " replaces them (", code("symbolic"), " / ", code("concrete"), " / ", code("return_arg"), " / ", code("alloc"),
-    ") so cross-call bugs are reachable; then an ", code("oob_write"), " check with no base finds heap overflows of modeled allocations. ",
-    el("b", {}, "skip_calls bypasses models"), " — leave it off and model every heavy call."));
-
-  body.append(h("8 · Use cases"));
-  const ucl = el("ul", { class: "dul" });
-  [["Reach a target", "add a reach check at the goal address; the witness is the input that gets there (e.g. a CTF flag check)."],
-   ["Integer overflow (e.g. CVE-2020-12762)", "symbolize the size args, add int_overflow; the witness is a size near INT_MAX."],
-   ["Heap overflow across calls (e.g. CVE-2017-5225)", "model the size/alloc/read-write calls, add oob_write (no base) — finds the unbounded write."],
-   ["Invariant checking", "add_check assert with an expression that should always hold at a point or at return."]].forEach(([t, s]) =>
-    ucl.append(el("li", {}, el("b", {}, t + " — "), s)));
-  body.append(ucl);
-
-  if (d.guide) {
-    body.append(h("9 · The agent's own guide"));
-    body.append(p("An agent calls ", code("get_guide"), " (or reads the handshake ", code("instructions"),
-      ") to get this self-contained how-to — the same text, with a worked example:"));
-    body.append(el("pre", { class: "dcode", style: "white-space:pre-wrap;max-height:320px;overflow:auto;color:var(--ink)" }, d.guide));
+  // a live, accurate tool list (names + required args) straight from THIS server — a quick
+  // lookup appendix, not a re-explanation; schemas come from tools/list over MCP.
+  if ((d.tools || []).length) {
+    body.append(el("div", { class: "faint", style: "margin:12px 0 4px" }, "Live tool list on this server (names + required args; full schemas via tools/list):"));
+    const tbl = el("table", { class: "dtbl" });
+    tbl.append(el("tr", {}, el("th", {}, "tool"), el("th", {}, "what it does")));
+    (d.tools || []).forEach(t => {
+      const req = (t.inputSchema && t.inputSchema.required) || [];
+      tbl.append(el("tr", {},
+        el("td", {}, code(t.name), req.length ? el("div", { class: "dargs" }, "args: " + req.join(", ")) : null),
+        el("td", {}, t.description)));
+    });
+    body.append(tbl);
   }
 
-  const m = modal("Clanker documentation", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
+  const m = modal("Clanker documentation — agent skill", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
   m.querySelector(".modal").classList.add("docs");
   $("#modalHost").append(m);
 }
-
-// ==================================================================== overflow modal
 function openOverflowModal() {
   const arithInsns = (A.detail.disasm.instructions || []).filter(i => i.arith);
   const sel = el("select", {});
@@ -2303,6 +3077,46 @@ async function renderCFG(force) {         // legacy CFG tab; the graph now lives
   }
   drawCFG(pane, g);
 }
+// IDA-style disassembler syntax colours for the graph's instruction text
+// (the node fills / background / highlights follow the active theme — see recolor).
+const IDA = {
+  // maximum-brightness neon disassembler palette (on the dark node boxes)
+  mn: "#66d9ff", reg: "#4dffe8", num: "#ccff4d", kw: "#ff6ae8", pun: "#d2dcea", sym: "#ffe84d",
+};
+// Binary Ninja dark theme (exact values from its dark.bntheme): neutral-gray canvas,
+// lighter rectangular nodes with a thin light-gray outline + a delicate black shadow.
+const BN = { bg: "#2a2a2a", node: "#4a4a4a", border: "#909090", head: "#b4b4b4" };
+// colour utilities for the graphs: parse any css colour to [r,g,b]; blend toward white / another colour
+function _rgb(c) {
+  let m = /^#?([0-9a-f]{3})$/i.exec(c);
+  if (m) { const h = m[1]; return [h[0] + h[0], h[1] + h[1], h[2] + h[2]].map(x => parseInt(x, 16)); }
+  m = /^#?([0-9a-f]{6})$/i.exec(c); if (m) { const n = parseInt(m[1], 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+  m = /rgba?\(([^)]+)\)/i.exec(c); if (m) return m[1].split(",").slice(0, 3).map(x => +x.trim());
+  return [26, 30, 37];
+}
+const _hex = ([r, g, b]) => "#" + [r, g, b].map(x => Math.max(0, Math.min(255, Math.round(x))).toString(16).padStart(2, "0")).join("");
+function lighten(c, amt) { const [r, g, b] = _rgb(c); return _hex([r + (255 - r) * amt, g + (255 - g) * amt, b + (255 - b) * amt]); }
+function mix(a, b, t) { const A = _rgb(a), B = _rgb(b); return _hex([A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t]); }
+const X86_REG = /^(?:[re]?[a-d]x|[re]?[sd]i|[re]?[sb]p|r(?:8|9|1[0-5])[dwb]?|[a-d][lh]|sil|dil|bpl|spl|[xyz]mm\d+|rip|eip|ip|[er]?flags|st\d?|mm[0-7]|k[0-7]|cr\d+|dr\d+|tr\d+|[cdefgs]s)$/i;
+const X86_SIZE = /^(?:byte|word|dword|qword|tbyte|oword|xmmword|ymmword|zmmword|ptr|offset|short|near|far)$/i;
+// split an instruction's text into coloured tokens (mnemonic, registers, numbers, …)
+function asmSpans(line) {
+  const out = [];
+  const re = /(\s+)|(0x[0-9a-fA-F]+|\b\d+\b)|([\[\](),:+\-*])|([A-Za-z_.$@][\w.$@]*)/g;
+  let m, first = true;
+  while ((m = re.exec(line))) {
+    if (m[1]) { out.push({ s: m[1], cls: "ws" }); continue; }
+    if (m[2]) { out.push({ s: m[2], cls: "num" }); continue; }
+    if (m[3]) { out.push({ s: m[3], cls: "pun" }); continue; }
+    const w = m[4];
+    if (first) { out.push({ s: w, cls: "mn" }); first = false; }
+    else if (X86_REG.test(w)) out.push({ s: w, cls: "reg" });
+    else if (X86_SIZE.test(w)) out.push({ s: w, cls: "kw" });
+    else out.push({ s: w, cls: "sym" });
+  }
+  return out;
+}
+
 function drawCFG(pane, g) {
   // if this function's graph is already laid out here, only recolor (keeps pan/zoom/position)
   if (pane._cfg && pane._cfg.addr === g.addr) { pane._cfg.recolor(); return; }
@@ -2328,9 +3142,11 @@ function drawCFG(pane, g) {
   svg.setAttribute("width", "100%"); svg.setAttribute("height", "100%");
   svg.style.cssText = "display:block;background:var(--bg);cursor:grab;touch-action:none;user-select:none";
   svg.innerHTML = `<defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
-    <path d="M0,0 L7,3 L0,6 Z" fill="#5a6577"/></marker>
+    <path d="M0,0 L7,3 L0,6 Z" fill="#8b93a2"/></marker>
     <marker id="arrhi" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
-    <path d="M0,0 L7,3 L0,6 Z" fill="#4c9aff"/></marker></defs>`;
+    <path d="M0,0 L7,3 L0,6 Z" fill="#4c9aff"/></marker>
+    <filter id="nodeshadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="1.2" stdDeviation="1.6" flood-color="#000000" flood-opacity="0.55"/></filter></defs>`;
   const viewport = document.createElementNS(NS, "g");
   svg.append(viewport);
 
@@ -2350,7 +3166,7 @@ function drawCFG(pane, g) {
     const gEl = document.createElementNS(NS, "g");
     gEl.setAttribute("transform", `translate(${n.x - n.width / 2},${n.y - n.height / 2})`);
     const rect = document.createElementNS(NS, "rect");
-    rect.setAttribute("width", n.width); rect.setAttribute("height", n.height); rect.setAttribute("rx", 7);
+    rect.setAttribute("width", n.width); rect.setAttribute("height", n.height); rect.setAttribute("rx", 6);  // rounded, like the paths graph
     rect.style.cursor = "pointer";
     gEl.append(rect);
     const head = document.createElementNS(NS, "text");
@@ -2363,7 +3179,15 @@ function drawCFG(pane, g) {
       const t = document.createElementNS(NS, "text");
       t.setAttribute("x", 9); t.setAttribute("y", 32 + i * LINE_H);
       t.setAttribute("font-family", "var(--mono)"); t.setAttribute("font-size", "12.5");
-      t.textContent = ln;
+      t.setAttribute("xml:space", "preserve");
+      // syntax-highlight each instruction into coloured tspans (IDA-style)
+      asmSpans(ln).forEach(sp => {
+        const ts = document.createElementNS(NS, "tspan");
+        ts.setAttribute("xml:space", "preserve");
+        if (sp.cls !== "ws") ts.setAttribute("fill", IDA[sp.cls]);
+        ts.textContent = sp.s;
+        t.append(ts);
+      });
       gEl.append(t);
       lineEls.push(t);
     });
@@ -2372,13 +3196,15 @@ function drawCFG(pane, g) {
   });
 
   function recolor() {
+    // node fills / borders follow the active (dark) theme; the selected path, the
+    // branch decisions and the findings are tinted + bordered so they stand out.
+    // Instruction text keeps its syntax-highlighted tspan colours (not overwritten).
     const pathBlocks = A.pathHighlight || new Set();
     const hitAddrs = new Set((A.run?.snapshot?.hits || []).map(h => h.addr));
-    // pull colours from the active theme so nodes stay distinct from the background
     const css = getComputedStyle(document.documentElement);
     const v = (name, fb) => (css.getPropertyValue(name).trim() || fb);
-    const node = v("--panel2", "#1a1e25"), line2 = v("--line2", "#30363f");
-    const ink = v("--ink", "#e8ecf1"), dim = v("--dim", "#98a1ad");
+    // theme colours, matching the paths graph; path/branch/finding highlights tint the fill + border
+    const node = v("--panel2", "#1a1e25"), line2 = v("--line2", "#30363f"), dim = v("--dim", "#98a1ad");
     const accent = v("--accent", "#4c9aff"), accent2 = v("--accent2", "#7c5cff"), bad = v("--bad", "#f85149");
     const branchBlocks = A.branchBlocks || new Set();
     const tint = (hex, a) => { const m = /^#?([0-9a-f]{6})$/i.exec(hex); if (!m) return hex; const n = parseInt(m[1], 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`; };
@@ -2388,11 +3214,10 @@ function drawCFG(pane, g) {
       ne.rect.setAttribute("stroke", hasHit ? bad : isBranch ? accent2 : onPath ? accent : line2);
       ne.rect.setAttribute("stroke-width", (hasHit || onPath || isBranch) ? 2 : 1);
       ne.head.setAttribute("fill", hasHit ? bad : isBranch ? accent2 : dim);
-      (ne.lineEls || []).forEach(t => t.setAttribute("fill", ink));
     }
     for (const e of edgeEls) {
       const hi = pathBlocks.has(e.v) && pathBlocks.has(e.w);
-      const color = e.kind === "call" ? accent2 : e.kind === "return" ? v("--ok", "#3fb950") : "#5a6577";
+      const color = e.kind === "call" ? accent2 : e.kind === "return" ? v("--ok", "#3fb950") : "#8b93a2";
       e.p.setAttribute("stroke", hi ? accent : color);
       e.p.setAttribute("stroke-width", hi ? 2.5 : 1.3);
       e.p.setAttribute("marker-end", hi ? "url(#arrhi)" : "url(#arr)");

@@ -1,0 +1,6 @@
+command script import seal_validation/snapshot/capture.py
+breakpoint set --name main
+run
+aa_setup
+continue
+quit

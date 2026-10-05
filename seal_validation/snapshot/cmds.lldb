@@ -1,0 +1,5 @@
+command script import seal_validation/snapshot/snap_dump.py
+breakpoint set --name aa_merge_scanline_edge
+breakpoint command add -F snap_dump.dump 1
+run
+quit

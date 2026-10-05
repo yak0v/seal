@@ -17,6 +17,43 @@ and pseudocode by running small IDAPython snippets and reading back the result.
 This module speaks the MCP "Streamable HTTP" transport with the standard
 library only (no new dependency), and is written to fail softly: if IDA is not
 reachable the GUI just keeps angr's `sub_<addr>` names.
+
+ROLE
+    The optional bridge to IDA. SEAL analyses the binary itself with angr/cle; IDA is
+    used ONLY to enrich the view — real function names, Hex-Rays pseudocode, and struct
+    member layouts (for pointer-to-struct args). The server connects via `ida_connect(url)`
+    and everything here degrades gracefully when IDA is absent.
+
+WHY IT'S LIKE THIS
+    - Code-mode, not fixed tools: the IDA MCP exposes `execute_python(code)`, so we fetch
+      names/pseudocode/structs by sending small IDAPython snippets and parsing the result,
+      rather than depending on a specific tool surface. That tolerates different IDA-MCP
+      builds (there are a couple of community variants; see the `_community_*` helpers).
+    - Stdlib-only transport so IDA support adds ZERO dependencies to SEAL; MCP here is a
+      thin POST + SSE-or-JSON reader, deliberately minimal.
+    - Fail-soft everywhere: a broken/absent IDA must never break analysis — the GUI just
+      falls back to angr's `sub_<addr>` names and the disassembly view.
+    - `host_header`: IDA MCP servers guard against DNS-rebinding by rejecting unexpected
+      Host headers. When IDA runs elsewhere and you reach it through a forward (common
+      setup: IDA in a VM, bound to 127.0.0.1, reached at the VM's LAN IP, e.g.
+      http://10.211.55.3:8744/mcp), pass `host_header="127.0.0.1"` so the server accepts
+      the request. Addresses are IDA's absolute addresses, which must match the base SEAL
+      loaded the binary at — same file, same base.
+
+EXTENDING
+    - New IDA-derived datum (xrefs, types, comments, a renamer): add a method on
+      `IdaSession` that calls `self.client.execute_python(<IDAPython snippet>)` and parses
+      the returned text; keep the snippet small and read back a compact, parseable result.
+    - New IDA-MCP variant: extend the `_community_*`/`_instances` parsing, don't assume one
+      server's exact output shape.
+
+PITFALLS
+    - decompile() needs a live connection; callers must fall back to disassembly when IDA
+      is not connected (`get_status().ida.connected`).
+    - Address space must match: if IDA analysed a different build/base than SEAL loaded,
+      names and line↔address mappings will be wrong even though both "work".
+    - The transport is synchronous and best-effort; wrap calls so a slow/hung IDA can't
+      stall the server, and treat any IDA output as untrusted text to parse, not execute.
 """
 from __future__ import annotations
 
@@ -382,6 +419,36 @@ class IdaSession:
         if not data.get("found"):
             raise MCPError(f"no type named {name!r} in IDA")
         return data
+
+    def list_structs(self) -> list[str]:
+        """Every struct/union type name known to IDA, sorted. Used to populate a
+        filterable dropdown so the user needn't remember an exact type name."""
+        code = (
+            "import ida_typeinf, json\n"
+            "til = ida_typeinf.get_idati()\n"
+            "qty = (ida_typeinf.get_ordinal_count(til) if hasattr(ida_typeinf, 'get_ordinal_count')\n"
+            "       else ida_typeinf.get_ordinal_qty(til))\n"
+            "names = []\n"
+            "for ordi in range(1, (qty or 0) + 1):\n"
+            "    t = ida_typeinf.tinfo_t()\n"
+            "    try:\n"
+            "        if t.get_numbered_type(til, ordi) and (t.is_struct() or t.is_union()):\n"
+            "            nm = t.get_type_name()\n"
+            "            if nm and not str(nm).startswith('$') and '::$' not in str(nm):\n"   # skip IDA's anonymous/hash types
+            "                names.append(str(nm))\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "result = json.dumps(sorted(set(names)))\n"
+        )
+        try:
+            res = self.client.call_tool("py_eval", {"code": code})
+        except MCPError as e:
+            raise MCPError(f"listing structs needs the IDA 'py_eval' tool, which this server lacks ({e})")
+        s = res.get("result") if isinstance(res, dict) else res
+        try:
+            return list(json.loads(s))
+        except Exception:
+            raise MCPError(f"could not read struct list from IDA: {str(s)[:200]}")
 
     def refresh(self) -> dict:
         """Drop caches and re-pull names — after renaming/retyping in IDA."""

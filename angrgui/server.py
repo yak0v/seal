@@ -21,19 +21,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import uuid
 import logging
 import urllib.parse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .engine import Binary
 from .runner import Run
+from .backend import make_backend, AngrBackend
 from .workspace import Workspace
 from .checks import CUSTOM_TEMPLATE
 from .codegen import generate_script
@@ -49,14 +51,36 @@ app = FastAPI(title="angr bug-hunting GUI")
 
 
 class _Session:
-    """Holds the one loaded binary, its workspace, and active runs."""
+    """Holds the active analysis backend, its workspace, and run bookkeeping. The
+    backend (angr today, another framework tomorrow) owns the binary + runs; `binary`
+    and `runs` stay as compatibility views so the rest of the server is backend-agnostic."""
     def __init__(self):
-        self.binary: Binary | None = None
+        self.backend = None                      # backend.Backend or None
         self.workspace: Workspace | None = None
-        self.runs: dict[str, Run] = {}
         self.last_run: dict[int, str] = {}       # func_addr -> most recent run_id
         self.load_status = {"loading": False, "message": "", "error": None}
         self.ida = None                     # optional angrgui.idamcp.IdaSession
+
+    @property
+    def binary(self):
+        return self.backend.binary if self.backend is not None else None
+
+    @binary.setter
+    def binary(self, b):
+        if b is None:
+            self.backend = None
+        else:
+            self.backend = AngrBackend(binary=b)   # wrap a directly-assigned Binary (tests/callers)
+
+    @property
+    def runs(self) -> dict:
+        return self.backend.runs if self.backend is not None else {}
+
+    @runs.setter
+    def runs(self, d):                           # reset the backend's runs (callers/tests)
+        if self.backend is not None:
+            self.backend.runs.clear()
+            self.backend.runs.update(d or {})
 
 
 S = _Session()
@@ -116,6 +140,7 @@ def _fname(addr) -> str:
 # --------------------------------------------------------------------------- models
 class LoadReq(BaseModel):
     path: str
+    target_funcs: list[int] | None = None   # scope analysis to these funcs (big arm64 dylibs)
 
 
 class RunReq(BaseModel):
@@ -128,6 +153,7 @@ class RunReq(BaseModel):
     checks: list = []
     limits: dict = {}
     models: list = []
+    initial_state: dict | None = None        # concolic seed: {kind:"snapshot", pc, regs, mem, symbolic}
 
 
 class ConfigReq(BaseModel):
@@ -161,17 +187,20 @@ def _need_binary() -> Binary:
 
 
 # --------------------------------------------------------------------------- routes
+_NOCACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     with open(os.path.join(STATIC, "index.html")) as fh:
-        return fh.read()
+        return HTMLResponse(fh.read(), headers=_NOCACHE)   # always serve fresh; a plain reload shows edits
 
 
 @app.get("/app.js")
 def app_js():
     from fastapi.responses import Response
     with open(os.path.join(STATIC, "app.js")) as fh:
-        return Response(fh.read(), media_type="application/javascript")
+        return Response(fh.read(), media_type="application/javascript", headers=_NOCACHE)
 
 
 @app.get("/api/state")
@@ -219,9 +248,9 @@ def load(req: LoadReq):
         S.load_status["message"] = msg
 
     try:
-        S.binary = Binary(path, progress=progress)
+        S.backend = make_backend("angr", path=path, progress=progress, target_funcs=req.target_funcs)
         S.workspace = Workspace(path)
-        S.runs.clear()
+        S.last_run.clear()
         S.load_status = {"loading": False, "message": "ready", "error": None}
         BUS.publish("load", f"loaded {os.path.basename(path)}", path=path,
                     functions=len(S.binary.user_functions()))
@@ -325,11 +354,93 @@ def run(req: RunReq):
     return {"run_id": _start_run(req.model_dump())}
 
 
+@app.get("/api/models")
+def get_models():
+    """The global function-return model registry (by_name + by_site)."""
+    if S.workspace is None:
+        return {"by_name": {}, "by_site": {}}
+    return S.workspace.function_models()
+
+
+@app.post("/api/models")
+def set_models(fm: dict = Body(...)):
+    if S.workspace is None:
+        raise HTTPException(400, "no workspace")
+    S.workspace.set_function_models(fm)
+    BUS.publish("models", "function-return models updated",
+                names=list((fm.get("by_name") or {}).keys()),
+                sites=list((fm.get("by_site") or {}).keys()))
+    return S.workspace.function_models()
+
+
+def _merge_global_models(spec: dict) -> dict:
+    """Fold the workspace's global function-return models (applied whenever a
+    function / call site is reached) into this run's per-analysis models."""
+    if S.workspace is None:
+        return spec
+    fm = S.workspace.function_models()
+    models = list(spec.get("models") or [])
+    for name, mdl in (fm.get("by_name") or {}).items():
+        if mdl and mdl.get("enabled", True):
+            models.append({**mdl, "func": mdl.get("func") or name})
+    for site, mdl in (fm.get("by_site") or {}).items():
+        if mdl and mdl.get("enabled", True):
+            models.append({**mdl, "site": mdl.get("site") or site})
+    spec["models"] = models
+    return spec
+
+
+def _arg_struct_type(func_addr: int, argname: str) -> str | None:
+    """Resolve a pointer argument's struct type from IDA's decompiled signature,
+    e.g. argument `tif` of `TIFFRewriteDirectory(TIFF *tif)` -> "TIFF"."""
+    if S.ida is None:
+        return None
+    try:
+        code = S.ida.decompile(func_addr).get("code", "")
+    except Exception:
+        return None
+    m = re.search(r"\(([^)]*)\)", code or "")
+    if not m:
+        return None
+    for param in m.group(1).split(","):
+        pm = re.match(r"\s*(.+?)[\s*]+([A-Za-z_]\w*)\s*$", param)
+        if pm and pm.group(2) == argname:
+            typ = re.sub(r"\b(const|struct|volatile|unsigned|signed)\b", "", pm.group(1))
+            typ = typ.replace("*", "").strip()
+            return typ or None
+    return None
+
+
+def _enrich_buffer_members(spec: dict) -> dict:
+    """Give each pointer buffer a byte-offset -> struct-member-name map so branch
+    conditions read `tif->tif_mode` instead of `tif_buf[16]`. Members the user loaded
+    (layout) are used as-is; otherwise the buffer's struct type — explicit, or resolved
+    from IDA's signature — is fetched from IDA and used for naming."""
+    for b in spec.get("buffers", []) or []:
+        if b.get("member_map") or b.get("layout") or S.ida is None:
+            continue
+        st = b.get("struct_type") or _arg_struct_type(spec.get("func_addr"), b.get("arg"))
+        if not st:
+            continue
+        try:
+            data = S.ida.struct_layout(st)
+            arg = b.get("arg")
+            b["struct_type"] = st
+            b["member_map"] = [[int(m["offset"]), int(m["size"]) or 1, f"{arg}->{m['name']}"]
+                               for m in data.get("members", [])]
+        except Exception:
+            pass
+    return spec
+
+
 def _start_run(spec: dict, source: str = "gui") -> str:
-    b = _need_binary()
-    if b.get_function(spec["func_addr"]) is None:
+    if S.backend is None:
+        raise HTTPException(400, "no binary loaded")
+    if S.backend.binary.get_function(spec["func_addr"]) is None:
         raise HTTPException(404, "no such function")
-    run_id = uuid.uuid4().hex[:12]
+    _merge_global_models(spec)
+    _enrich_buffer_members(spec)
+    run_id = S.backend.new_run_id()
 
     def on_event(kind, **data):
         msg = {"finding": lambda: f"finding: {data.get('check_kind')} at {data.get('addr', 0):#x} — {data.get('detail', '')}",
@@ -337,10 +448,8 @@ def _start_run(spec: dict, source: str = "gui") -> str:
                                      f"({data.get('hits', 0)} finding(s))"}.get(kind, lambda: kind)()
         BUS.publish(kind, msg, run_id=run_id, **data)
 
-    r = Run(b, spec, on_event=on_event)
-    S.runs[run_id] = r
+    S.backend.start_run(run_id, spec, on_event=on_event)   # backend owns the run object
     S.last_run[spec["func_addr"]] = run_id
-    r.start()
     BUS.publish("run", f"{source} started a run of {_fname(spec['func_addr'])}",
                 func=spec["func_addr"], run_id=run_id,
                 checks=[c.get("name") or c.get("kind") for c in spec.get("checks", []) if c.get("enabled", True)])
@@ -353,6 +462,11 @@ def events(request: Request, after: int | None = None):
     # start from "now". EventSource auto-reconnect sends Last-Event-ID, which we resume from.
     resume = request.headers.get("last-event-id")
     start = int(resume) if resume and resume.isdigit() else (after if after is not None else BUS._seq)
+    # A Last-Event-ID larger than our current seq means it came from a PREVIOUS server
+    # process (the bus reset on restart): resume from now so new events still flow,
+    # instead of waiting forever for a seq this fresh bus will never reach.
+    if start > BUS._seq:
+        start = BUS._seq
 
     def gen():
         yield "retry: 2000\n\n"
@@ -363,18 +477,52 @@ def events(request: Request, after: int | None = None):
 
 @app.get("/api/run/{run_id}")
 def run_status(run_id: str):
-    r = S.runs.get(run_id)
-    if r is None:
+    snap = S.backend.run_snapshot(run_id) if S.backend else None
+    if snap is None:
         raise HTTPException(404, "no such run")
-    return r.snapshot()
+    return snap
+
+
+def _leaf_example(snap: dict, node: int) -> dict:
+    """The concrete inputs of a path: the node's own example, else any leaf under it,
+    else any leaf in the run."""
+    tree = snap["tree"]
+    byid = {n["id"]: n for n in tree}
+    kids = {}
+    for n in tree:
+        if n["parent"] is not None:
+            kids.setdefault(n["parent"], []).append(n["id"])
+    nd = byid.get(node)
+    if nd and nd.get("example"):
+        return nd["example"]
+    stack = [node] if nd else [n["id"] for n in tree if n["parent"] is None]
+    while stack:
+        cur = byid.get(stack.pop())
+        if cur and cur.get("example"):
+            return cur["example"]
+        stack.extend(kids.get(cur["id"], []) if cur else [])
+    for n in tree:
+        if n.get("example"):
+            return n["example"]
+    return {}
+
+
+@app.get("/api/run/{run_id}/values")
+def run_values(run_id: str, node: int):
+    """Per-instruction destination values on a path: {hex_addr: {reg, val, store?}},
+    computed by re-executing the function with that path's concrete example inputs.
+    Lets the UI show the value of the variable assigned on each decompilation line."""
+    snap = S.backend.run_snapshot(run_id) if S.backend else None
+    if snap is None:
+        raise HTTPException(404, "no such run")
+    example = _leaf_example(snap, node)
+    return {"node": node, "values": S.backend.run_values(run_id, example)}
 
 
 @app.post("/api/run/{run_id}/cancel")
 def run_cancel(run_id: str):
-    r = S.runs.get(run_id)
-    if r is None:
+    if not (S.backend and S.backend.cancel_run(run_id)):
         raise HTTPException(404, "no such run")
-    r.cancel()
     return {"ok": True}
 
 
@@ -437,6 +585,16 @@ def ida_refresh():
         raise HTTPException(400, "not connected to IDA")
     try:
         return S.ida.refresh()
+    except MCPError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.get("/api/ida/structs")
+def ida_structs():
+    if S.ida is None:
+        raise HTTPException(400, "not connected to IDA")
+    try:
+        return {"structs": S.ida.list_structs()}
     except MCPError as e:
         raise HTTPException(502, str(e))
 
@@ -532,7 +690,7 @@ def _mcp_configure(addr, patch: dict):
     a = _addr(addr)
     cfg = S.workspace.get_function(a)                   # structured
     sc = cfg["scenarios"][cfg["active"]]
-    for k in ("args", "buffers", "assumptions", "stdin", "files", "limits", "models"):
+    for k in ("args", "buffers", "assumptions", "stdin", "files", "limits", "models", "initial_state"):
         if k in patch and patch[k] is not None:
             sc[k] = {**sc.get("limits", {}), **patch[k]} if k == "limits" else patch[k]
     if patch.get("checks") is not None:
@@ -571,7 +729,7 @@ def _mcp_run(addr):
     spec = {"func_addr": a, "args": flat.get("args") or [], "buffers": flat.get("buffers") or [],
             "assumptions": [x for x in (flat.get("assumptions") or []) if x.strip()],
             "stdin": flat.get("stdin"), "files": flat.get("files") or [], "limits": flat.get("limits") or {},
-            "models": flat.get("models") or [],
+            "models": flat.get("models") or [], "initial_state": flat.get("initial_state"),
             "checks": [c for c in flat.get("checks", []) if c.get("enabled", True)]}
     # checks are optional: with none, this just enumerates the paths (control-flow exploration)
     return {"run_id": _start_run(spec, source="agent")}
@@ -586,6 +744,10 @@ def _mcp_get_run(run_id):
              "end": (n["end"] or {}).get("reason"), "hits": n["hits"]} for n in snap["tree"]]
     return {"status": snap["status"], "error": snap["error"], "summary": snap["summary"],
             "findings": snap["hits"], "paths": tree}
+
+
+def _mcp_path_values(run_id, node):
+    return run_values(run_id, int(node))          # {node, values: {addr: {reg,val,store?}}}
 
 
 def _mcp_decompile(addr):
@@ -747,93 +909,373 @@ def _mcp_guide():
     return {"guide": GUIDE}
 
 
-GUIDE = r"""# SEAL (Symbolic Execution Analysis Lab) — guide for agents
+GUIDE = r"""# SEAL (Symbolic Execution Analysis Lab) — operating skill for agents
 
-## What this tool does (plain terms)
-It runs ONE function with its inputs left UNKNOWN ("symbolic") and asks a solver
-questions like: "can execution reach address X?", "can this add overflow?", "can
-this write land outside a buffer?". For every YES it returns a CONCRETE set of
-inputs (a "witness") that makes it happen. You do not write exploits or guess
-inputs — you declare what is unknown, declare what to look for, then read back the
-exact inputs the solver found. A human watches the same session live in a GUI.
+You are driving SEAL, a tool that finds bugs and reachability facts in ONE function
+of a compiled binary using **symbolic execution** (the angr engine), behind a visual
+GUI that a human is watching live. This document is your complete manual. Read it
+once, top to bottom; it assumes you have never used SEAL or symbolic execution
+before. Everything you do over MCP also appears in the human's GUI in real time.
 
-## The loop (do these in order)
-1. get_status                              — is a binary loaded? is IDA connected?
-   (load_binary(path) yourself if needed; list_files(dir) to find a path.)
-2. list_functions(query)                   — pick a function; note its "addr".
-3. get_function(addr)                       — see its setup. Arguments are symbolic by default.
-4. decompile(addr) or disassemble(addr)     — read the code to decide what to check.
-5. configure / add_assumption / add_check   — set up inputs and what to look for.
-6. run(addr) -> {"run_id": ...}             — starts exploring in the background.
-7. get_run(run_id)                          — POLL until status is "done" (or "error"); read findings.
+════════════════════════════════════════════════════════════════════════
+PART 1 — THE MENTAL MODEL (read this, it prevents 90% of mistakes)
+════════════════════════════════════════════════════════════════════════
 
-## Worked example — find the input that reaches a "win" block
-list_functions -> {"addr":"0x400666","name":"main"}; decompile shows it prints
-"Congrats!" at 0x400743 only for the right input.
+Normal execution: you give a function concrete inputs, it runs one path, you see one
+result. Symbolic execution: you leave some inputs UNKNOWN (called "symbolic"), and
+the engine explores MANY paths at once, tracking a set of algebraic constraints on
+those unknowns for each path. When you ask a question — "can execution reach address
+X?", "can this multiply overflow?", "can this store land outside the buffer?" — the
+engine hands the constraints to a solver (Z3). If the answer is YES, it gives you a
+**witness**: concrete values for the unknown inputs that actually make it happen.
 
-  add_check({"addr":"0x400666","check":{"kind":"reach","addr":"0x400743"}})
-  run({"addr":"0x400666"})                 -> {"run_id":"ab12..."}
-  get_run({"run_id":"ab12..."})            # repeat until status=="done"
-  -> {"status":"done",
-      "findings":[{"kind":"reach","addr":4196675,"message":"reached 0x400743",
-                   "witness":{"arg0":{"hex":"0x5","s":5}, ".password":"IW{...}"}}]}
-  The "witness" is the answer: those inputs drive execution to 0x400743.
+So your job is NOT to write an exploit or guess inputs. Your job is three steps:
+  (1) DECLARE what is unknown      (make the inputs you want to vary "symbolic"),
+  (2) DECLARE what to look for     (add one or more "checks"),
+  (3) RUN, then READ THE WITNESS   (the concrete inputs the solver found).
 
-## Declaring inputs (configure patch, or add_assumption)
-- Arguments are symbolic by default. Make one FIXED: configure {"args":[{"name":"n","mode":"concrete","value":16,"size":4}]}.
-- Floating-point param: add "float":true to the arg (required for float checks).
-- Pointer to a symbolic buffer: {"buffers":[{"arg":"buf","size":64}]} (pointer is concrete, contents symbolic).
-- Pointer to a struct: get_struct("TYPE") gives the member layout (offset/size/type); then set members via
-  {"buffers":[{"arg":"p","size":<sizeof>,"layout":[{"offset":12,"size":4,"mode":"sym","name":"p_size"},
-  {"offset":8,"size":4,"mode":"fixed","value":0}]}]} — listed members are set (named symbolic or fixed),
-  the rest stay symbolic. Named members show up in witnesses.
-- Symbolic stdin:  {"stdin":{"mode":"symbolic","size":32}}.
-- Symbolic file the program reads: {"files":[{"name":".password","size":20}]}.
-- Constrain inputs: add_assumption(addr, "arg0 s> 0").  Limits: configure {"limits":{"steps":300,"seconds":60,"skip_calls":true}}.
+The witness is the whole point. A finding without reading its witness is useless.
 
-## Checks — add_check(addr, check). Optional: with no checks, run just enumerates the paths.
-- reach          {"kind":"reach","addr":"0x.."}           any path that gets here
-- avoid          {"kind":"avoid","addr":"0x.."}           flag paths that hit a bad address
-- assert         {"kind":"assert","expr":"total < 0x1000","at_return":true}   an invariant that must hold
-- int_overflow   {"kind":"int_overflow","signed":"either|signed|unsigned"}    add/sub/mul that wraps
-- narrowing_cast {"kind":"narrowing_cast"}                 value truncated to a smaller int, losing data
-- float_anomaly  {"kind":"float_anomaly"}                  result can be NaN or +/-Inf
-- oob_write      {"kind":"oob_write","base":"a1","size":16}  a write outside [base, base+size)
-Add "addr":"0x.." to any of the last four to check one instruction; omit it to scan the whole function.
+Critical truths that trip up every new agent:
+  • A FIXED (concrete) input can never expose a bug that depends on that input. If you
+    want the solver to find a bad `size`, `size` must be SYMBOLIC. If everything is
+    fixed, every path is concrete and SEAL finds nothing interesting.
+  • But TOO MUCH symbolic is the opposite failure: if every input and the entire
+    surrounding memory is unknown, the engine sees astronomically many paths ("path
+    explosion") and either times out or reports that "every path" looks dangerous
+    (useless). The art is making ONLY the attacker-controlled thing symbolic and
+    keeping realistic context concrete. (This is what "concolic" seeding in PART 7 is
+    for.)
+  • `run` is ASYNCHRONOUS. It returns a run_id immediately; the exploration happens in
+    the background. You MUST poll `get_run(run_id)` until status is "done" or "error"
+    before the findings are complete.
+  • One function at a time. SEAL analyses a single function's body; calls out to other
+    functions are either stepped into, skipped, or modeled (PART 9) — your choice.
 
-## Expression language (used by assumptions and assert "expr")
-names: argument names, a1../arg0.. (parameters), registers (rdi, eax), ret (return value)
-compare: == != < <= > >=  (unsigned). Prefix s for signed: s< s<= s> s>=
-arith/bitwise: + - * / % & | ^ ~ << >>   (s>> arithmetic shift, s/ s% signed)
-widths: u8/u16/u32/u64 (low bits, unsigned), s8/s16/s32/s64 (sign-extend). memory: mem(addr, size)
-examples:  "a1 & 0xff == 0x5a"    "u32(x) + 8 < u32(x)"    "ret s>= 0"
+════════════════════════════════════════════════════════════════════════
+PART 2 — CONNECT
+════════════════════════════════════════════════════════════════════════
 
-## Modeling calls (hooks) — for bugs that span library calls
-When the analysed function calls others (malloc, size helpers, read/write), you usually
-don't want to execute their real code. `skip_calls` returns "anything" (useless if you
-care about the result), and stepping in is expensive. Instead MODEL a call with add_model
-(or configure {"models":[...]}). Kinds:
-  - {"func":"TIFFScanlineSize","kind":"symbolic","name":"size","bits":64}  # fresh symbolic return
-  - {"func":"_TIFFmalloc","kind":"alloc","size_arg":0}      # allocate a buffer sized by arg0, TRACKED
-  - {"func":"TIFFReadScanline","kind":"concrete","value":0} # no-op returning success
-  - {"func":"foo","kind":"return_arg","arg":0}              # return the first argument
-Then an oob_write check with NO base checks every write against the tracked allocations —
-so "model malloc as alloc + add oob_write" finds heap overflows (e.g. CVE-2017-5225).
-IMPORTANT: skip_calls BYPASSES models, so leave it off and model every heavy call the
-function makes (reads/writes/allocs), or the run won't stay bounded.
+SEAL exposes a built-in MCP server (Streamable HTTP) at the /mcp endpoint of the same
+host/port as the GUI (e.g. http://127.0.0.1:8770/mcp). No authentication. Do the
+standard handshake: initialize → tools/list → tools/call. The initialize response's
+`instructions` field, and the `get_guide` tool, both return THIS document — reread it
+any time.
 
-## Scenarios (optional)
-A function can have several scenarios — different ways it is reached, each with its
-own initial state; the checks are SHARED. configure/add_assumption/run act on the
-ACTIVE scenario. Tools: add_scenario(name,duplicate), select_scenario, rename_scenario, delete_scenario.
+Everything you call is published to the GUI's live "Activity" feed, and with "follow
+agent" on (default) the human's view auto-jumps to the function you configure and the
+run you start. You are performing for an audience; narrate nothing, just operate — the
+GUI shows them what you did.
 
-## Gotchas
-- Addresses in: hex string "0x400743" or a function name. Addresses out (in findings): integers.
-- run is ASYNC — always poll get_run until status is "done" or "error".
-- A witness maps input name -> value: {"hex","s"} for a number, a byte string for stdin/files. That IS the triggering input.
-- Found nothing? Widen limits, or check your assumptions aren't over-constraining. remove_assumption / remove_check undo mistakes.
-- decompile needs IDA (get_status.ida.connected); else use disassemble. ida_connect(url) connects.
-- Call get_guide any time to reread this.
+════════════════════════════════════════════════════════════════════════
+PART 3 — THE CORE LOOP (the happy path, in order)
+════════════════════════════════════════════════════════════════════════
+
+1. get_status
+     Is a binary loaded? Is IDA connected (for names/decompilation)? If no binary,
+     load one yourself: list_files(dir) to browse, then load_binary(absolute_path).
+2. list_functions(query)
+     Find your target by name or address substring. Note its integer "addr". For a
+     big stripped binary most functions are "sub_<addr>" with named:false — that's
+     normal; search by address or connect IDA for names.
+3. get_function(addr)
+     Read the current setup: the active scenario's initial state (args, buffers,
+     assumptions, stdin, files, limits, models, initial_state), the shared checks, and
+     the list of scenario names. Arguments are symbolic by default.
+4. disassemble(addr)   (or decompile(addr) if IDA is connected)
+     READ THE CODE. Decide which inputs matter and where the interesting
+     operations/branches are. You cannot check well what you have not read.
+5. configure(addr, patch)  /  add_assumption(addr, expr)  /  add_check(addr, check)
+     Declare inputs (what is symbolic vs fixed, buffers, structs, stdin, files),
+     constrain them to realistic ranges, and declare what to look for.
+6. run(addr)  ->  {"run_id": "..."}
+     Starts exploring in the background.
+7. get_run(run_id)
+     POLL until status == "done" (or "error"). Then read `findings`: each has a kind,
+     an address, a message, a `witness` (the triggering inputs), and belongs to a node
+     in the `tree` (the path tree). Optionally call path_values(run_id, node) for the
+     concrete value assigned on each line of that path.
+
+That is the whole loop. Everything below is detail for doing step 5 well and reading
+step 7 correctly.
+
+════════════════════════════════════════════════════════════════════════
+PART 4 — DECLARING INPUTS (the `configure` patch, and add_assumption)
+════════════════════════════════════════════════════════════════════════
+
+`configure(addr, patch)` replaces the given keys of the ACTIVE scenario. The patch may
+contain any of: args, buffers, assumptions, stdin, files, limits, models,
+initial_state. (checks are shared, not per-scenario, but configure also accepts a
+"checks" key as a convenience.)
+
+ARGS — the function's parameters. Each: {"name","mode","size","value","float"}.
+  • mode "symbolic" (default): the solver may choose any value. This is what exposes
+    bugs. size is in BYTES (4 = 32-bit, 8 = 64-bit).
+  • mode "concrete": a fixed value you supply in "value". Use for context you know.
+  • "float": true marks a floating-point parameter (REQUIRED before a float_anomaly
+    check or any FP reasoning works on it).
+  Example: configure(a, {"args":[{"name":"n","mode":"concrete","value":16,"size":4},
+                                  {"name":"buf","mode":"symbolic","size":8}]})
+
+BUFFERS — point a pointer argument at a fresh buffer whose CONTENTS are symbolic (the
+pointer itself is a concrete scratch address). {"arg","size","layout"}.
+  • Plain symbolic buffer: {"buffers":[{"arg":"buf","size":64}]}.
+  • Struct layout: when the pointer is to a struct, call get_struct("TYPE") (needs IDA)
+    to get the member offsets/sizes/types, then set specific members and leave the rest
+    symbolic:
+      {"buffers":[{"arg":"p","size":<sizeof>,"layout":[
+         {"offset":12,"size":4,"mode":"sym","name":"p_size"},   # named symbolic member
+         {"offset":8, "size":4,"mode":"fixed","value":0}]}]}    # pinned member
+    Named symbolic members show up in witnesses by name — much more readable.
+
+STDIN / FILES — for programs that read input:
+  • Symbolic stdin: {"stdin":{"mode":"symbolic","size":32}}.
+  • A symbolic file the program opens by name (e.g. a CTF password file):
+    {"files":[{"name":".password","size":20}]}.
+
+ASSUMPTIONS — constrain the unknowns so the solver stays in realistic territory and
+doesn't report absurd witnesses. add_assumption(addr, "arg0 s> 0"). They are boolean
+expressions that must hold at entry (see PART 8 for the language). Over-constraining is
+a common reason you "find nothing" — if a run is empty, suspect your assumptions first.
+
+LIMITS — bound the exploration. configure(a, {"limits":{...}}):
+  • steps: max simulation steps (default ~200). Raise for deep functions.
+  • active: max simultaneous paths kept (default ~400). Raise for wide branching.
+  • seconds: wall-clock cap.
+  • skip_calls: true makes calls to other functions return a fresh unconstrained value
+    instead of being executed — keeps exploration inside the target function. BUT it
+    BYPASSES models (PART 9), so don't set it when you rely on modeled allocations.
+  • loop_bound: cap iterations of a loop with a symbolic trip count (stops infinite
+    unrolling). find / avoid: optional target/forbidden addresses for directed search.
+
+════════════════════════════════════════════════════════════════════════
+PART 5 — CHECKS (what to look for).  add_check(addr, check); or remove_check.
+════════════════════════════════════════════════════════════════════════
+
+With NO checks, `run` simply enumerates the reachable paths (useful to see control
+flow). Add checks to hunt specific conditions. Every check may take an optional
+"addr" to pin it to ONE instruction; omit "addr" to scan the whole function.
+
+  • reach   {"kind":"reach","addr":"0x.."}
+        A finding for any path that reaches that address. Witness = the inputs that get
+        there. THE tool for "what input makes it print the flag / hit this branch".
+  • avoid   {"kind":"avoid","addr":"0x.."}
+        Flags (and marks) paths that reach a bad address.
+  • assert  {"kind":"assert","expr":"total < 0x1000","at_return":true}
+        An invariant that must ALWAYS hold. A finding is any input that BREAKS it (the
+        counterexample). "at_return":true evaluates it at the function's return.
+  • int_overflow  {"kind":"int_overflow","signed":"either|signed|unsigned"}
+        An add/sub/mul whose result wraps past the type width. Witness = operands that
+        wrap (e.g. a size near INT_MAX). Classic size-computation bug.
+  • narrowing_cast  {"kind":"narrowing_cast"}
+        A value truncated to a smaller integer where the dropped high bits can be
+        non-zero (information lost). Catches BOTH ordinary C casts (long→int) AND NEON
+        vector-lane truncation like arm64 `xtn` (this is the root cause of the
+        CoreGraphics CVE we validate — a float→int64 that is then truncated to int32
+        without saturation). Witness = the input that makes the high bits non-zero.
+  • float_anomaly  {"kind":"float_anomaly"}
+        A floating-point op whose result can be NaN or ±Inf. Mark the relevant arg
+        "float":true first.
+  • oob_write  {"kind":"oob_write","base":"a1","size":16}
+        A memory write that can land outside [base, base+size). "base" may be an
+        argument name / expression and "size" its length. OMIT base to check every
+        write against the allocations tracked by your alloc models (PART 9) — that is
+        how you find heap overflows across library calls.
+  • custom  {"kind":"custom","addr":"0x..","code":"def check(state, api): ..."}
+        Run your own Python predicate at a point; return a dict to record a finding.
+
+════════════════════════════════════════════════════════════════════════
+PART 6 — READING RESULTS (don't skip this — it's half the job)
+════════════════════════════════════════════════════════════════════════
+
+get_run(run_id) returns:
+  • status: "pending" | "running" | "done" | "error" | "cancelled". POLL until it's
+    not pending/running.
+  • findings: a list. Each: {kind, addr (integer), message, witness, extra, node}.
+  • tree: the path tree — nodes with ids, parent links, the block addresses on each
+    path, and per-leaf an "example" (inputs for that path) and a classification
+    (deadended / returned / unconstrained / errored).
+  • summary: counts.
+
+THE WITNESS maps each input NAME to its value:
+  • a number → {"hex": "0x..", "s": <signed decimal>, "bits": N}. That is the exact
+    value the solver chose. For a narrowing/overflow finding it's the value that
+    triggers the bug; for a reach it's the input that gets there.
+  • stdin / a file → a byte string.
+Read it and report it — it is the proof.
+
+"unconstrained" leaves are a strong signal: execution reached a state where the
+instruction pointer itself became attacker-controlled (e.g. a jump through a symbolic
+function pointer) — a control-flow-hijack lead. The leaf still carries an example.
+
+path_values(run_id, node): for the chosen path, the concrete value assigned at each
+instruction — {addr: {reg, val, store}}. This is what the GUI overlays on the
+decompilation/disassembly so the human sees the real value on each line.
+
+cancel_run(run_id): stop a run still exploring. export_scenario(addr): bundle the
+active scenario + shared checks + the latest run's findings into a portable blob.
+
+════════════════════════════════════════════════════════════════════════
+PART 7 — CONCOLIC SEEDING FROM A REAL RUN (initial_state / snapshots)
+════════════════════════════════════════════════════════════════════════
+
+The default start is a "fresh call": the engine builds a call state with symbolic
+arguments and otherwise-empty memory. That's fine for small, self-contained functions.
+But for a function deep inside a real library, a fresh call is both WRONG (the real
+surrounding structs/buffers aren't there) and INTRACTABLE (everything is symbolic →
+path explosion). The fix is CONCOLIC seeding: start from a snapshot of a REAL execution
+(concrete registers + memory captured from a live process), and make ONLY the
+attacker-controlled fields symbolic. Then exploration follows realistic paths and the
+bug condition comes out as a PRECISE threshold instead of "every path".
+
+You set this with the scenario's `initial_state`:
+  {"kind":"snapshot",
+   "pc":   <start address>,                      # where to begin (may be mid-function)
+   "regs": {"x0":..., "x1":..., "sp":..., ...},  # concrete registers from the capture
+   "mem":  [{"addr":..., "hex":"...."}, ...],    # concrete memory regions
+   "symbolic":[{"reg":"x1","name":"coord","size":8},   # fields to make symbolic:
+               {"addr":0x.., "name":"len","size":4}],  #   a register OR a memory addr
+   "image":{"slide":0x.., "file_lo":0x.., "file_hi":0x..}}  # optional, see rebasing
+
+Two things SEAL does for you here:
+  • It will seed MID-function: `pc` is authoritative even though `regs` also contains a
+    saved pc — so you can start right at the instruction you care about.
+  • REBASING: a snapshot captured from a live process holds runtime (ASLR-slid)
+    addresses, but SEAL loads the binary at its FILE addresses. If you include
+    "image":{"slide",...}, SEAL rebases the snapshot down into file-address space for
+    you (pc, registers, memory region bases, and pointer slots inside the bytes; heap
+    and stack addresses are left alone). You pass the raw captured snapshot + the
+    slide; SEAL does the math.
+
+HOW TO CAPTURE A SNAPSHOT (outside SEAL — lldb can't run inside it): the repo ships
+angrgui/snapshot/capture.py (an lldb script that dumps registers + pointer-reachable
+memory in exactly this shape and records the image slide) and live_bp.py (break by
+ADDRESS in a shared-cache image — breaking by a stripped local symbol name hangs).
+Capture at the TRUE function entry (lldb: --skip-prologue false) or the argument
+registers will already be spilled and dead. See docs/ARCHITECTURE.md "Concolic
+seeding" for the full workflow. Then feed the JSON straight into initial_state.
+
+════════════════════════════════════════════════════════════════════════
+PART 8 — THE EXPRESSION LANGUAGE (assumptions and assert "expr")
+════════════════════════════════════════════════════════════════════════
+
+names:    argument names, a1../arg0.. (parameters), registers (rdi, eax, x0…), ret
+          (the return value), and mem(addr, size) to read memory.
+compare:  == != < <= > >=   are UNSIGNED. Prefix s for signed: s< s<= s> s>=.
+          (Getting signedness wrong silently changes the result — be deliberate.)
+arith/bitwise:  + - * / % & | ^ ~ << >>    (s>> arithmetic shift; s/ s% signed div/mod)
+widths:   u8/u16/u32/u64 take the low N bits unsigned; s8/s16/s32/s64 sign-extend.
+examples: "a1 & 0xff == 0x5a"      "u32(x) + 8 < u32(x)"      "ret s>= 0"
+
+════════════════════════════════════════════════════════════════════════
+PART 9 — MODELING CALLS (bugs that span library calls)
+════════════════════════════════════════════════════════════════════════
+
+When your function calls others (malloc, size helpers, read/write), executing their
+real code is slow and often impossible (no real heap, missing deps). `skip_calls`
+returns "anything" which is useless if the result matters. Instead MODEL the call with
+add_model(addr, model) (or configure {"models":[...]}):
+  • {"func":"TIFFScanlineSize","kind":"symbolic","name":"size","bits":64}  fresh symbolic return
+  • {"func":"_TIFFmalloc","kind":"alloc","size_arg":0}        allocate a buffer sized by arg0, TRACKED
+  • {"func":"read","kind":"concrete","value":0}               no-op returning a fixed value
+  • {"func":"foo","kind":"return_arg","arg":0}                return the Nth argument
+An `oob_write` check with NO base then checks every write against the TRACKED
+allocations — so "model malloc as alloc + add oob_write" finds heap overflows across
+calls. IMPORTANT: skip_calls BYPASSES models, so when you model calls, leave skip_calls
+OFF and model every heavy call (allocs/reads/writes) so the run stays bounded.
+
+════════════════════════════════════════════════════════════════════════
+PART 10 — SCENARIOS
+════════════════════════════════════════════════════════════════════════
+
+A function can have several SCENARIOS — different ways it is reached, each with its own
+initial state (args, buffers, stdin, files, assumptions, limits, models, initial_state).
+The CHECKS are SHARED across scenarios. configure / add_assumption / run always act on
+the ACTIVE scenario. Manage with add_scenario(name, duplicate?), select_scenario,
+rename_scenario, delete_scenario (each by name or index). Use scenarios to compare,
+e.g., a fresh-call setup vs a concolic-snapshot setup of the same function.
+
+════════════════════════════════════════════════════════════════════════
+PART 11 — ARM64 / arm64e NOTES (iOS / macOS system binaries)
+════════════════════════════════════════════════════════════════════════
+
+SEAL runs on arm64 and arm64e, not just x86-64. At load it applies a portable runtime
+patch (angrgui/angr_arm_patch.py) that teaches angr the NEON vector IR ops it ships
+without (XTN/narrowing, saturating-narrow, byte-reverse, etc.) and hooks arm64e
+pointer-authentication instructions (pacibsp/retab/braa/…) which libVEX cannot decode.
+Big dyld-shared-cache dylibs (tens of thousands of functions) load in "lazy" mode:
+functions are indexed from the symbol/segment table and each one's control-flow graph
+is built on demand when you select it — so a 9 MB framework opens in seconds. A few
+rare NEON ops (some saturating/rounding shifts, LSE atomics) are intentionally NOT
+implemented: a wrong handler would silently corrupt analysis, so SEAL raises a clean
+error instead — if you hit one in a hot path, it needs a real handler added.
+
+════════════════════════════════════════════════════════════════════════
+PART 12 — RECIPES (copy the shape, get real addresses from list_functions)
+════════════════════════════════════════════════════════════════════════
+
+A · Reach a target (CTF "find the input that wins")
+   f = list_functions("check")[0]
+   decompile(f.addr)                                   # find the "you win" block @ 0x4012f0
+   configure(f.addr, {"args":[{"name":"key","mode":"symbolic","size":8}]})
+   add_check(f.addr, {"kind":"reach","addr":0x4012f0})
+   rid = run(f.addr).run_id ; poll get_run(rid)
+   # finding "reach"; witness {key: 0x5365637265743121} → that input gets there.
+
+B · Integer overflow (size computation wraps past 2³²)
+   configure(a, {"args":[{"name":"size","mode":"symbolic","size":4},
+                         {"name":"len","mode":"symbolic","size":4}]})
+   add_assumption(a, "size < 0x80000000")              # keep it realistic
+   add_check(a, {"kind":"int_overflow","signed":false})
+   rid = run(a).run_id ; poll get_run(rid)
+   # finding: size+len wraps; witness size≈0xffffffff, len=1 → tiny alloc, huge copy.
+
+C · Narrowing cast / the CoreGraphics-CVE shape (float→int truncation)
+   # concolic: start at the narrowing instruction with the scaled coordinate symbolic
+   configure(a, {"initial_state":{"kind":"snapshot","pc":0x<runtime xtn>,
+                   "regs":{...captured...},"mem":[...captured...],
+                   "symbolic":[{"reg":"v0","name":"coord","size":16}],
+                   "image":{"slide":0x10984000,"file_lo":0x..,"file_hi":0x..}}})
+   add_check(a, {"kind":"narrowing_cast"})
+   rid = run(a).run_id ; poll get_run(rid)
+   # finding "narrowing 64->32 bits may lose data at xtn …"; witness = the lanes whose
+   # high bits are non-zero → the value the truncation corrupts.
+
+D · Heap overflow across library calls
+   add_model(a, {"func":"_TIFFmalloc","kind":"alloc","size_arg":0,"name":"buf"})
+   add_model(a, {"func":"TIFFScanlineSize","kind":"symbolic","bits":32})
+   configure(a, {"limits":{"skip_calls":false}})       # models only run if calls aren't skipped
+   add_check(a, {"kind":"oob_write"})                   # no base → vs tracked allocations
+   rid = run(a).run_id ; poll get_run(rid)
+   # finding: a scanline size writes past the modeled buffer; witness = that size.
+
+E · Invariant / assertion (prove a property or get a counterexample)
+   configure(a, {"args":[{"name":"n","mode":"symbolic","size":4}]})
+   add_check(a, {"kind":"assert","expr":"ret s>= 0","at_return":true})
+   rid = run(a).run_id ; poll get_run(rid)
+   # if the invariant can be false: finding with the n that makes the return negative.
+
+════════════════════════════════════════════════════════════════════════
+PART 13 — GOTCHAS (the list of things that will waste your time)
+════════════════════════════════════════════════════════════════════════
+
+• Addresses IN are a hex string "0x400743" or a function name; addresses OUT (in
+  findings) are integers.
+• run is ASYNC — always poll get_run until status is "done"/"error" before trusting
+  findings.
+• No findings? In order: (1) is the input you care about actually SYMBOLIC? (2) are
+  your assumptions over-constraining? (3) raise limits (steps/active/seconds); (4) did
+  the run even reach the code — check the tree. remove_assumption / remove_check undo.
+• Too many/garbage findings or a timeout? You made too much symbolic — pin realistic
+  context (concrete args, or concolic snapshot) and constrain with assumptions.
+• skip_calls BYPASSES models. If you modeled allocs/reads and see nothing, skip_calls
+  is probably on.
+• decompile needs IDA connected (get_status.ida.connected). Otherwise use disassemble.
+  ida_connect(url) connects to a running IDA's MCP (often on another host/VM).
+• A float check needs the arg marked "float":true first.
+• For concolic seeding, pass the slide in initial_state.image and SEAL rebases; capture
+  at the true function entry or the argument registers are already dead.
+• Call get_guide any time to reread this whole manual.
 """
 
 _A = {"addr": {"type": "string", "description": "function address, e.g. \"0x400650\", or name"}}
@@ -863,6 +1305,9 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {**_A, "check": {"type": "object"}}, "required": ["addr", "check"]}},
     {"name": "run", "description": "Explore the function's paths using its active scenario, watching for the enabled checks (checks are optional — with none it just enumerates paths). Returns a run_id.",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
+    {"name": "path_values", "description": "Per-instruction destination values on one path (node id from get_run's paths): "
+     "{addr: {reg, val, store}} — the concrete value of the variable assigned on each decompilation line for that path.",
+     "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}, "node": {"type": "integer"}}, "required": ["run_id", "node"]}},
     {"name": "get_run", "description": "Results of a run: status, findings (with concrete witnesses), and the path tree.",
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
     {"name": "load_binary", "description": "Load an ELF binary by absolute path (replaces the current one). Analyses before returning.",
@@ -944,6 +1389,7 @@ _MCP_TOOLS = {
     "add_check": lambda a: _mcp_add(a["addr"], check=a["check"]),
     "run": lambda a: _mcp_run(a["addr"]),
     "get_run": lambda a: _mcp_get_run(a["run_id"]),
+    "path_values": lambda a: _mcp_path_values(a["run_id"], a["node"]),
     "load_binary": lambda a: _mcp_load_binary(a["path"]),
     "add_scenario": lambda a: _mcp_add_scenario(a["addr"], a.get("name"), a.get("duplicate", False)),
     "select_scenario": lambda a: _mcp_select_scenario(a["addr"], a["scenario"]),

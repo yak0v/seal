@@ -18,6 +18,54 @@ custom       : a user Python snippet `def check(state, api): -> dict | None`.
 
 Each hit is a dict:
     {check_id, kind, addr, message, witness: {name: value}, extra: {...}}
+
+ROLE
+----
+Every check subclasses ``BaseCheck``. Two flavours:
+* **breakpoint-driven** (``installs_breakpoint = True``): installs angr ``inspect``
+  hooks (``expr`` / ``mem_write`` / …) and fires as states are built — e.g.
+  ``int_overflow``, ``narrowing_cast``, ``float_anomaly``, ``oob_write``. These see
+  sub-expressions the explorer never stashes.
+* **state-observing** (``installs_breakpoint = False``): inspected at block heads via
+  ``note_state`` — e.g. ``reach`` / ``avoid`` / ``assert``.
+A check records a hit only when the condition is actually *satisfiable* and attaches a
+concrete ``witness`` (``_witness_with``) proving it.
+
+WHY IT'S LIKE THIS
+------------------
+* **``oob_write`` is anchor+oob, not "belongs AND oob".** The explicit-mode region test
+  used to require the write to be both inside the buffer AND outside it — a contradiction,
+  so it NEVER fired. It now *anchors* the write to the buffer over a window and flags when
+  the address can leave ``[base, base+size)`` (also catching writes already forced out of
+  range). See ``_check_region``.
+* **``narrowing_cast`` understands NEON vector narrowing, not just scalar C casts.** The
+  scalar case is ``Extract(small-1:0, inner)`` with standard widths. But a real ARM ``xtn``
+  (our ``angr_arm_patch`` ``NarrowUn`` handler) emits ``Concat`` of per-lane low-half
+  ``Extract``s whose ``inner`` is a **128-bit vector** — so the old scalar-only check was
+  blind to it and found nothing on the exact CVE-2026-86950 instruction. ``_narrowing``
+  now matches BOTH shapes and reports the per-lane 2N→N narrowing. See ``_narrowing``.
+* **Checks observe, they don't steer.** Installing as inspect hooks means a check never
+  changes the search — add/remove one and the path set is identical, only the findings
+  differ.
+
+EXTENDING  (add a new check kind)
+---------------------------------
+1. Subclass ``BaseCheck``; set ``kind`` and ``installs_breakpoint``.
+2. For a breakpoint check, implement ``install(state)`` (register the inspect hook) and an
+   ``_on_*`` handler that calls ``self._record(...)`` with a satisfiable witness; for a
+   state check, implement the per-state hook used by ``note_state``.
+3. Register the class in ``CHECK_TYPES`` (the kind→class dict near the bottom) so
+   ``build_check`` can construct it; add its schema to the MCP/GUI docs.
+
+PITFALLS
+--------
+* Only record when ``state.solver.satisfiable([cond])`` — an unsatisfiable condition is
+  not a finding. Always attach the witness that proves it (dedup with ``dedup_key``).
+* ``narrowing_cast``/``int_overflow`` read claripy AST structure; a change to how
+  ``angr_arm_patch`` builds an op (e.g. the ``Concat`` lane order) can silently stop a
+  match — keep the handler and the matcher in sync.
+* Breakpoint checks fire on EVERY sub-expression; keep handlers cheap and bail fast on
+  the common no-match case.
 """
 from __future__ import annotations
 
@@ -139,6 +187,24 @@ def witness_of(state) -> dict:
             try:
                 v = state.solver.eval(ast)
                 out[nm] = _fmt(v, ast.size())
+            except Exception:
+                pass
+    # per-struct-member values for buffers that carry a member map, so the code view
+    # and path detail can show e.g. `tif->tif_diroff = 0x...` (scalar members only;
+    # little-endian, read from the initial symbolic buffer)
+    for bufname, members in (state.globals.get("angrgui_bufmembers") or {}).items():
+        buf = names.get(bufname)
+        if not (isinstance(buf, claripy.ast.Base) and buf.op == "BVS"):
+            continue
+        n = buf.size()
+        for off, size, mname in members[:96]:
+            if not (1 <= size <= 8) or off * 8 + size * 8 > n:
+                continue
+            try:
+                parts = [buf[n - 1 - 8 * (off + i):n - 8 * (off + i) - 8] for i in range(size)]
+                bv = parts[0] if size == 1 else claripy.Concat(*reversed(parts))
+                if bv.symbolic:                       # only report fields the inputs actually fix
+                    out[mname] = _fmt(state.solver.eval(bv), size * 8)
             except Exception:
                 pass
     # stdin, if any
@@ -448,19 +514,59 @@ class NarrowingCastCheck(BaseCheck):
     def install(self, state):
         state.inspect.b("expr", when=angr.BP_AFTER, action=self._on_expr)
 
+    @staticmethod
+    def _narrowing(r):
+        """Recognise a truncating narrow and return (small, big, dropped_bits) or None.
+
+        Two shapes:
+          * scalar C cast  -> Extract(small-1:0, inner)          [inner wider, same value]
+          * NEON xtn lane  -> Concat(inner[2k·s+s-1:2k·s] ...)   [low half of each 2s-wide
+            lane of one vector] — our angr_arm_patch NarrowUn handler emits exactly this.
+        `dropped` is the bits thrown away (must be able to be non-zero to be a finding)."""
+        if not isinstance(r, claripy.ast.BV):
+            return None
+        if r.op == "Extract":                       # scalar: Extract(small-1 : 0, inner)
+            hi, lo, inner = r.args
+            if lo != 0 or not isinstance(inner, claripy.ast.BV):
+                return None
+            small, big = hi + 1, inner.size()
+            if small >= big or small not in _STD_WIDTHS or big not in _STD_WIDTHS:
+                return None
+            if not inner.symbolic:
+                return None
+            return small, big, inner[big - 1:small]
+        if r.op == "Concat":                        # vector xtn: Concat of lane low-halves
+            args = r.args
+            if len(args) < 2 or any(a.op != "Extract" for a in args):
+                return None
+            inner = args[0].args[2]
+            if not isinstance(inner, claripy.ast.BV) or not inner.symbolic:
+                return None
+            if any(a.args[2] is not inner for a in args):
+                return None
+            small = args[0].args[0] - args[0].args[1] + 1   # width of each extracted lane
+            if small not in _STD_WIDTHS:
+                return None
+            # each arg must be the low `small` bits of a 2*small-wide lane; collect dropped halves
+            dropped = []
+            for i, a in enumerate(reversed(args)):          # Concat is big-endian: last arg = lane 0
+                base = i * 2 * small
+                if a.args[1] != base or a.args[0] != base + small - 1:
+                    return None
+                if base + 2 * small > inner.size():
+                    return None
+                dropped.append(inner[base + 2 * small - 1: base + small])
+            # per-lane narrowing is 2*small -> small (e.g. xtn: 64 -> 32 on each lane)
+            return small, 2 * small, claripy.Concat(*dropped) if len(dropped) > 1 else dropped[0]
+        return None
+
     def _on_expr(self, state):
         insp = state.inspect
         r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
-        if r is None or not isinstance(r, claripy.ast.BV) or r.op != "Extract":
+        nar = self._narrowing(r)
+        if nar is None:
             return
-        hi, lo, inner = r.args
-        if lo != 0 or not isinstance(inner, claripy.ast.BV):
-            return
-        small, big = hi + 1, inner.size()
-        if small >= big or small not in _STD_WIDTHS or big not in _STD_WIDTHS:
-            return
-        if not inner.symbolic:
-            return
+        small, big, dropped = nar
         ins_addr = state.scratch.ins_addr
         if ins_addr is None:
             return
@@ -470,7 +576,6 @@ class NarrowingCastCheck(BaseCheck):
         elif not self.ctx.in_target_function(ins_addr):
             return
         # a finding only if the bits we drop can actually be non-zero
-        dropped = inner[big - 1:small]
         cond = dropped != 0
         try:
             if not state.solver.satisfiable(extra_constraints=[cond]):
@@ -627,21 +732,30 @@ class BufferBoundsCheck(BaseCheck):
                 self._check_region(state, ins_addr, wa, length, base_bv, size_bv, end_bv, "its allocated buffer")
 
     def _check_region(self, state, ins_addr, wa, length, base, size_bv, end, label):
-        # the write at [wa, wa+length) belongs to this buffer, and can leave [base, base+size)
-        belongs = claripy.And(claripy.UGE(wa, base), claripy.ULT(wa, end)) if end is not None \
-            else claripy.And(claripy.UGE(wa, base), claripy.ULE(wa + length, base + size_bv))
+        # A finding = the write [wa, wa+length) is ANCHORED to this buffer (its address
+        # derives from base — it lands within a generous window around base, which rules
+        # out unrelated pointers) and CAN leave [base, base+size). We deliberately do NOT
+        # require it to also be in-bounds: on a path whose constraints already force the
+        # index out of range, the write is a *definite* overflow and must still fire.
+        REGION = 0x100000                    # 1 MiB window = "derived from this buffer"
+        if end is not None:                  # modeled allocation: confine to its region
+            anchor = claripy.And(claripy.UGE(wa, base), claripy.ULT(wa, end))
+        else:                                # explicit buffer: a window on both sides of base
+            anchor = claripy.And(claripy.UGE(wa, base - REGION), claripy.ULT(wa, base + REGION))
         oob = claripy.Or(claripy.ULT(wa, base), claripy.UGT(wa + length, base + size_bv))
         try:
-            if not state.solver.satisfiable(extra_constraints=[belongs, oob]):
+            if not state.solver.satisfiable(extra_constraints=[anchor, oob]):
                 return
-            if end is not None and not state.solver.satisfiable(extra_constraints=[belongs, claripy.ULE(wa + length, base + size_bv)]):
-                return                       # never in bounds here -> not a buffer access
         except Exception:
             return
-        witness = self._witness_with(state, [belongs, oob])
+        region = [anchor]
+        witness = self._witness_with(state, region + [oob])
         where = base_v = size_v = None
         try:
-            tmp = state.copy(); tmp.add_constraints(belongs); tmp.add_constraints(oob)
+            tmp = state.copy()
+            for c in region:
+                tmp.add_constraints(c)
+            tmp.add_constraints(oob)
             where = tmp.solver.eval(wa); base_v = tmp.solver.eval(base); size_v = tmp.solver.eval(size_bv)
         except Exception:
             pass

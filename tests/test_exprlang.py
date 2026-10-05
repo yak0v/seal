@@ -37,6 +37,19 @@ def test_arithmetic_constants():
     assert ev("0x10 - 1") == 15
 
 
+def test_ternary():
+    x = claripy.BVS("x", 64)
+    ast = ev("x == 0 ? 10 : 20", {"x": x})
+    s = claripy.Solver(); s.add(x == 0)
+    assert s.eval(ast, 1)[0] == 10
+    s2 = claripy.Solver(); s2.add(x == 5)
+    assert s2.eval(ast, 1)[0] == 20
+    # nested / inside parens
+    ast2 = ev("(x & 1) == 0 ? 1 : 2", {"x": x})
+    s3 = claripy.Solver(); s3.add(x == 4)
+    assert s3.eval(ast2, 1)[0] == 1
+
+
 def test_comparison_on_symbols():
     x = claripy.BVS("x", 32)
     ast = ev("x < 0x100", {"x": x})

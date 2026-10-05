@@ -18,10 +18,65 @@ A "run spec" (what the UI sends) looks like:
   "checks": [ ...check specs... ],
   "limits": {"steps":200,"active":400,"seconds":30,"find":null,"avoid":[]}
 }
+
+ROLE
+----
+``Run`` owns one exploration: it builds the initial ``SimState`` from the spec,
+installs the checks, drives the ``SimulationManager``, records the path tree +
+findings, and emits live events. ``trace_assignments`` is a separate concrete
+re-execution used only to annotate decompilation lines with per-line values.
+
+WHY IT'S LIKE THIS
+------------------
+* **Two ways to build the start state (``_build_state``).** A fresh *call_state*
+  (symbolic args — the classic CTF/library workflow) OR a *snapshot* seed when the
+  spec carries ``initial_state.kind == "snapshot"`` (concolic: start from a REAL
+  captured machine state and make only the marked fields symbolic). The snapshot path
+  is what lets SEAL analyse deep, context-heavy code (e.g. a CoreGraphics rasterizer)
+  without the state explosion of all-symbolic inputs.
+* **``_set_arg`` is arch-aware on purpose.** It used to hard-code x86-64 arg registers
+  (``rdi``/``rsi``/…) and crashed with ``KeyError: 'rdi'`` on AArch64. It now resolves
+  argument locations from the calling convention / prototype, falling back to the
+  per-arch register list — so the same run spec works on x86-64 and arm64(e).
+* **Snapshot seeding has a sharp subtlety (``_build_state_from_snapshot``).** The
+  captured ``regs`` dict *includes* ``pc`` (the capture address). If we blindly set every
+  register, that ``pc`` would overwrite the ``blank_state(addr=...)`` start address — so a
+  caller could never seed MID-function. We therefore SKIP ``pc``/``ip`` in the register
+  loop and set ``pc`` authoritatively from the snapshot's top-level ``pc``. This is what
+  makes "start at the xtn, not the function entry" work.
+* **In-SEAL slide rebasing.** If the snapshot carries ``image.slide`` (it came from a
+  live, ASLR-slid process), ``_build_state_from_snapshot`` rebases it into the binary's
+  file-address space via ``snapshot/rebase.py`` *before* using it — because cle keeps the
+  Mach-O at file addresses (see ``engine.py`` on why ``base_addr`` can't do this).
+* **``trace_assignments`` mirrors the run concretely.** It re-executes the chosen path
+  with concrete inputs to read the value written on each line. It now honors a snapshot
+  ``initial_state`` too, pinning the symbolic fields to the finding's witness so the
+  per-line values reflect the real seeded run, not a fresh call.
+
+EXTENDING
+---------
+* New input kind (e.g. symbolic env/argv): add it to the spec, seed it in
+  ``_build_state`` (call_state branch) and surface the name so it appears in witnesses.
+* New call-model kind: see ``_install_models`` / the models handling and ``checks`` /
+  ``server`` where models are declared.
+* New start-state source (another capture format): emit the neutral snapshot shape and
+  reuse ``_build_state_from_snapshot``; don't special-case it in the explore loop.
+
+PITFALLS
+--------
+* ``skip_calls`` (CALLLESS) BYPASSES call models — a call returns an unconstrained
+  value instead of running the model. For model-dependent bugs, leave it OFF and model
+  every heavy call, or the run won't stay bounded.
+* A snapshot seed is only self-consistent in ONE address space. If ``image.slide`` is
+  wrong/missing, pc and code pointers won't line up with the loaded binary and the run
+  dies early (e.g. an IR-decode error in unrelated code).
+* The explorer prunes to a single path when inputs are concrete (``trace_assignments``);
+  don't reuse that helper for multi-path analysis.
 """
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -90,6 +145,7 @@ class Run:
         self._printer = str
         self._return_addr = None
         self._loop_bound = 0
+        self._skip_ret_names: dict = {}        # call-site addr -> readable name for its skipped-call return
 
     # ------------------------------------------------------------------ control
     def cancel(self):
@@ -111,6 +167,61 @@ class Run:
             return claripy.BVV(val & ((1 << bits) - 1), bits), False
         return claripy.BVS(name, bits), True
 
+    def _build_state_from_snapshot(self, snap: dict, opts: set):
+        """Concolic seed: start from a REAL execution state (registers + memory captured
+        from a live run) and overlay fresh symbolic values only on the fields the caller
+        marks as attacker-controlled. Everything else stays concrete, so exploration
+        follows realistic paths instead of treating every input as unknown."""
+        # If the snapshot carries an image slide (captured from a live, ASLR-slid
+        # process), rebase it into this binary's file-address space so pc / pointers
+        # line up with the loaded code. SEAL does this itself — callers pass the raw
+        # captured snapshot plus {"image": {"slide", "file_lo", "file_hi"}}.
+        img = snap.get("image") or {}
+        if img.get("slide"):
+            try:
+                from .snapshot.rebase import rebase as _rebase
+                mo = self.project.loader.main_object
+                lo = int(img.get("file_lo", mo.min_addr))
+                hi = int(img.get("file_hi", mo.max_addr))
+                snap = _rebase(snap, int(img["slide"]), lo, hi)
+            except Exception as e:
+                log.warning("snapshot rebase failed: %s", e)
+
+        pc = int(snap.get("pc", self.func_addr))
+        state = self.project.factory.blank_state(addr=pc, add_options=opts)
+        # Set the captured registers, but never let a saved pc/ip in `regs` clobber the
+        # start address: `pc` (above) is authoritative so a caller can seed mid-function.
+        for r, v in (snap.get("regs") or {}).items():
+            if r.lower() in ("pc", "ip"):
+                continue
+            try:
+                setattr(state.regs, r, claripy.BVV(int(v), self.arch.bits))
+            except Exception as e:
+                log.warning("snapshot reg %s: %s", r, e)
+        state.regs.pc = claripy.BVV(pc, self.arch.bits)
+        for m in (snap.get("mem") or []):
+            try:
+                state.memory.store(int(m["addr"]), bytes.fromhex(m["hex"]))
+            except Exception as e:
+                log.warning("snapshot mem @%s: %s", m.get("addr"), e)
+        named = {}
+        for s in (snap.get("symbolic") or []):       # attacker-controlled -> symbolic overlay
+            nm = s.get("name") or "sym"
+            bv = claripy.BVS(nm, int(s.get("size", self.arch.bytes)) * 8)
+            named[nm] = bv
+            try:
+                if s.get("reg"):
+                    setattr(state.regs, s["reg"], bv)
+                elif s.get("addr") is not None:
+                    state.memory.store(int(s["addr"]), bv, endness=self.arch.memory_endness)
+            except Exception as e:
+                log.warning("snapshot symbolic %s: %s", nm, e)
+        state.globals["angrgui_vars"] = named
+        state.globals["angrgui_argv"] = list(named.values())
+        state.globals["angrgui_locals"] = {}
+        state.globals["angrgui_bufmembers"] = {}
+        return state
+
     def _build_state(self):
         opts = {
             angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
@@ -120,6 +231,9 @@ class Run:
             # don't descend into called functions: a call returns a fresh unconstrained
             # value, so exploration stays in the target function and its branches show.
             opts.add(angr.options.CALLLESS)
+        snap = self.spec.get("initial_state")
+        if snap and snap.get("kind") == "snapshot":
+            return self._build_state_from_snapshot(snap, opts)
         args = self.spec.get("args", [])
         arg_asts = []
         named = {}
@@ -197,6 +311,19 @@ class Run:
         state.globals["angrgui_argv"] = arg_asts    # ordered, for the a1.. / arg0.. aliases
         state.globals["angrgui_locals"] = self._locals_map()
 
+        # map buffer byte offsets to struct member names, so conditions read
+        # e.g. `tif->tif_mode` instead of `tif_buf[16]`
+        bufmembers = {}
+        for b in self.spec.get("buffers", []):
+            arg = b.get("arg")
+            mm = b.get("member_map")
+            if not mm:
+                mm = [[int(m.get("offset", 0)), int(m.get("size") or 1),
+                       m.get("name") or f"{arg}.m{int(m.get('offset', 0))}"] for m in (b.get("layout") or [])]
+            if mm:
+                bufmembers[f"{arg}_buf"] = sorted(mm, key=lambda x: x[0])
+        state.globals["angrgui_bufmembers"] = bufmembers
+
         # assumptions
         applied = []
         for src in self.spec.get("assumptions", []):
@@ -215,13 +342,16 @@ class Run:
     # ----------------------------------------------------------- call models (hooks)
     MODEL_REGION = 0x40000      # size of each buffer a hooked allocator hands back
 
-    def _make_model_proc(self, m):
-        """A SimProcedure that replaces a called function with a simple model:
-        return a fresh symbolic value, a constant, one of the arguments, or a freshly
-        allocated buffer (whose logical size is one argument, tracked for OOB checks)."""
+    def _model_compute(self, m):
+        """Build a closure ``state -> claripy.BV`` giving this model's return value
+        (and applying any constraints it entails): a constant, one argument, a fresh
+        symbolic value, a symbolic value restricted to a set/predicate, an expression
+        over the arguments, or a freshly allocated buffer (size = one argument)."""
         kind = m.get("kind", "symbolic")
         bits = self.arch.bits
+        mask = (1 << bits) - 1
         region = self.MODEL_REGION
+        ro = self.arch.ret_offset
         # SysV AMD64 integer argument registers, in order (this tool targets x86-64)
         ARG_REGS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
 
@@ -233,48 +363,101 @@ class Run:
         def argval(state, i):
             return getattr(state.regs, ARG_REGS[i]) if i < len(ARG_REGS) else claripy.BVV(0, bits)
 
+        def coerce(v):
+            if isinstance(v, int):
+                return claripy.BVV(v & mask, bits)
+            if v.size() < bits:
+                return v.zero_extend(bits - v.size())
+            if v.size() > bits:
+                return v[bits - 1:0]
+            return v
+
+        site = m.get("site")
+        site_i = (int(site, 0) if isinstance(site, str) else int(site)) if site is not None else None
+        label = str(m.get("func") or (f"site_{site_i:x}" if site_i is not None else "call"))
+
         if kind == "concrete":
-            val = int(m.get("value", 0)) & ((1 << bits) - 1)
-            class P(angr.SimProcedure):
-                def run(self):
-                    return claripy.BVV(val, bits)
+            val = int(m.get("value", 0)) & mask
+            def compute(state):
+                return claripy.BVV(val, bits)
         elif kind == "return_arg":
             idx = int(m.get("arg", 0))
-            class P(angr.SimProcedure):
-                def run(self):
-                    return argval(self.state, idx)
+            def compute(state):
+                return coerce(argval(state, idx))
         elif kind == "alloc":
             sidx = int(m.get("size_arg", 0))
             nm = m.get("name")
-            class P(angr.SimProcedure):
-                def run(self):
-                    size = argval(self.state, sidx)
-                    base = self.state.heap.allocate(region)
-                    allocs = self.state.globals.get("angrgui_allocs", ())
-                    self.state.globals["angrgui_allocs"] = allocs + ((base, size, base + region),)
-                    if nm:
-                        remember(self.state, nm, claripy.BVV(base, bits))
-                    return claripy.BVV(base, bits)
-        else:   # "symbolic" (default)
-            nm = m.get("name") or (str(m.get("func")) + "_ret")
-            rb = int(m.get("bits") or bits)
-            class P(angr.SimProcedure):
-                def run(self):
-                    v = claripy.BVS(nm, rb)
-                    remember(self.state, nm, v)
-                    return v
-        P.display_name = "model_" + str(m.get("func"))
+            def compute(state):
+                size = argval(state, sidx)
+                base = state.heap.allocate(region)
+                allocs = state.globals.get("angrgui_allocs", ())
+                state.globals["angrgui_allocs"] = allocs + ((base, size, base + region),)
+                if nm:
+                    remember(state, nm, claripy.BVV(base, bits))
+                return claripy.BVV(base, bits)
+        elif kind == "constrained":      # symbolic, restricted to a value set and/or a predicate
+            nm = m.get("name") or (label + "_ret")
+            vals = [int(x) & mask for x in (m.get("values") or [])]
+            pred = m.get("constraint")   # a boolean expr over `ret` (and args)
+            def compute(state):
+                v = claripy.BVS(nm, bits)
+                cons = []
+                if vals:
+                    cons.append(claripy.Or(*[v == x for x in vals]))
+                if pred:
+                    state.registers.store(ro, v)                 # bind `ret` to this value
+                    state.globals["angrgui_argv"] = [argval(state, i) for i in range(len(ARG_REGS))]
+                    cons.append(as_bool(make_evaluator(state)(pred)))
+                for c in cons:
+                    state.add_constraints(c)
+                remember(state, nm, v)
+                return v
+        elif kind == "expr":             # return = an expression over the arguments
+            expr = m.get("expr") or "0"
+            def compute(state):
+                saved = state.globals.get("angrgui_argv")
+                state.globals["angrgui_argv"] = [argval(state, i) for i in range(len(ARG_REGS))]
+                try:
+                    v = make_evaluator(state)(expr)
+                finally:
+                    if saved is None:
+                        state.globals.pop("angrgui_argv", None)
+                    else:
+                        state.globals["angrgui_argv"] = saved
+                return coerce(v)
+        else:                            # "symbolic" (default)
+            nm = m.get("name") or (label + "_ret")
+            def compute(state):
+                v = claripy.BVS(nm, bits)
+                remember(state, nm, v)
+                return v
+        return compute
+
+    def _make_model_proc(self, m):
+        """A SimProcedure that replaces a whole called function with a model."""
+        compute = self._model_compute(m)
+        class P(angr.SimProcedure):
+            def run(self):
+                return compute(self.state)
+        P.display_name = "model_" + str(m.get("func") or "call")
         return P()
 
     def _install_models(self, state):
         self._hooked = []
         for m in (self.spec.get("models") or []):
-            target = m.get("func")
-            if not target:
-                continue
             try:
+                if m.get("site") is not None:
+                    self._install_site_model(m)
+                    continue
+                target = m.get("func")
+                explicit = m.get("addr")
+                if explicit is None and not target:
+                    continue
                 proc = self._make_model_proc(m)
-                if isinstance(target, str) and target.lower().startswith("0x"):
+                if explicit is not None:                 # hook a known address directly
+                    addr = int(explicit, 16) if isinstance(explicit, str) else int(explicit)
+                    self.project.hook(addr, proc, replace=True)
+                elif isinstance(target, str) and target.lower().startswith("0x"):
                     addr = int(target, 16)
                     self.project.hook(addr, proc, replace=True)
                 elif isinstance(target, int):
@@ -284,7 +467,22 @@ class Run:
                     addr = self.project.hook_symbol(target, proc, replace=True)
                 self._hooked.append(addr)
             except Exception as e:
-                log.warning("could not model %r: %s", target, e)
+                log.warning("could not model %r: %s", m, e)
+
+    def _install_site_model(self, m):
+        """Replace a single (usually indirect) call *instruction* with a model: a
+        length-hook runs our function in place of the call and execution resumes right
+        after it with the modelled return value in the return register — the call
+        target is never taken. This is how an indirect call through a pointer is handled."""
+        site = m["site"]
+        site = int(site, 16) if isinstance(site, str) else int(site)
+        insn = next((i for i in self.project.factory.block(site).capstone.insns if i.address == site), None)
+        compute = self._model_compute(m)
+        ro = self.arch.ret_offset
+        def site_hook(state):
+            state.registers.store(ro, compute(state))
+        self.project.hook(site, site_hook, length=(insn.size if insn else self.arch.bytes), replace=True)
+        self._hooked.append(site)
 
     def _unhook(self):
         for a in getattr(self, "_hooked", []):
@@ -314,16 +512,26 @@ class Run:
 
     def _set_arg(self, state, index, value, prototype):
         cc = self.project.factory.cc()
+        # Proper path: place the value in the Nth argument's real location, honouring
+        # the arch ABI (x86-64 SysV, AArch64 AAPCS64 with its separate int/FP banks).
         try:
-            locs = cc.arg_locs(self.project.factory.function_prototype(prototype)
-                               if isinstance(prototype, str) else prototype)
-            loc = locs[index]
-            loc.set_value(state, value)
+            proto = prototype
+            if isinstance(prototype, str):
+                proto = angr.types.parse_signature(prototype).with_arch(self.arch)
+            cc.arg_locs(proto)[index].set_value(state, value)
+            return
         except Exception:
-            # fall back to the SysV integer registers
-            regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
-            if index < len(regs):
-                setattr(state.regs, regs[index], value)
+            pass
+        # Fallback: the arch's integer argument registers (cc.ARG_REGS is x0..x7 on
+        # AArch64, rdi/rsi/... on AMD64), then a hard-coded per-family list.
+        regs = list(getattr(cc, "ARG_REGS", None) or [])
+        if not regs:
+            if self.arch.name.startswith("AMD64"):
+                regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+            elif self.arch.name.startswith("AARCH64"):
+                regs = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        if index < len(regs):
+            setattr(state.regs, regs[index], value)
 
     def _locals_map(self):
         out = {}
@@ -377,6 +585,53 @@ class Run:
         self.nodes[nid] = node
         return node
 
+    def _resolve_addr(self, s):
+        """``s.addr``, but tolerant of a symbolic instruction pointer.
+
+        A symbolic IP means the state is about to jump somewhere the inputs
+        influence — typically a call through a symbolic function pointer (e.g.
+        a struct field we left symbolic). angr keeps such a state *active* when
+        the target still has a few concrete solutions, but ``s.addr`` resolves
+        the IP with ``eval_one`` and raises SimValueError when there is not
+        exactly one. Return ``(addr, symbolic_ip?)`` using a representative
+        concrete target so one such state can't abort the whole exploration.
+        """
+        try:
+            return s.addr, False
+        except Exception:
+            try:
+                return s.solver.min(s.regs._ip), True
+            except Exception:
+                hist = list(s.history.bbl_addrs)
+                return (hist[-1] if hist else self.func_addr), True
+
+    def _indirect_call_site(self, s):
+        """If the state is stuck on a `call [reg+…]` through a pointer, return
+        ``(addr, op_str, line)`` of that call; else None."""
+        try:
+            hist = list(s.history.bbl_addrs)
+            site = hist[-1] if hist else None
+            if site is None:
+                return None
+            last = self.project.factory.block(site).capstone.insns[-1]
+            if last.mnemonic == "call" and "[" in (last.op_str or ""):
+                line = None
+                try:
+                    e = self.binary.nearest_line(last.address)
+                    line = e[1] if e else None
+                except Exception:
+                    pass
+                return last.address, (last.op_str or "").strip(), line
+        except Exception:
+            pass
+        return None
+
+    def _symbolic_ip_fate(self, s) -> str:
+        """A symbolic IP from a call through a function pointer is an *unknown call
+        target* (we just don't know which function to run — model it), not a
+        control-flow hijack. A symbolic ret/jump is treated as a hijack."""
+        return "unknown_call" if self._indirect_call_site(s) else "unconstrained"
+
     def _branch_condition(self, state) -> str | None:
         """The constraint(s) this step added: what the inputs must satisfy to come here."""
         cons = []
@@ -422,6 +677,18 @@ class Run:
         elif fate == "pruned":
             node.end = {"reason": "loop_bound",
                         "text": f"stopped: a loop ran more than {self._loop_bound} times (loop bound)"}
+        elif fate == "unknown_call":
+            site = self._indirect_call_site(state)
+            if site:
+                a, op, line = site
+                where = f"{a:#x}" + (f" (line {line})" if line else "")
+                node.end = {"reason": "unknown_call", "site": a, "line": line,
+                            "text": f"can't continue here: the call at {where} goes through a function pointer "
+                                    f"the inputs leave undetermined ({op}) — assign a model for this call site "
+                                    f"(Call models → indirect call), or set that struct field to a concrete function."}
+            else:
+                node.end = {"reason": "unknown_call",
+                            "text": "can't continue: an indirect call's target is undetermined — model the call."}
         elif fate == "unconstrained":
             node.end = {"reason": "unconstrained",
                         "text": "jumped to an address the inputs control (possible control-flow hijack)"}
@@ -549,7 +816,71 @@ class Run:
         self._emit("run_status", func=self.func_addr, status=self.status,
                    hits=len(self.hits), error=self.error)
 
+    def _callee_label(self, site: int) -> str:
+        """A readable name for what a skipped call at this block returns: the callee
+        name for a direct call; for an indirect call (through a pointer) the source
+        line of the call, so it reads e.g. `ret_L312` and can be found in the code."""
+        try:
+            last = self.project.factory.block(site).capstone.insns[-1]
+            op = (last.op_str or "").strip()
+            if last.mnemonic == "call":
+                if re.fullmatch(r"0x[0-9a-fA-F]+", op):          # direct: call 0x....
+                    tgt = int(op, 16)
+                    nm = self.binary.name_at(tgt) or f"sub_{tgt:x}"
+                    return f"{nm}_ret"
+                try:                                             # indirect: name by its source line
+                    e = self.binary.nearest_line(last.address)
+                    if e:
+                        return f"ret_L{e[1]}"
+                except Exception:
+                    pass
+                m = re.search(r"\[([^\]]+)\]", op)               # fallback: the pointer operand
+                inner = (m.group(1) if m else op)
+                return "ret_" + re.sub(r"[^A-Za-z0-9]+", "_", inner).strip("_")
+        except Exception:
+            pass
+        return "call_ret"
+
+    def _skip_ret_name(self, s) -> str:
+        """Stable, unique display name for the value a given skipped call returns.
+        Keyed by call site so the same call reads the same across paths; a second
+        call site to the same callee gets an index appended."""
+        hist = list(s.history.bbl_addrs)
+        site = hist[-1] if hist else 0
+        if site in self._skip_ret_names:
+            return self._skip_ret_names[site]
+        base = self._callee_label(site)
+        name, n, used = base, 1, set(self._skip_ret_names.values())
+        while name in used:
+            n += 1
+            name = f"{base}{n}"
+        self._skip_ret_names[site] = name
+        return name
+
+    def _name_skipped_rets(self, states):
+        """CALLLESS writes an Unconstrained value angr names 'fake_ret_value' for
+        every skipped call, so unrelated returns look identical in branch
+        conditions. Give each a name derived from its callee instead. The value is
+        still freshly unconstrained (same semantics) — only the label changes, and
+        it is renamed before the next block consumes it (e.g. `cmp eax, 4`)."""
+        if not self.spec.get("limits", {}).get("skip_calls"):
+            return
+        ro = self.arch.ret_offset
+        for s in states:
+            try:
+                if s.history.jumpkind != "Ijk_FakeRet":
+                    continue
+                rv = s.registers.load(ro, self.arch.bytes)
+                if rv.op != "BVS" or "fake_ret_value" not in rv.args[0]:
+                    continue
+                s.registers.store(ro, claripy.BVS(self._skip_ret_name(s), self.arch.bits))
+            except Exception:
+                pass
+
     def _absorb(self, simgr, find, avoid):
+        # Rename CALLLESS return values (fake_ret_value) to their callee before the
+        # next step's compare consumes them, so branch conditions stay distinct/readable.
+        self._name_skipped_rets(simgr.active)
         # Gather every fresh successor from this step, tagged with its fate.
         succ: list[tuple] = [(s, "active", None) for s in simgr.active]
         for stash, kind in (("deadended", "deadended"), ("errored", "errored"),
@@ -559,7 +890,12 @@ class Run:
                 if id(st) in self._seen_leaves:
                     continue
                 self._seen_leaves.add(id(st))
-                succ.append((st, kind, str(item.error) if stash == "errored" else None))
+                k = kind
+                # an "unconstrained" state stuck on a call through a pointer isn't a
+                # hijack — it's an undetermined call target the user should model
+                if stash == "unconstrained" and self._indirect_call_site(st):
+                    k = "unknown_call"
+                succ.append((st, k, str(item.error) if stash == "errored" else None))
 
         # Count successors per parent node so we can tell branches from straight lines.
         parent_count: dict = {}
@@ -568,11 +904,20 @@ class Run:
             parent_count[pn] = parent_count.get(pn, 0) + 1
 
         extended = set()
+        hijacked = []            # active states with a symbolic IP: close and stop stepping
         for s, fate, err in succ:
+            addr, sym_ip = self._resolve_addr(s)
+            # A symbolic instruction pointer on an otherwise-active state is a
+            # control-flow hijack: the inputs decide where execution jumps.
+            # Treat it as a leaf (angr's "unconstrained" outcome) rather than
+            # letting it crash or spin, and take it out of the active search.
+            if sym_ip and fate == "active":
+                fate = self._symbolic_ip_fate(s)
+                hijacked.append(s)
             pn = s.globals.get("angrgui_node")
             recent = list(s.history.recent_bbl_addrs)
             if pn is None or pn not in self.nodes:
-                node = self._new_node(s.addr, None, 0)
+                node = self._new_node(addr, None, 0)
                 node.block_addrs.extend(recent)
                 s.globals["angrgui_node"] = node.id
             elif parent_count.get(pn, 1) > 1:
@@ -582,20 +927,20 @@ class Run:
                 if pn not in extended:
                     parent.block_addrs.extend(recent)
                     extended.add(pn)
-                node = self._new_node(s.addr, pn, parent.depth + 1)
+                node = self._new_node(addr, pn, parent.depth + 1)
                 node.cond = self._branch_condition(s)
                 node.decided_at = self._decision_point(parent)
                 s.globals["angrgui_node"] = node.id
             else:
                 node = self.nodes[pn]
                 node.block_addrs.extend(recent)
-            node.cur = s.addr
+            node.cur = addr
             if fate != "active":
                 node.kind = fate
                 self._close(node, s, fate, err)
-            if find and s.addr == find:
+            if find and addr == find:
                 node.kind = "found"
-            if s.addr in avoid:
+            if addr in avoid:
                 node.kind = "avoided"
             # state-point checks (assert/reach/avoid/custom) observe states at block
             # boundaries, where register and memory reads are committed and reliable
@@ -607,6 +952,13 @@ class Run:
                 ret_site = self._ret_insn(s)
                 for chk in self._state_checks:
                     chk.note_return(s, ret_site)
+
+        # Stop stepping states whose IP the inputs control — they are recorded
+        # as hijack leaves above; re-stepping a symbolic IP would only crash or
+        # fan out uselessly.
+        if hijacked:
+            drop = set(map(id, hijacked))
+            simgr.active[:] = [s for s in simgr.active if id(s) not in drop]
 
     def _finalize(self, simgr):
         # paths still active when the budget ran out
@@ -659,3 +1011,104 @@ class Run:
                 "hits": [h.to_json() for h in self.hits],
                 "tree": [self._node_json(n) for n in list(self.nodes.values())],
             }
+
+
+def trace_assignments(binary, spec: dict, example: dict, max_steps: int = 6000) -> dict:
+    """Re-execute a function with the example's concrete inputs and record, per
+    instruction address, the value written to its destination register (and memory
+    stores). That is the concrete value of the variable assigned on each source line,
+    on this path — used to annotate assignment lines in the decompilation.
+
+    Returns {hex_addr: {"reg": name, "val": hex, "store": {"addr","val"}?}}.
+    """
+    import angr
+    import claripy
+
+    cspec = dict(spec)
+    init = spec.get("initial_state")
+    if init and init.get("kind") == "snapshot":
+        # Concolic seed: start from the same captured state, but pin each
+        # attacker-controlled field to this finding's witness value so the trace
+        # follows exactly this path (fully concrete -> one path, values resolve).
+        snap = dict(init)
+        regs = dict(snap.get("regs") or {})
+        mem = [dict(m) for m in (snap.get("mem") or [])]
+        remaining = []
+        for s in (snap.get("symbolic") or []):
+            nm = s.get("name") or "sym"
+            ex = (example or {}).get(nm)
+            v = ex.get("u") if isinstance(ex, dict) else None
+            if v is None:
+                remaining.append(s)
+                continue
+            if s.get("reg"):
+                regs[s["reg"]] = int(v)
+            elif s.get("addr") is not None:
+                size = int(s.get("size", binary.arch.bytes))
+                mem.append({"addr": int(s["addr"]),
+                            "hex": int(v).to_bytes(size, "little").hex()})
+            else:
+                remaining.append(s)
+        snap["regs"], snap["mem"], snap["symbolic"] = regs, mem, remaining
+        cspec["initial_state"] = snap
+        cspec["args"] = []
+    else:
+        cargs = []
+        for a in spec.get("args", []):
+            ex = (example or {}).get(a.get("name") or "")
+            v = ex.get("u") if isinstance(ex, dict) else None
+            cargs.append({**a, "mode": "concrete", "value": int(v or 0)})
+        cspec["args"] = cargs
+    cspec["checks"] = []
+
+    run = Run(binary, cspec)
+    state = run._build_state()
+    run._install_models(state)                    # honour alloc/return models (e.g. malloc)
+    arch = binary.arch
+    SKIP = {"ip", "pc", "sp", "xsp", "bp", "x29", "lr", "x30", "cc_op", "cc_dep1",
+            "cc_dep2", "cc_ndep", "nzcv", "cpsr", "fpcr", "fpsr", "qc"}
+    regvals, memvals = {}, {}
+
+    def on_rw(s):
+        ia = s.scratch.ins_addr
+        if ia is None:
+            return
+        try:
+            off = s.inspect.reg_write_offset
+            if isinstance(off, claripy.ast.Base):
+                off = s.solver.eval(off)
+            expr = s.inspect.reg_write_expr
+            size = max(1, expr.size() // 8)
+            name = arch.translate_register_name(off, size)
+            if not name or name in SKIP:
+                return
+            regvals[ia] = {"reg": name, "val": hex(s.solver.eval(expr))}
+        except Exception:
+            pass
+
+    def on_mw(s):
+        ia = s.scratch.ins_addr
+        if ia is None:
+            return
+        try:
+            memvals[ia] = {"addr": hex(s.solver.eval(s.inspect.mem_write_address)),
+                           "val": hex(s.solver.eval(s.inspect.mem_write_expr))}
+        except Exception:
+            pass
+
+    state.inspect.b("reg_write", when=angr.BP_AFTER, action=on_rw)
+    state.inspect.b("mem_write", when=angr.BP_BEFORE, action=on_mw)
+    simgr = binary.project.factory.simgr(state)
+    steps = 0
+    while simgr.active and steps < max_steps:
+        simgr.step()
+        steps += 1
+        if len(simgr.active) > 1:                 # inputs are concrete; keep a single path
+            del simgr.active[1:]
+
+    out = {}
+    for ia, rv in regvals.items():
+        out[hex(ia)] = dict(rv)
+    for ia, mv in memvals.items():
+        out.setdefault(hex(ia), {})["store"] = mv
+    return out

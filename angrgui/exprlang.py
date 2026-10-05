@@ -20,6 +20,48 @@ Identifiers resolve, in this order, to
 
 Comparisons are unsigned by default; prefix the operator with `s` for signed (s<, s<=, s>, s>=).
 Widths are matched automatically by zero-extending the narrower side.
+
+ROLE
+    The one place SEAL parses user/agent-written boolean and arithmetic expressions.
+    Assumptions (constraints on the entry state) and `assert` checks are just strings
+    in this language; both the GUI and the MCP accept them verbatim and hand them here.
+    Grammar: C-like precedence — ternary `?:`, `||`, `&&`, `!`, comparisons, `| ^ &`,
+    shifts, `+ -`, `* / %`, unary `- ~`, then atoms (numbers, names, `f(args)`,
+    `name:width`, `[addr]:size` memory reads). Output is always a claripy AST (or a
+    Python int for pure-constant sub-expressions), evaluated against one angr state.
+
+WHY IT'S LIKE THIS
+    - Hand-rolled tokenizer + recursive-descent parser (no eval, no third-party dep):
+      the input comes from outside SEAL, so it must never execute arbitrary Python,
+      and the grammar is tiny enough that a parser is simpler than taming a library.
+    - Unsigned by default with explicit `s`-prefixed signed operators, because binary
+      analysis is mostly unsigned (addresses, sizes) and silent sign choices hide bugs
+      — see PITFALLS. The tokenizer deliberately orders `s<`/`s>`/... before the
+      identifier rule and requires a trailing comparison char so a name like `size`
+      or a bare `s` is never mistaken for a signed operator.
+    - Name resolution order (vars bound by the run → DWARF locals → registers → `ret`
+      → positional `arg0..`/`a1..`) mirrors how a reverse engineer thinks: prefer the
+      meaningful name the run gave a value, fall back to raw machine state.
+
+EXTENDING
+    - New function (like `mem`, `u32`, `zext`): add it to the `funcs` dict built in
+      `make_evaluator()`; it receives already-evaluated claripy ASTs / ints and returns
+      a BV. That is the cheapest extension point and needs no grammar change.
+    - New operator / syntax: add it to TOKEN_RE, then to the relevant precedence level
+      in `Parser` (p_or/p_and/.../p_mul) and give it a builder method. Keep precedence
+      explicit; don't reuse a token char that already means something else.
+    - New resolvable name space: extend `resolve()` in `make_evaluator()`.
+
+PITFALLS
+    - Signedness is explicit and defaults to UNSIGNED. `a s< 0` and `a < 0` ask
+      different questions and both parse — a wrong choice silently changes which
+      inputs satisfy the constraint, so it won't error, it'll just mislead.
+    - Widths auto-match by zero-extending the narrower side; if you need sign-extended
+      matching, say so with `s8..s64`/`sext`, or the high bits are wrong.
+    - `mem(addr,size)` / `[addr]:size` read the *current* state's memory with the
+      arch endianness — results depend on when in the path the expression is evaluated.
+    - Returning a bool-ish AST vs a BV matters to callers; `as_bool()` normalizes a
+      value to a constraint (nonzero), used where a bare number is treated as a test.
 """
 from __future__ import annotations
 
@@ -33,7 +75,7 @@ import claripy
 # like `size` or `s` is never mistaken for an operator.
 TOKEN_RE = re.compile(
     r"\s*(?:(?P<num>0x[0-9a-fA-F]+|0b[01]+|\d+)"
-    r"|(?P<op>s<=|s>=|s<|s>|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^~!<>()\[\]:,])"
+    r"|(?P<op>s<=|s>=|s<|s>|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^~!<>()\[\]:,?])"
     r"|(?P<id>[A-Za-z_][A-Za-z0-9_.]*))"
 )
 
@@ -127,6 +169,14 @@ class ClaripyOps:
     def not_(self, a):
         return claripy.Not(_truth(a))
 
+    def ite(self, c, a, b):
+        a, b = _match(a, b)
+        if isinstance(a, int):
+            a = _bv(a, b.size() if not isinstance(b, int) else 64)
+        if isinstance(b, int):
+            b = _bv(b, a.size())
+        return claripy.If(_truth(c), a, b)
+
     def cmp(self, op, a, b):
         signed = op.startswith("s")
         a, b = _match(a, b, signed)
@@ -178,10 +228,20 @@ class Parser:
 
     # -- grammar --------------------------------------------------------
     def parse(self):
-        e = self.p_or()
+        e = self.p_ternary()
         if self.peek()[0] != "eof":
             raise ExprError(f"unexpected {self.peek()[1]!r}")
         return e
+
+    def p_ternary(self):
+        c = self.p_or()
+        if self.is_op("?"):
+            self.take()
+            a = self.p_ternary()
+            self.take("op", ":")
+            b = self.p_ternary()
+            return self.ops.ite(c, a, b)
+        return c
 
     def p_or(self):
         a = self.p_and()
@@ -257,10 +317,10 @@ class Parser:
                 self.take()
                 args = []
                 if not self.is_op(")"):
-                    args.append(self.p_or())
+                    args.append(self.p_ternary())
                     while self.is_op(","):
                         self.take()
-                        args.append(self.p_or())
+                        args.append(self.p_ternary())
                 self.take("op", ")")
                 if name not in self.funcs:
                     raise ExprError(f"unknown function {name}()")
@@ -268,7 +328,7 @@ class Parser:
             return self.resolve(name)
         if self.is_op("("):
             self.take()
-            e = self.p_or()
+            e = self.p_ternary()
             self.take("op", ")")
             return e
         if self.is_op("["):

@@ -15,6 +15,48 @@ when you switch scenario.  Stored shape::
 
 Older project files stored the initial state flat alongside the checks; those are
 migrated into a single "Default" scenario on load.
+
+ROLE
+    The persistence + shape layer for a function's analysis setup. It owns the
+    split between per-reach SCENARIOS and SHARED checks, migrates old project files
+    to the current shape, and flattens a scenario down to the flat dict the rest of
+    SEAL (runner, codegen, MCP) actually consumes. It stores nothing about results —
+    only the setup — in ``<binary>.angrgui.json`` beside the binary.
+
+WHY IT'S LIKE THIS
+    - Scenarios vs. shared checks: the SAME function is often reached several ways
+      (different args / stdin / a concolic snapshot seed), but you want to hunt for
+      the same bugs in all of them. So initial state is per-scenario and checks are
+      shared — switching scenario changes only how the function is entered.
+    - SCEN_FIELDS is the single source of truth for "what is initial state". Every
+      place that copies/cleans/flattens a scenario iterates SCEN_FIELDS, so adding a
+      field in one spot keeps migrate/clean/flatten consistent. Note `initial_state`
+      is in it: the concolic snapshot seed ({kind:"snapshot", pc, regs, mem, symbolic})
+      lives ON THE SCENARIO, which is why a seeded setup survives restarts.
+    - `flatten()` exists because the runner/codegen/MCP want one flat dict (one
+      scenario's state + the shared checks + scenario metadata), not the nested
+      structured shape — the structured shape is for editing, the flat shape for use.
+    - Saved next to the binary (not in a central DB) so a project is self-contained
+      and portable: copy the binary + its .angrgui.json and the setup travels.
+    - Atomic save (write tmp + os.replace) so a crash mid-save can't corrupt a project.
+
+EXTENDING
+    - New per-scenario initial-state field: add it to SCEN_FIELDS (here) AND teach the
+      GUI/MCP that read & write it. `_migrate`, `_clean_scenario` and `flatten` all key
+      off SCEN_FIELDS, so they pick it up automatically.
+    - New shape migration: handle the old shape inside `_migrate` and keep returning
+      the current structured shape; every read path goes through `_migrate`, so one
+      place covers load, get and set.
+
+PITFALLS
+    - Don't add an initial-state field anywhere but SCEN_FIELDS — a field not listed
+      there is silently dropped by `_clean_scenario`/`flatten` and won't persist.
+    - Checks are shared: writing checks onto a scenario (instead of cfg["checks"]) is
+      wrong; they belong at the function level.
+    - `flatten()`'s "scenarios" key is a list of NAMES (plus "active"), not the full
+      scenario objects — consumers that want the state read the flat fields directly.
+    - `get_function` always returns a migrated copy; mutate and hand back via
+      `set_function` — don't assume you're holding the stored object.
 """
 from __future__ import annotations
 
@@ -25,7 +67,7 @@ import threading
 SUFFIX = ".angrgui.json"
 
 # the initial-state fields that live on a scenario (everything except checks)
-SCEN_FIELDS = ("args", "buffers", "assumptions", "stdin", "files", "limits", "models")
+SCEN_FIELDS = ("args", "buffers", "assumptions", "stdin", "files", "limits", "models", "initial_state")
 
 
 class Workspace:
@@ -45,6 +87,21 @@ class Workspace:
                 self.data.setdefault("meta", {})
             except (OSError, ValueError):
                 pass
+
+    # ---------------------------------------- global function-return models
+    # Models that apply whenever a function is called, across every analysis:
+    #   by_name[func]  -> {kind, ...}      replaces a statically-called function
+    #   by_site[hexad] -> {kind, ...}      replaces one (usually indirect) call site
+    def function_models(self) -> dict:
+        fm = self.data.setdefault("function_models", {})
+        fm.setdefault("by_name", {})
+        fm.setdefault("by_site", {})
+        return fm
+
+    def set_function_models(self, fm: dict):
+        self.data["function_models"] = {"by_name": dict((fm or {}).get("by_name") or {}),
+                                        "by_site": dict((fm or {}).get("by_site") or {})}
+        self.save()
 
     def save(self):
         with self._lock:

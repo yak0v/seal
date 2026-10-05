@@ -1,6 +1,53 @@
 """
 Static side of the tool: load a binary with angr, list functions, disassemble,
 recover DWARF variables and source lines, and describe the per-function CFG.
+
+ROLE
+----
+``Binary`` is SEAL's "static model": everything the GUI/MCP read *about* a program
+without executing it — the function list, disassembly, CFG, DWARF vars, names and
+source lines. The dynamic/symbolic side lives in ``runner.py``; this file never
+explores, it only describes. (``backend.AngrBackend`` wraps a ``Binary`` + runs.)
+
+WHY IT'S LIKE THIS
+------------------
+* **Lazy mode.** A whole-binary ``CFGFast`` is fine for a small ELF but hopeless on
+  a ~13k-function iOS/macOS dyld-cache dylib (minutes-to-never, gigabytes). So for
+  big binaries we DON'T build a global CFG. We index every function cheaply from the
+  symbol table (``_build_index``) and build each function's CFG *on demand* the first
+  time it's selected (``analyze_function`` → scoped ``CFGFast(regions=[(fa, fa+size)])``
+  + ``CompleteCallingConventions`` + ``angr_arm_patch.patch_pac`` over just that range).
+  ``auto_lazy`` trips on >2000 function symbols or >3 MB of code; ``lazy=False`` forces
+  the classic global CFG for small ELFs so the x86 workflow is unchanged.
+* **Mach-O function discovery.** ``cle`` does NOT reliably set ``is_function`` on Mach-O
+  symbols, so ``_build_index`` can't filter on it — instead it treats any symbol that
+  lands in an executable segment as a function and derives each extent from the gap to
+  the next symbol. That is why the index logic looks at segment membership, not flags.
+* **ARM64 support is applied here.** ``angr_arm_patch.apply()`` runs on every load so
+  NEON IR ops exist; ``patch_pac`` is applied per analysed function range so arm64e PAC
+  instructions in that function decode. Both are no-ops/harmless on x86-64.
+* **``base_addr`` exists but is a near-dead option for Mach-O.** It is threaded into
+  ``angr.Project(main_opts={"base_addr": ...})`` so an ELF/PIE can be loaded at a chosen
+  base, but cle's **Mach-O backend ignores it** (it keeps the image at its file vmaddrs,
+  ``min_addr`` stays 0). That is exactly why a live, ASLR-slid snapshot is reconciled by
+  rebasing the SNAPSHOT down to file addresses (``snapshot/rebase.py`` + the hook in
+  ``runner._build_state_from_snapshot``) rather than by sliding the loaded image up.
+
+EXTENDING
+---------
+* New static view (e.g. string refs, xrefs): add a method on ``Binary`` and surface it
+  through ``backend``/``server``; keep it lazy-friendly (don't force a global CFG).
+* New architecture's "arith" highlighting: extend ``ARITH_MNEMONICS`` (x86) / the arch
+  equivalent used by the overflow check hinting.
+* Teaching angr a new ARM64 op or arch quirk belongs in ``angr_arm_patch.py``, not here.
+
+PITFALLS
+--------
+* Don't call ``self.cfg`` expecting a global CFG in lazy mode — it's ``None`` until a
+  function is analysed. Use ``get_function`` / ``analyze_function`` which populate it.
+* ``get_function`` lazily analyses and returns ``None`` (not raise) for a bad/unknown
+  address — a cold ``Explore`` of an un-analysed function used to 500 because of this.
+* Function extents in lazy mode are gap-estimates; a symbol-less region may be missed.
 """
 from __future__ import annotations
 
@@ -77,24 +124,130 @@ def _resolve_type(t) -> tuple[str, int, bool]:
 class Binary:
     """A loaded binary plus everything static we compute about it."""
 
-    def __init__(self, path: str, progress=None):
+    def __init__(self, path: str, progress=None, target_funcs=None, lazy=None, base_addr=None):
+        """Lazy mode (default for large binaries, e.g. a 9.5 MB iOS dyld-cache dylib):
+        instead of a whole-binary CFGFast (impractical for ~17k functions), index every
+        function from the symbol table and build each one's control-flow graph ON DEMAND
+        when it is first selected/analysed. `target_funcs` pre-analyses specific ones;
+        `lazy=False` forces the classic whole-binary CFG (used for small ELFs).
+
+        `base_addr` loads the image at this absolute base instead of its preferred one.
+        Use it to match a live-process slide so a captured snapshot's pc and code
+        pointers line up with the loaded binary (concolic seeding of a real run)."""
         self.path = os.path.abspath(path)
+        self.base_addr = base_addr
         self._progress = progress or (lambda msg: None)
         self._progress("loading binary")
-        self.project = angr.Project(self.path, auto_load_libs=False, load_debug_info=True)
-        self.arch = self.project.arch
-        self._progress("recovering control flow (CFGFast)")
-        self.cfg = self.project.analyses.CFGFast(normalize=True, data_references=False)
-        self._progress("recovering calling conventions")
+        # Teach angr the ARM64 NEON IR ops it ships without, so SEAL can also handle
+        # arm64(e) targets. Harmless for x86-64 (only adds missing ops); idempotent.
         try:
-            self.project.analyses.CompleteCallingConventions(recover_variables=False)
-        except Exception as e:  # best effort
-            log.warning("calling convention analysis failed: %s", e)
+            from . import angr_arm_patch
+            angr_arm_patch.apply()
+        except Exception as e:  # never let the patch break loading
+            log.warning("angr ARM patch not applied: %s", e)
+        main_opts = {"base_addr": base_addr} if base_addr is not None else {}
+        self.project = angr.Project(self.path, auto_load_libs=False, load_debug_info=True,
+                                    main_opts=main_opts)
+        self.arch = self.project.arch
+        self.target_funcs = list(target_funcs) if target_funcs else None
+
+        mo = self.project.loader.main_object
+        nfunc_syms = sum(1 for s in mo.symbols if s.is_function)
+        code_span = (mo.max_addr - mo.min_addr)
+        auto_lazy = nfunc_syms > 2000 or code_span > 3_000_000
+        self.lazy = auto_lazy if lazy is None else lazy
+        self._cfgs: dict[int, object] = {}       # func addr -> its scoped CFGFast
+        self._analyzed: set[int] = set()
+        self._index: list[dict] = []             # all functions (lazy): {addr,name,size}
+        self._index_addrs: list[int] = []
+        self._name_by_addr: dict[int, str] = {}
+
+        if self.lazy:
+            self._build_index()
+            self.cfg = None
+            self._progress(f"indexed {len(self._index)} functions (on-demand CFG)")
+            for fa in (self.target_funcs or []):
+                self.analyze_function(fa)
+        else:
+            self._progress("recovering control flow (CFGFast)")
+            self.cfg = self.project.analyses.CFGFast(normalize=True, data_references=False)
+            self._progress("recovering calling conventions")
+            try:
+                self.project.analyses.CompleteCallingConventions(recover_variables=False)
+            except Exception as e:  # best effort
+                log.warning("calling convention analysis failed: %s", e)
         self._progress("reading DWARF debug info")
         self.dwarf_functions = self._collect_dwarf()
         self.addr_to_line = getattr(self.project.loader.main_object, "addr_to_line", {}) or {}
         self._source_cache: dict[str, list[str] | None] = {}
         self._progress("ready")
+
+    # ------------------------------------------------------- lazy per-function CFG
+    def _build_index(self):
+        """Index every function from the symbol table (addr, name, size). Function
+        extents come from the gap to the next symbol, so each function's CFG can later
+        be built over exactly its own byte range."""
+        mo = self.project.loader.main_object
+        # cle doesn't reliably flag is_function on Mach-O, so treat any named symbol that
+        # lands in an executable segment as a function start.
+        exec_ranges = [(s.vaddr, s.vaddr + s.memsize) for s in mo.segments if s.is_executable]
+
+        def in_exec(a):
+            return any(lo <= a < hi for lo, hi in exec_ranges)
+
+        seen = {}
+        for s in mo.symbols:
+            a = s.rebased_addr
+            if not s.name or a == 0:
+                continue
+            if not (getattr(s, "is_function", False) or in_exec(a)):
+                continue
+            seen.setdefault(a, s.name)
+        addrs = sorted(seen)
+        for i, a in enumerate(addrs):
+            nxt = addrs[i + 1] if i + 1 < len(addrs) else (mo.max_addr + 1)
+            self._index.append({"addr": a, "name": seen[a], "size": max(4, min(nxt - a, 0x40000))})
+        self._index_addrs = addrs
+        self._name_by_addr = seen
+
+    def _containing(self, addr: int) -> int | None:
+        if not self._index_addrs:
+            return None
+        i = bisect.bisect_right(self._index_addrs, addr) - 1
+        return self._index_addrs[i] if i >= 0 else None
+
+    def analyze_function(self, fa: int):
+        """Build (and cache) the CFG for one function, then make it the current CFG.
+        Idempotent; cheap on a cache hit."""
+        if fa in self._analyzed:
+            self.cfg = self._cfgs.get(fa, self.cfg)
+            return self.cfg
+        ent = next((e for e in self._index if e["addr"] == fa), None)
+        size = ent["size"] if ent else 0x8000
+        self._progress(f"analysing function @ {hex(fa)}")
+        cfg = self.project.analyses.CFGFast(
+            regions=[(fa, fa + size)], normalize=True, data_references=False)
+        try:
+            self.project.analyses.CompleteCallingConventions(recover_variables=False)
+        except Exception as e:
+            log.warning("calling convention analysis failed @ %s: %s", hex(fa), e)
+        try:
+            from . import angr_arm_patch
+            angr_arm_patch.patch_pac(self.project, fa, fa + size)
+        except Exception as e:
+            log.warning("PAC hooking skipped @ %s: %s", hex(fa), e)
+        self._cfgs[fa] = cfg
+        self._analyzed.add(fa)
+        self.cfg = cfg
+        return cfg
+
+    def _ensure(self, addr: int):
+        """Lazily analyse the function containing `addr` and make it current."""
+        if not self.lazy:
+            return
+        fa = self._containing(addr)
+        if fa is not None:
+            self.analyze_function(fa)
 
     # ------------------------------------------------------------------ meta
     @property
@@ -112,7 +265,7 @@ class Binary:
             "pie": bool(getattr(mo, "pic", False)),
             "has_dwarf": bool(self.dwarf_functions),
             "has_lines": bool(self.addr_to_line),
-            "function_count": len(self.user_functions()),
+            "function_count": len(self._index) if self.lazy else len(self.user_functions()),
         }
 
     def scratch_base(self) -> int:
@@ -123,6 +276,11 @@ class Binary:
 
     # ------------------------------------------------------------- functions
     def user_functions(self):
+        if self.lazy:
+            # only the functions analysed so far have a Function object
+            out = [self.project.kb.functions.get_by_addr(fa)
+                   for fa in sorted(self._analyzed) if self.project.kb.functions.contains_addr(fa)]
+            return out
         out = []
         for f in self.cfg.kb.functions.values():
             if f.is_plt or f.is_simprocedure or f.is_syscall or f.is_alignment:
@@ -133,11 +291,26 @@ class Binary:
         out.sort(key=lambda f: f.addr)
         return out
 
+    @staticmethod
+    def _is_named_str(name: str) -> bool:
+        return bool(name) and not name.startswith(("sub_", "frame_dummy", "register_tm", "deregister_tm"))
+
     def _is_named(self, f) -> bool:
         # Prefer functions with a real symbol name over compiler stubs.
         return not f.name.startswith(("sub_", "_", "frame_dummy", "register_tm", "deregister_tm"))
 
     def function_list(self) -> list[dict]:
+        if self.lazy:
+            # all functions, straight from the symbol index (no CFG needed to list)
+            out = []
+            for e in self._index:
+                out.append({
+                    "addr": e["addr"], "name": e["name"], "size": e["size"],
+                    "block_count": 0,            # filled in once the function is analysed
+                    "has_source": False, "named": self._is_named_str(e["name"]),
+                    "returning": True, "args": [],
+                })
+            return out
         out = []
         for f in self.user_functions():
             dw = self.dwarf_functions.get(f.addr)
@@ -167,10 +340,24 @@ class Binary:
         return []
 
     def get_function(self, addr: int):
-        return self.cfg.kb.functions.get_by_addr(addr)
+        # Lazily analyse the function at `addr` (not just the one containing it) so a
+        # cold run on a never-selected function works. Return None if it still can't be
+        # found — angr's get_by_addr raises KeyError, but callers expect None.
+        if self.lazy and addr not in self._analyzed and self._name_by_addr.get(addr) is not None:
+            self.analyze_function(addr)
+        else:
+            self._ensure(addr)
+        kb = self.project.kb.functions
+        if kb.contains_addr(addr):
+            return kb.get_by_addr(addr)
+        try:
+            return kb.get_by_addr(addr)
+        except KeyError:
+            return None
 
     def block_head(self, addr: int) -> int:
         """The start address of the basic block containing `addr` (or addr itself)."""
+        self._ensure(addr)
         node = self.cfg.model.get_any_node(addr, anyaddr=True)
         if node is not None:
             return node.addr
@@ -256,7 +443,7 @@ class Binary:
         if i < 0:
             return None
         prev = self._line_addrs[i]
-        f = self.cfg.kb.functions.floor_func(addr)
+        f = self.project.kb.functions.floor_func(addr)
         if f is None or not (f.addr <= prev <= addr):
             return None
         return self.line_for(prev)
@@ -276,7 +463,8 @@ class Binary:
         if block_addr not in cache:
             lines = []
             try:
-                f = self.cfg.kb.functions.floor_func(block_addr)
+                self._ensure(block_addr)
+                f = self.project.kb.functions.floor_func(block_addr)
                 leaders = sorted(f.block_addrs_set) if f is not None else [block_addr]
                 addrs = ([ins.address for ins in self._owned_capstone(block_addr, leaders)]
                          if block_addr in leaders
@@ -298,6 +486,14 @@ class Binary:
         """Name of the function / PLT stub / angr SimProcedure starting at addr."""
         if self.project.is_hooked(addr):
             return self.project.hooked_by(addr).display_name
+        if self.lazy:
+            # resolve from the symbol index without triggering analysis of a callee
+            nm = self._name_by_addr.get(addr)
+            if nm:
+                return nm
+            if self.project.kb.functions.contains_addr(addr):
+                return self.project.kb.functions.get(addr).name
+            return None
         f = self.cfg.kb.functions.get(addr)
         return f.name if f is not None else None
 
@@ -377,7 +573,7 @@ class Binary:
             if data.get("type") == "call":
                 tgt = getattr(dst, "addr", None)
                 name = None
-                tf = self.cfg.kb.functions.get(tgt) if tgt else None
+                tf = self.project.kb.functions.get(tgt) if tgt else None
                 if tf is not None:
                     name = tf.name
                 out[getattr(src, "addr", 0)] = {"target": tgt, "name": name}

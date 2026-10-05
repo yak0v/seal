@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SEAL — Symbolic Execution Analysis Lab</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b1f2a'/%3E%3Cpath fill='%2335c08a' d='M6.5 15.6C6 11.4 8.6 8.6 12 8.6 15.4 8.6 17.1 11 18 14 19.3 17.9 21 20.6 23.5 22.3 24.9 23.1 26.1 22.6 26.7 21.2 27.1 23.4 25.8 25.5 23.3 26 18.8 26.9 14.3 27.1 11.4 24.8 9.9 23.6 9.2 21 9.1 18.6 7.9 18 6.8 17.2 6.5 15.6Z'/%3E%3Cpath fill='%2335c08a' d='M11.3 20.4C12.7 22.8 14.6 24.7 16.9 25.7 14.2 26.4 11.6 25.2 10.6 22.9Z'/%3E%3Ccircle cx='11.5' cy='12.9' r='1.15' fill='%230b1f2a'/%3E%3Ccircle cx='6.5' cy='14.7' r='1.3' fill='%23f0a04b'/%3E%3Ccircle cx='5.9' cy='8.3' r='2' fill='%23f0a04b'/%3E%3C/svg%3E">
 <style>
 :root{
   --bg:#0c0e12; --panel:#13161b; --panel2:#1a1e25; --line:#252a33; --line2:#30363f;
@@ -12,8 +13,8 @@
   --green:#46d07e; --green-dim:rgba(70,208,126,.14);
   --ok:#3fb950; --warn:#e3b341; --bad:#f85149; --info:#58a6ff;
   --chip:#1e2530; --field:#0e1116; --radius:7px;
-  /* syntax highlighting (code + script views); themed per palette */
-  --syn-kw:#c792ea; --syn-ty:#f5b673; --syn-str:#a5d6a7; --syn-cm:#6b7f95; --syn-mn:#58a6ff; --syn-cond:#8cc4ff;
+  /* syntax highlighting (code + script views); bright/neon, themed per palette */
+  --syn-kw:#4fc1ff; --syn-ty:#5cf2dd; --syn-str:#ffcb6b; --syn-cm:#6b8299; --syn-mn:#4fc1ff; --syn-cond:#8ad4ff;
   --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
   --sans:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
 }
@@ -24,7 +25,7 @@ html[data-theme="slate"]{--bg:#111318;--panel:#1a1d24;--panel2:#22262f;--line:#2
   --ink:#edf0f4;--field:#0f1217}
 html[data-theme="ocean"]{--bg:#0b1620;--panel:#102230;--panel2:#16303f;--line:#1f3d4e;--line2:#2b5062;
   --green:#36c6c0;--green-dim:rgba(54,198,192,.16);--accent:#49b3ff;--field:#081219;
-  --syn-kw:#6cb6ff;--syn-ty:#56d4dd;--syn-str:#5fd3b2;--syn-cm:#5f7d8d;--syn-mn:#49b3ff;--syn-cond:#56d4dd}
+  --syn-kw:#4fc1ff;--syn-ty:#5cf2dd;--syn-str:#ffcb6b;--syn-cm:#6b8ea0;--syn-mn:#4fc1ff;--syn-cond:#8ad4ff}
 html[data-theme="abyss"]{--bg:#07131e;--panel:#0c1f2e;--panel2:#112b3b;--line:#1b3848;--line2:#274c5e;
   --ink:#dce8ee;--dim:#a9bfca;--faint:#6b8494;--green:#2ec5d3;--green-dim:rgba(46,197,211,.16);--accent:#3d9be0;--accent2:#7c9cff;--field:#050e17;--chip:#112b3b;
   --syn-kw:#6cb6ff;--syn-ty:#56d4dd;--syn-str:#5fd3b2;--syn-cm:#5f7d8d;--syn-mn:#3d9be0;--syn-cond:#56d4dd}
@@ -68,6 +69,15 @@ html[data-theme="tokyonight"]{--bg:#1a1b26;--panel:#1f2030;--panel2:#24283b;--li
 html[data-theme="nightowl"]{--bg:#011627;--panel:#0b2942;--panel2:#0e3350;--line:#1d3b53;--line2:#2b4d66;
   --ink:#e7eef8;--dim:#bfcadb;--faint:#7e90a4;--green:#addb67;--green-dim:rgba(173,219,103,.16);--accent:#82aaff;--accent2:#c792ea;--field:#001120;--chip:#0e3350;
   --syn-kw:#c792ea;--syn-ty:#7fdbca;--syn-str:#ecc48d;--syn-cm:#839898;--syn-mn:#82aaff;--syn-cond:#7fdbca}
+/* MAX-brightness colours — overrides every theme (equal/higher specificity, defined last) */
+:root,html[data-theme]{
+  /* syntax */
+  --syn-kw:#66d9ff; --syn-ty:#4dffe8; --syn-str:#ffe14d; --syn-cm:#aebfd0; --syn-mn:#66d9ff; --syn-cond:#80ddff;
+  /* all UI text — menus, labels, panels, everything (pushed to the brightest readable levels) */
+  --ink:#ffffff; --dim:#dce5f0; --faint:#b2c1d1;
+  /* accents + status, maxed to vivid (brand --green kept per-theme so hues don't shift) */
+  --accent:#62c2ff; --accent2:#c08cff; --ok:#5bf07a; --warn:#ffd23f; --bad:#ff6d64; --info:#6cc0ff;
+}
 *{box-sizing:border-box}
 html,body{margin:0;height:100%}
 body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:13px;overflow:hidden;-webkit-font-smoothing:antialiased}
@@ -115,8 +125,38 @@ select{font-family:var(--sans)}
 #top .bname{font-weight:800;letter-spacing:1.5px;font-size:15px;color:var(--ink)}
 #top .bfull{font-size:8px;letter-spacing:.4px;color:var(--faint);text-transform:uppercase;white-space:nowrap}
 #top .binfo{font-family:var(--mono);color:var(--dim);font-size:12px}
-#main{display:flex;height:calc(100% - 48px)}
-#centerCol{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0}
+/* Paths layout toggle: a pill reading "horizontal" / "vertical" */
+#pathsToggle.pathspill{border-radius:999px;padding:2px}
+#pathsToggle.pathspill .segbtn{border-radius:999px;padding:3px 12px}
+#pathsToggle.pathspill .segbtn.on{background:var(--green-dim);color:var(--green);font-weight:600}
+#main{display:flex;height:calc(100% - 48px);min-height:0}
+/* Functions sits full-height on the left; everything else stacks in #rightStack */
+#rightStack{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0}
+#topRow{flex:1;min-height:0;display:flex}
+/* code column: sized to fit the code (resizable); the dock fills the remaining width */
+#centerCol{flex:0 0 auto;width:640px;min-width:340px;max-width:72vw;display:flex;flex-direction:column;min-height:0}
+/* PATHS strip: path tree (left) with the condition + outcome detail stacked on its right */
+#pathsBottom{display:none;position:relative;flex:0 0 auto;height:360px;min-height:0;flex-direction:row;background:var(--panel);border-top:1px solid var(--line);overflow:hidden}
+#pbClose{position:absolute;top:6px;right:8px;z-index:8;width:22px;height:22px;padding:0;line-height:20px;text-align:center;
+  background:var(--panel2);border:1px solid var(--line2);border-radius:5px;color:var(--dim);cursor:pointer;font-size:12px}
+#pbClose:hover{color:var(--ink);border-color:var(--accent)}
+#pbPaths{flex:1;min-width:0;overflow:auto;padding:8px 12px}
+#pbPaths.treemode{display:flex;flex-direction:column;overflow:hidden;padding:8px 12px}
+#pbPaths.treemode .checksbar,#pbPaths.treemode .psum{flex:0 0 auto}
+#pbPaths .ptreegraph{min-height:120px}
+#pbDetail{flex:0 0 auto;width:380px;min-width:200px;overflow:auto;padding:8px 16px 14px;border-left:1px solid var(--line);background:var(--panel)}
+/* in the paths strip the detail is a narrow right column: stack condition over outcome */
+#pbDetail .pdetail.cols{height:auto;overflow:visible;padding:0}
+#pbDetail .pcols{flex-direction:column;height:auto;gap:0;align-items:stretch}
+#pbDetail .pcol{flex:0 0 auto;overflow:visible;padding-right:0}
+#pbDetail .pcol+.pcol{border-left:none;border-top:1px solid var(--line);padding-left:0;padding-top:8px;margin-top:8px}
+#pbSplit{display:none}
+body.paths #pathsBottom{display:flex}
+body.paths #pbSplit{display:block}
+body.paths #bottomPanel,body.paths #bottomSplit{display:none}   /* detail moves to #pbDetail */
+body.paths #dockPaths{display:none}                              /* paths move to #pbPaths */
+body.paths #dock>.splitter-h[data-target="dockv"]{display:none}
+body.paths #dockGraph{flex:1 1 auto;height:auto}                 /* CFG graph fills the dock */
 #bottomPanel{height:230px;flex:0 0 auto;display:flex;flex-direction:column;background:var(--panel);border-top:1px solid var(--line)}
 #bottomPanel.collapsed{height:28px}
 #bottomPanel.collapsed #bottomInner{display:none}
@@ -140,8 +180,12 @@ select{font-family:var(--sans)}
 .edgebtn.right{right:0;border-right:none;border-radius:7px 0 0 7px}
 .edgebtn.hidden{display:none}
 
-#mainView{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;background:var(--bg)}
-#dock{width:440px;flex:0 0 auto;min-width:280px;max-width:60vw;display:flex;flex-direction:column;background:var(--panel);border-left:1px solid var(--line)}
+#mainView{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;background:var(--bg);--code-fs:12px}
+.tabs .fontsize{display:flex;gap:3px;align-items:center;margin-right:8px}
+.tabs .fontsize button{width:24px;height:20px;padding:0;font-size:11px;font-weight:700;background:var(--panel2);
+  border:1px solid var(--line2);border-radius:5px;color:var(--dim);cursor:pointer;font-family:var(--sans)}
+.tabs .fontsize button:hover{color:var(--ink);border-color:var(--accent)}
+#dock{flex:1 1 auto;min-width:280px;display:flex;flex-direction:column;background:var(--panel);border-left:1px solid var(--line)}
 #dockHead{height:28px;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:0 10px;border-bottom:1px solid var(--line);font-size:11px;color:var(--dim)}
 .dockttl{font-weight:600;text-transform:uppercase;letter-spacing:.5px;font-size:10px;color:var(--ink)}
 #dockGraph{height:44%;flex:0 0 auto;min-height:120px;overflow:hidden;position:relative;background:var(--bg)}
@@ -171,7 +215,7 @@ select{font-family:var(--sans)}
 .decompwrap{display:flex;flex-direction:column;height:100%}
 .decompbar{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12px;color:var(--dim)}
 .decompbar .fn{font-family:var(--mono);color:var(--ink);padding:0;border:none}
-.ccode{flex:1;margin:0;overflow:auto;padding:10px 14px;font-family:var(--mono);font-size:12px;line-height:18px;color:var(--ink);white-space:pre;tab-size:2}
+.ccode{flex:1;margin:0;overflow:auto;padding:10px 14px;font-family:var(--mono);font-size:var(--code-fs);line-height:1.5;color:var(--ink);white-space:pre;tab-size:2}
 .ccode .ty{color:var(--syn-ty)}.ccode .kw{color:var(--syn-kw)}.ccode .cm{color:var(--syn-cm);font-style:italic}.ccode .nm2{color:var(--syn-str)}
 
 /* tabs */
@@ -183,7 +227,7 @@ select{font-family:var(--sans)}
 .tabpane.sel{display:block}
 
 /* code view */
-.codewrap{font-family:var(--mono);font-size:12px}
+.codewrap{font-family:var(--mono);font-size:var(--code-fs)}
 .srcline{display:flex;gap:0;border-left:3px solid transparent}
 .srcline .ln{width:34px;text-align:right;color:var(--faint);padding:2px 8px 2px 0;user-select:none;flex:0 0 auto}
 .srcline .tx{white-space:pre;padding:2px 8px}
@@ -196,9 +240,22 @@ select{font-family:var(--sans)}
 .insn .op{color:var(--ink);flex:1;white-space:pre;overflow:hidden;text-overflow:ellipsis}
 .insn .acts{opacity:0;display:flex;gap:4px;flex:0 0 auto}
 .insn:hover .acts{opacity:1}
-.insn.arith{background:rgba(124,92,255,.06)}
-.insn.arith .mn{color:var(--accent2)}
+/* arithmetic rows: no persistent tint/recolor (red is reserved for findings on a
+   selected path); the "+ overflow" affordance lives in the row's action buttons. */
+.statewrap{padding:4px 2px}
+.statebox{border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin:6px 0}
+.statelbl{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin:10px 0 4px}
+.statetbl{width:100%;border-collapse:collapse;font-size:12px}
+.statetbl th{text-align:left;color:var(--faint);font-weight:500;padding:2px 8px;border-bottom:1px solid var(--line)}
+.statetbl td{padding:2px 8px;border-bottom:1px solid rgba(255,255,255,.04)}
+.statetbl tr.symrow{background:rgba(248,81,73,.08)}
+.snapjson{background:var(--field);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:6px}
 .insn.hit{border-left-color:var(--bad);background:rgba(248,81,73,.08)}
+.exannot{color:var(--bad);opacity:.9;font-style:italic;margin-left:8px;white-space:nowrap}
+.codeinputs{margin:2px 0 8px;padding:6px 12px;border-left:3px solid var(--accent);
+  background:color-mix(in srgb,var(--accent) 10%,transparent);border-radius:4px;font-family:var(--mono);font-size:12px}
+.codeinputs .cilbl{color:var(--dim);margin-right:10px}
+.codeinputs .civals{color:var(--ink)}
 .insn.oncur{background:#182338}
 .blocklabel{color:var(--faint);font-size:11px;padding:8px 12px 2px;border-top:1px solid #1a2029;margin-top:4px}
 
@@ -216,6 +273,11 @@ select{font-family:var(--sans)}
 .arg input.name{font-weight:600}
 .assume{display:flex;gap:6px;margin-bottom:6px}
 .assume input{flex:1}
+/* a "modelled return" tag shown next to a call in the disassembly */
+.insn .modeltag{flex:0 0 auto;font-family:var(--sans);font-size:10px;font-weight:700;color:var(--accent2);
+  background:color-mix(in srgb,var(--accent2) 16%,transparent);border:1px solid var(--accent2);border-radius:9px;
+  padding:0 7px;margin-right:8px;cursor:pointer;white-space:nowrap;max-width:280px;overflow:hidden;text-overflow:ellipsis}
+.insn .modeltag:hover{background:color-mix(in srgb,var(--accent2) 30%,transparent)}
 .modelrow{display:flex;align-items:center;gap:7px;padding:4px 0;font-size:12px;border-bottom:1px solid var(--line)}
 .modelrow:last-child{border-bottom:none}
 .modelrow .mfn{color:var(--accent2);font-weight:600;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -239,7 +301,7 @@ select{font-family:var(--sans)}
 
 /* progress */
 .prog{height:6px;background:#0b0f16;border-radius:4px;overflow:hidden;margin:6px 0}
-.prog>i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0;transition:width .3s}
+.prog>i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
 .stats{display:flex;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--dim);font-family:var(--mono)}
 .stats b{color:var(--ink)}
 
@@ -360,8 +422,11 @@ select{font-family:var(--sans)}
 .swrap{display:flex;flex-direction:column;height:100%}
 .sbar{display:flex;gap:8px;align-items:flex-start;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12px;line-height:1.5;color:var(--dim)}
 .sbar code{background:#0b0f16;padding:0 4px;border-radius:3px;color:var(--ink)}
-.scode{flex:1;margin:0;overflow:auto;padding:10px 14px;font-family:var(--mono);font-size:12px;line-height:18px;color:var(--ink);tab-size:4}
-.ccode .cline{display:block;padding:0 4px;border-left:3px solid transparent}
+.scode{flex:1;margin:0;overflow:auto;padding:10px 14px;font-family:var(--mono);font-size:var(--code-fs);line-height:1.5;color:var(--ink);tab-size:4}
+.ccode .cline{display:flex;align-items:baseline;padding:0 4px;border-left:3px solid transparent}
+.ccode .clnum{flex:0 0 auto;width:38px;padding-right:12px;text-align:right;color:var(--faint);user-select:none;white-space:nowrap;opacity:.75}
+.ccode .clnum.dup{opacity:.28}
+.ccode .cltext{flex:1 1 auto;min-width:0;white-space:pre}
 .ccode .cline[data-addr]{cursor:pointer}
 .ccode .cline[data-addr]:hover{background:#1a2230}
 .ccode .cline.onpath{background:rgba(76,154,255,.12);border-left-color:var(--accent)}
@@ -370,6 +435,16 @@ select{font-family:var(--sans)}
 .ccode .cline{position:relative;padding-right:80px}
 .clacts{position:absolute;right:6px;top:0;display:none;gap:3px}
 .ccode .cline:hover .clacts{display:inline-flex}
+/* path branch verdict badge — clearly our own annotation, not part of the code */
+.ccode .cbadge{font-family:var(--sans);font-size:10px;font-weight:700;letter-spacing:.3px;margin-left:12px;
+  padding:0 7px;border-radius:9px;vertical-align:middle;white-space:nowrap}
+.ccode .cbadge.taken{color:var(--ok);background:color-mix(in srgb,var(--ok) 20%,transparent);border:1px solid var(--ok)}
+.ccode .cbadge.nottaken{color:var(--bad);background:color-mix(in srgb,var(--bad) 18%,transparent);border:1px solid var(--bad)}
+/* concrete values of the flow's inputs, annotated inline on the decompilation */
+.ccode .cvals{font-family:var(--mono);font-size:11px;color:var(--warn);margin-left:14px;white-space:nowrap;opacity:.92}
+.ccode .cvals.asgn{color:var(--green)}   /* value assigned on this line (distinct from input values) */
+.ccode .cvals::before{content:"‹ ";opacity:.6}
+.ccode .cvals::after{content:" ›";opacity:.6}
 .ckname{background:transparent;border:1px solid transparent;border-radius:4px;font-weight:600;color:var(--ink);padding:1px 5px;min-width:0;font-family:var(--sans);font-size:12px}
 .ckname:hover{border-color:var(--line)}
 .ckname:focus{border-color:var(--accent);background:#0b0f16;outline:none}
@@ -414,6 +489,43 @@ select{font-family:var(--sans)}
 .dtbl td:first-child{white-space:nowrap}
 .dargs{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:3px}
 .dcheck{margin:7px 0;color:var(--dim)}
+/* docs: mock-UI "pictures" (reuse real component look, theme-aware, never stale) */
+.docbody .uishot{border:1px solid var(--line2);border-radius:8px;background:var(--panel);padding:11px 12px;margin:10px 0}
+.docbody .uishot .uibar{display:flex;align-items:center;gap:6px;margin:-1px 0 9px;padding-bottom:7px;border-bottom:1px solid var(--line);
+  font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.6px}
+.docbody .uishot .uibar::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--green)}
+.docbody .uicap{font-size:11.5px;color:var(--faint);margin:5px 2px 0}
+.docbody .uishot .arg{margin-bottom:5px}
+.docbody .annot{display:flex;gap:9px;align-items:flex-start;margin:6px 0;font-size:12.5px;color:var(--dim)}
+.docbody .annot b{color:var(--ink)}
+.docbody .anum{flex:0 0 auto;width:18px;height:18px;margin-top:1px;border-radius:50%;background:var(--green-dim);color:var(--green);
+  font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;border:1px solid var(--green)}
+/* app-layout wireframe */
+.docbody .applayout{display:flex;flex-direction:column;gap:6px;margin:10px 0}
+.docbody .applayout .lrow{display:flex;gap:6px}
+.docbody .lbox{border:1px solid var(--line2);border-radius:6px;background:var(--panel2);padding:9px 10px;font-size:11.5px;color:var(--dim);min-height:0}
+.docbody .lbox .ln{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
+  background:var(--green-dim);color:var(--green);border:1px solid var(--green);font-size:9px;font-weight:700;margin-right:6px;vertical-align:middle}
+.docbody .lbox b{color:var(--ink)}
+.docbody .lbar{background:var(--panel);font-size:11px}
+.docbody .lmid{display:flex;gap:6px;min-height:118px}
+.docbody .lcol{flex:0 0 150px}
+.docbody .lgrow{flex:1;min-width:0}
+.docbody .lbot{flex-direction:column}
+/* struct editor: filterable struct-name combobox */
+.combo{position:relative;flex:1;min-width:0;display:flex}
+.combo input{flex:1;min-width:0;border-top-right-radius:0;border-bottom-right-radius:0}
+.combo .combo-caret{flex:0 0 auto;width:26px;border:1px solid var(--line);border-left:none;background:var(--field);color:var(--dim);
+  border-radius:0 6px 6px 0;cursor:pointer;font-size:10px;display:flex;align-items:center;justify-content:center}
+.combo .combo-caret:hover{color:var(--ink);background:var(--panel2)}
+.combo-list{position:absolute;top:calc(100% + 3px);left:0;right:0;z-index:60;max-height:260px;overflow:auto;
+  background:var(--panel2);border:1px solid var(--line2);border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+.combo-item{padding:5px 10px;font-size:12.5px;font-family:var(--mono);color:var(--dim);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.combo-item:hover,.combo-item.active{background:var(--green-dim);color:var(--green)}
+.combo-item .cm-hit{color:var(--ink);font-weight:700}
+.combo-empty{padding:9px 10px;font-size:12px;color:var(--faint)}
+.combo-head{padding:4px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--faint);
+  position:sticky;top:0;background:var(--panel2);border-bottom:1px solid var(--line)}
 /* struct editor */
 .structtbl{max-height:46vh;overflow:auto;border:1px solid var(--line);border-radius:6px;margin-top:10px}
 .strow{display:flex;align-items:center;gap:6px;padding:3px 8px;border-bottom:1px solid var(--line);font-size:12px}
@@ -489,12 +601,20 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
 <div id="top">
   <div class="brand" title="SEAL — Symbolic Execution Analysis Lab">
     <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
-      <circle cx="16" cy="16" r="14" fill="none" stroke="var(--line2)" stroke-width="1.3"/>
-      <circle cx="16" cy="16" r="11.5" fill="none" stroke="var(--green)" stroke-width="2"/>
-      <path d="M16 9.5 V14.5 M16 14.5 L11 20.5 M16 14.5 L21 20.5" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round"/>
-      <circle cx="16" cy="9.3" r="2.1" fill="var(--green)"/>
-      <circle cx="11" cy="20.7" r="2.1" fill="var(--green)"/>
-      <circle cx="21" cy="20.7" r="2.1" fill="var(--accent)"/>
+      <!-- a seal (the animal) in profile, sitting upright, snout to the left,
+           tail flicking right — balancing a node/ball, nodding to the path tree -->
+      <path fill="var(--green)" d="M6.5 15.6 C6 11.4 8.6 8.6 12 8.6 C15.4 8.6 17.1 11 18 14
+        C19.3 17.9 21 20.6 23.5 22.3 C24.9 23.1 26.1 22.6 26.7 21.2
+        C27.1 23.4 25.8 25.5 23.3 26 C18.8 26.9 14.3 27.1 11.4 24.8
+        C9.9 23.6 9.2 21 9.1 18.6 C7.9 18 6.8 17.2 6.5 15.6 Z"/>
+      <!-- front flipper -->
+      <path fill="var(--green)" d="M11.3 20.4 C12.7 22.8 14.6 24.7 16.9 25.7 C14.2 26.4 11.6 25.2 10.6 22.9 Z"/>
+      <circle cx="11.5" cy="12.9" r="1.15" fill="var(--panel)"/>   <!-- eye -->
+      <circle cx="6.5" cy="14.7" r="1.3" fill="var(--accent)"/>    <!-- nose -->
+      <path d="M6 15.5 L2.5 16.5 M6.2 16.4 L3 18.2" stroke="var(--line2)" stroke-width="0.8" stroke-linecap="round"/>
+      <!-- the ball the seal balances = a path node -->
+      <path d="M6.3 13.2 L6 9.9" stroke="var(--green)" stroke-width="0.9" stroke-linecap="round"/>
+      <circle cx="5.9" cy="8.3" r="2" fill="var(--accent)"/>
     </svg>
     <span class="brandtext"><b class="bname">SEAL</b><span class="bfull">Symbolic Execution Analysis Lab</span></span>
   </div>
@@ -503,9 +623,13 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
   <button id="actBtn" class="tiny" title="Live activity — actions from you and from agents (MCP)">Activity <span id="actBadge" class="actbadge"></span></button>
   <div class="binfo" id="binfo">no binary loaded</div>
   <div class="grow"></div>
-  <div class="seg viewmode" id="viewMode" title="Setup = configure the run (both side panels) · Explore = read the paths (Setup hidden, wider graph/paths)">
+  <div class="seg viewmode" id="viewMode" title="Setup = configure (both side panels shown) · Explore = read paths (both side panels hidden)">
     <div class="segbtn on" data-mode="setup">⚙ Setup</div>
     <div class="segbtn" data-mode="explore">◱ Explore</div>
+  </div>
+  <div class="seg pathspill" id="pathsToggle" title="Show the explored paths and choose their layout: horizontal (left→right tree) or vertical (top→down tree). Click the active one again to hide.">
+    <div class="segbtn" data-orient="horizontal">horizontal</div>
+    <div class="segbtn" data-orient="vertical">vertical</div>
   </div>
   <button id="humanDocsBtn" class="tiny ghost" title="What SEAL does and how to use it (for humans)">📖 Docs</button>
   <button id="docsBtn" class="tiny ghost" title="Elaborate guide for an AI agent (clanker) driving SEAL over MCP">🤖 Clanker docs</button>
@@ -513,7 +637,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
 </div>
 
 <div id="main">
-  <!-- LEFT: functions -->
+  <!-- LEFT: functions (full height) -->
   <div class="panel" id="left">
     <button class="pcollapse" id="leftCollapse" title="hide this panel">«</button>
     <div class="phead">Functions <span class="grow"></span><span id="fnCount" class="faint"></span></div>
@@ -528,18 +652,29 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
 
   <div class="splitter" data-target="left"></div>
 
+  <!-- RIGHT STACK: the top row (code + graph + setup) over the Paths strip -->
+  <div id="rightStack">
+  <div id="topRow">
+
   <!-- CENTER: code view with the path detail docked below it -->
   <div id="centerCol">
     <div id="mainView">
       <div class="tabs">
-        <div class="tab" data-tab="decomp">Decompilation</div>
-        <div class="tab sel" data-tab="code">Disassembly</div>
+        <div class="tab sel" data-tab="decomp">Decompilation</div>
+        <div class="tab" data-tab="code">Disassembly</div>
+        <div class="tab" data-tab="state">State</div>
         <div class="tab" data-tab="script">angr script</div>
+        <span class="grow"></span>
+        <div class="fontsize" title="code text size">
+          <button id="fsDown" title="smaller text">A−</button>
+          <button id="fsUp" title="larger text">A+</button>
+        </div>
       </div>
       <div class="grow" style="position:relative;min-height:0">
-        <div class="tabpane sel" id="pane-code"><div class="empty">Select a function on the left.</div></div>
+        <div class="tabpane" id="pane-code"><div class="empty">Select a function on the left.</div></div>
         <div class="tabpane" id="pane-script"><div class="empty">Select a function to see its setup as an angr script.</div></div>
-        <div class="tabpane" id="pane-decomp"><div class="empty">Connect to IDA (top bar) for decompilation.</div></div>
+        <div class="tabpane" id="pane-state"><div class="empty">Select a function.</div></div>
+        <div class="tabpane sel" id="pane-decomp"><div class="empty">Connect to IDA (top bar) for decompilation.</div></div>
       </div>
     </div>
     <div class="splitter-h" data-target="bottom" id="bottomSplit"></div>
@@ -554,7 +689,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
   </div>
 
   <!-- DOCK: control-flow graph + the explored paths, full height -->
-  <div class="splitter" data-target="dock"></div>
+  <div class="splitter" data-target="center"></div>
   <div id="dock">
     <div id="dockHead">
       <span class="dockttl">Graph</span>
@@ -566,9 +701,21 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
     <div id="dockPaths"><div class="empty">Run the checks to see the paths angr explored.</div></div>
   </div>
 
+  </div><!-- #topRow -->
+
+  <!-- PATHS strip: path tree (left) with the condition + outcome detail stacked on its right -->
+  <div class="splitter-h" id="pbSplit" data-target="pathsbottom"></div>
+  <div id="pathsBottom">
+    <button id="pbClose" title="hide the paths strip">✕</button>
+    <div id="pbPaths"><div class="empty">Run the checks to see the paths angr explored.</div></div>
+    <div class="splitter" data-target="pbdetail"></div>
+    <div id="pbDetail"><div class="empty">Click a path to see its detail here.</div></div>
+  </div>
+  </div><!-- #rightStack -->
+
   <div class="splitter" data-target="right"></div>
 
-  <!-- RIGHT: setup / checks / run / hits -->
+  <!-- RIGHT: setup / checks / run / hits (full height, flanks everything on the right) -->
   <div class="panel" id="right">
     <button class="pcollapse right" id="rightCollapse" title="hide this panel">»</button>
     <div class="phead" id="rTitle">Setup</div>
@@ -576,7 +723,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
       <div class="empty">Pick a function to manage its assumptions and checks.</div>
     </div>
   </div>
-</div>
+</div><!-- #main -->
 
 <div id="actPanel">
   <div class="acthead">Activity

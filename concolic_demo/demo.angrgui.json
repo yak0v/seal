@@ -1,0 +1,56 @@
+{
+  "functions": {
+    "4294968416": {
+      "checks": [
+        {
+          "kind": "oob_write",
+          "base": "0x600000cd8000",
+          "size": 256,
+          "id": "b2a11b",
+          "enabled": true,
+          "func_addr": 4294968416
+        }
+      ],
+      "scenarios": [
+        {
+          "name": "Default",
+          "args": [
+            {
+              "name": "arg0",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": true
+            },
+            {
+              "name": "arg1",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": true
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {
+            "steps": 60,
+            "active": 300,
+            "seconds": 30,
+            "loop_bound": 12,
+            "find": null,
+            "avoid": [],
+            "skip_calls": true
+          },
+          "models": [],
+          "initial_state": null
+        }
+      ],
+      "active": 0
+    }
+  },
+  "meta": {},
+  "function_models": {
+    "by_name": {},
+    "by_site": {}
+  }
+}

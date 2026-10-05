@@ -27,3 +27,21 @@ samples/machine.angrgui.json
 
 # built research sample (rebuild: cross-compile samples/machine.c)
 samples/machine
+
+# ── Node test tooling (jsdom for headless GUI checks) ───────────────────────
+node_modules/
+
+# ── Proprietary / huge INPUTS (supply your own; these are not source) ───────
+# iPhone firmware (.ipsw), the extracted dyld shared cache, the blacktop `ipsw`
+# tool binary, and the extracted/IDA'd CoreGraphics — multi-GB and Apple-owned.
+ipsw/
+# this Mac's own CoreGraphics build used for CVE validation (Apple proprietary).
+seal_validation/snapshot/macos_cg/
+# a captured snapshot embeds CoreGraphics memory bytes — regenerate with capture.py.
+seal_validation/snapshot/cg_lineto.json
+
+# ── Build artifacts (rebuild from the .c sources / scripts) ─────────────────
+seal_validation/glyph_harness
+seal_validation/snapshot/harness
+*.dSYM/
+seal_validation/*.log
