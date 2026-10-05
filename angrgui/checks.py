@@ -535,28 +535,35 @@ class NarrowingCastCheck(BaseCheck):
             if not inner.symbolic:
                 return None
             return small, big, inner[big - 1:small]
-        if r.op == "Concat":                        # vector xtn: Concat of lane low-halves
+        if r.op == "Concat":
+            # NEON lane-narrowing (xtn/vmovn/…): the result is a Concat of per-lane low
+            # halves. The shape VARIES after claripy simplification — a lane may be a bare
+            # Extract of one vector register (every lane symbolic), an Extract of that
+            # lane's own already-folded source (e.g. fcvtzs: `fpToSBV(…)[31:0]`), or a
+            # constant (a lane that folded to a concrete value, e.g. a zeroed high lane).
+            # So treat each lane INDEPENDENTLY rather than requiring one common inner: a
+            # lane that is the low `small` bits of a value at least `2*small` wide drops
+            # that value's next `small` bits. (This is why the earlier one-inner matcher
+            # missed the real CoreGraphics xtn, whose high lane folds to a constant.)
             args = r.args
-            if len(args) < 2 or any(a.op != "Extract" for a in args):
+            if len(args) < 2:
                 return None
-            inner = args[0].args[2]
-            if not isinstance(inner, claripy.ast.BV) or not inner.symbolic:
+            small = args[0].size()
+            if small not in _STD_WIDTHS or any(a.size() != small for a in args):
                 return None
-            if any(a.args[2] is not inner for a in args):
-                return None
-            small = args[0].args[0] - args[0].args[1] + 1   # width of each extracted lane
-            if small not in _STD_WIDTHS:
-                return None
-            # each arg must be the low `small` bits of a 2*small-wide lane; collect dropped halves
             dropped = []
-            for i, a in enumerate(reversed(args)):          # Concat is big-endian: last arg = lane 0
-                base = i * 2 * small
-                if a.args[1] != base or a.args[0] != base + small - 1:
-                    return None
-                if base + 2 * small > inner.size():
-                    return None
-                dropped.append(inner[base + 2 * small - 1: base + small])
-            # per-lane narrowing is 2*small -> small (e.g. xtn: 64 -> 32 on each lane)
+            for a in args:
+                if a.op == "Extract" and isinstance(a.args[2], claripy.ast.BV):
+                    hi, lo, X = a.args
+                    if hi - lo + 1 == small and X.size() >= lo + 2 * small:
+                        d = X[lo + 2 * small - 1: lo + small]   # bits this lane throws away
+                        if d.symbolic:
+                            dropped.append(d)
+                        continue
+                if a.symbolic:                  # a symbolic lane that isn't a clean low-half
+                    return None                 # Extract -> not a recognizable lane-narrowing
+            if not dropped:
+                return None
             return small, 2 * small, claripy.Concat(*dropped) if len(dropped) > 1 else dropped[0]
         return None
 

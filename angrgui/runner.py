@@ -199,6 +199,17 @@ class Run:
             except Exception as e:
                 log.warning("snapshot reg %s: %s", r, e)
         state.regs.pc = claripy.BVV(pc, self.arch.bits)
+        # A snapshot's LR points into the real CALLER. Once this function returns we are
+        # done analysing it, so terminate the path at the return address rather than
+        # decoding on into the caller — whose code/PAC we have not set up, which would
+        # error (unhooked arm64e `retab`) or run unbounded. Clean "returned" leaf instead.
+        try:
+            rr = snap.get("regs") or {}
+            lr = rr.get("lr", rr.get("x30"))
+            if lr is not None and not self.project.is_hooked(int(lr)):
+                self.project.hook(int(lr), angr.SIM_PROCEDURES["stubs"]["PathTerminator"](), replace=False)
+        except Exception as e:
+            log.warning("snapshot return-terminator: %s", e)
         for m in (snap.get("mem") or []):
             try:
                 state.memory.store(int(m["addr"]), bytes.fromhex(m["hex"]))

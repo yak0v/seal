@@ -295,8 +295,13 @@ def patch_pac(project, start: int, end: int) -> dict:
         return _Br
 
     class _Nop(angr.SimProcedure):
+        # A signing/auth op (pacibsp, autibsp, xpaclri, …) is a no-op for data-flow: it
+        # must ADVANCE to the next instruction. A bare SimProcedure that returns None
+        # would instead do an implicit Ijk_Ret to LR (a SimProcedure models a *called
+        # function*), which silently returns from the function at the first PAC op — so
+        # jump explicitly to the next instruction. AArch64 instructions are 4 bytes.
         def run(self):
-            return None
+            self.jump(self.state.addr + 4)
 
     hooked: dict[str, str] = {}
     _RET = {"retaa", "retab"}
