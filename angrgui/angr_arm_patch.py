@@ -221,6 +221,34 @@ _EXPLICIT_ATTRS = {
 _applied = False
 
 
+# NEON vector floating-point arithmetic (Mul/Add/Sub/Div xFxy). angr HAS these ops but
+# its `_op_vector_float_mapped` returns NotImplemented on symbolic lanes and then crashes
+# (`'NotImplementedType' has no attribute 'raw_to_bv'`), so we OVERRIDE their calculate
+# with a correct per-lane claripy implementation (works for symbolic AND concrete).
+_VFP_OPS = {"Mul": "fpMul", "Add": "fpAdd", "Sub": "fpSub", "Div": "fpDiv"}
+_VECTOR_FP_OVERRIDE = [
+    "Iop_Mul64Fx2", "Iop_Add64Fx2", "Iop_Sub64Fx2", "Iop_Div64Fx2",
+    "Iop_Mul32Fx4", "Iop_Add32Fx4", "Iop_Sub32Fx4", "Iop_Div32Fx4",
+    "Iop_Mul32Fx2", "Iop_Add32Fx2", "Iop_Sub32Fx2",
+]
+
+
+def _op_generic_VectorFP(self, args):
+    """Lanewise IEEE fp op on two same-width vectors, round-to-nearest-even (the NEON
+    default). Reads self._vector_count / _vector_size for the lane layout."""
+    import claripy
+    fn = getattr(claripy, _VFP_OPS[self._generic_name])
+    rm = claripy.fp.RM.RM_NearestTiesEven
+    a, b = args[-2], args[-1]                    # last two args are the vector operands
+    lb = int(self._vector_size)                  # per-lane width in bits
+    out = []
+    for i in range(int(self._vector_count)):     # lane 0 = low bits
+        fa = a[(i + 1) * lb - 1:i * lb].raw_to_fp()
+        fb = b[(i + 1) * lb - 1:i * lb].raw_to_fp()
+        out.append(fn(rm, fa, fb).raw_to_bv())
+    return claripy.Concat(*reversed(out))        # Concat is big-endian: high lane first
+
+
 def apply() -> dict:
     """Install the handlers. Idempotent. Returns {op_name: 'ok'|error} for logging."""
     global _applied
@@ -261,6 +289,13 @@ def apply() -> dict:
         except Exception as e:                       # noqa: BLE001 - report, don't crash import
             status[nm] = f"{type(e).__name__}: {e}"
             log.warning("could not register %s: %s", nm, e)
+
+    # Override angr's broken symbolic vector-FP arithmetic with our per-lane version.
+    for nm in _VECTOR_FP_OVERRIDE:
+        op = irop.operations.get(nm)
+        if op is not None:
+            op._calculate = types.MethodType(_op_generic_VectorFP, op)
+            status[nm] = "overridden"
 
     _applied = True
     log.info("angr ARM NEON patch applied: %s", {k: v for k, v in status.items() if v != "ok"} or "all ok")
