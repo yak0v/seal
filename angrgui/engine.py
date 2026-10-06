@@ -491,14 +491,18 @@ class Binary:
         return cache[block_addr]
 
     def name_at(self, addr: int) -> str | None:
-        """Name of the function / PLT stub / angr SimProcedure starting at addr."""
+        """Name of the function / PLT stub / angr SimProcedure starting at addr.
+
+        A real SYMBOL wins over a hook's display name: we PAC-hook real function entries
+        (pacibsp), so `is_hooked` is true for ordinary functions — reporting the hook name
+        ("_Nop") there would mislabel e.g. aa_lineto. Only fall back to the hook name for
+        addresses that have no symbol (pure SimProcedure stubs)."""
+        nm = self._name_by_addr.get(addr)
+        if nm:
+            return nm
         if self.project.is_hooked(addr):
             return self.project.hooked_by(addr).display_name
         if self.lazy:
-            # resolve from the symbol index without triggering analysis of a callee
-            nm = self._name_by_addr.get(addr)
-            if nm:
-                return nm
             if self.project.kb.functions.contains_addr(addr):
                 return self.project.kb.functions.get(addr).name
             return None
@@ -543,7 +547,7 @@ class Binary:
         src_view = self._source_view(f)
         return {
             "addr": f.addr,
-            "name": f.name,
+            "name": self.name_at(f.addr) or f.name,   # symbol name, not the PAC-hook's "_Nop"
             "instructions": insns,
             "source": src_view,
             "call_targets": self._call_targets(f),
