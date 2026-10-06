@@ -1209,7 +1209,8 @@ function sectionChecks() {
 }
 function renderCheck(c, i) {
   const box = el("div", { class: "check" + (c.enabled ? "" : " dis") });
-  const kindPill = { int_overflow: "warn", narrowing_cast: "warn", float_anomaly: "warn", oob_write: "bad",
+  const kindPill = { int_overflow: "warn", narrowing_cast: "warn", float_anomaly: "warn", div_by_zero: "warn",
+                     oob_write: "bad", oob_read: "bad", null_deref: "bad",
                      assert: "warn", reach: "info", avoid: "warn", custom: "info" }[c.kind] || "info";
   box.append(el("div", { class: "top" },
     el("input", { type: "checkbox", checked: c.enabled ? "" : null, style: "width:auto", onchange: e => { c.enabled = e.target.checked; saveConfig(); renderRight(); } }),
@@ -1227,6 +1228,9 @@ function describeCheck(c) {
   if (c.kind === "narrowing_cast") return (c.addr ? hx64(c.addr) : "whole function") + " · value truncated to a smaller int loses data";
   if (c.kind === "float_anomaly") return (c.addr ? hx64(c.addr) : "whole function") + " · result can be NaN / ±Inf";
   if (c.kind === "oob_write") return `write outside ${c.base}[${c.size}]` + (c.addr ? " at " + hx64(c.addr) : "");
+  if (c.kind === "oob_read") return `read outside ${c.base}[${c.size}]` + (c.addr ? " at " + hx64(c.addr) : "");
+  if (c.kind === "null_deref") return (c.addr ? hx64(c.addr) : "whole function") + " · read/write through a NULL-able pointer";
+  if (c.kind === "div_by_zero") return (c.addr ? hx64(c.addr) : "whole function") + " · divisor can be 0";
   if (c.kind === "assert") return (c.at_return ? "at return: " : c.addr ? hx64(c.addr) + ": " : "every block: ") + c.expr;
   if (c.kind === "reach" || c.kind === "avoid") return "address " + hx64(c.addr);
   if (c.kind === "custom") return (c.addr ? "at " + hx64(c.addr) : "every block") + " · " + (c.code || "").split("\n").filter(l => l.trim() && !l.trim().startsWith("#")).slice(0, 1).join("").slice(0, 60);
@@ -3102,8 +3106,11 @@ function openDetectMenu(anchor) {
   m.append(el("div", { class: "vmlbl", style: "padding:2px 8px 4px" }, "detect a bug class"));
   [["Integer overflow / wrap", "add / sub / mul whose result wraps", openOverflowModal],
    ["Narrowing cast (lossy)", "value truncated to a smaller int, dropping set bits", openNarrowingModal],
+   ["Divide by zero", "an integer division/remainder whose divisor can be 0", openDivZeroModal],
    ["Floating-point anomaly", "result can be NaN or ±Inf", openFloatModal],
-   ["Out-of-bounds write", "a write that can leave a declared buffer", openOobModal]].forEach(([t, s, fn]) =>
+   ["Out-of-bounds write", "a write that can leave a declared buffer", () => openOobModal("oob_write")],
+   ["Out-of-bounds read", "a read that can leave a declared buffer (info leak)", () => openOobModal("oob_read")],
+   ["Null-pointer dereference", "a read/write through a pointer the inputs can make NULL", openNullDerefModal]].forEach(([t, s, fn]) =>
     m.append(el("div", { class: "popitem", style: "flex-direction:column;align-items:flex-start;gap:1px",
       onclick: () => { m.remove(); fn(); } }, el("span", {}, t), el("span", { class: "dargs" }, s))));
   document.body.append(m);
@@ -3152,15 +3159,17 @@ function openFloatModal() {
   $("#modalHost").append(m);
 }
 
-function openOobModal() {
+function openOobModal(kind) {
+  kind = kind || "oob_write";
+  const rw = kind === "oob_read" ? "read" : "write";
   const base = el("input", { placeholder: "a1   ·   rsp-0x40   ·   0x601080", style: "width:100%;box-sizing:border-box" });
   const size = el("input", { value: "64", style: "width:90px" });
   const sel = insnPicker();
   const body = el("div", {},
     field("Buffer start", base, "Expression for the buffer's base address: a pointer argument (a1/arg0/your name), a register expression (rsp-0x40), or a literal address."),
-    field("Buffer size (bytes)", size, "A write whose address can land outside [base, base+size) is reported — with the input that takes it there."),
-    field("Where (optional)", sel, "Restrict to one write instruction, or watch every write in the function."));
-  const m = modal("Detect out-of-bounds writes", body, [
+    field("Buffer size (bytes)", size, `A ${rw} whose address can land outside [base, base+size) is reported — with the input that takes it there.`),
+    field("Where (optional)", sel, `Restrict to one ${rw} instruction, or watch every ${rw} in the function.`));
+  const m = modal(`Detect out-of-bounds ${rw}s`, body, [
     el("button", { onclick: () => m.remove() }, "Cancel"),
     el("button", { class: "primary", onclick: () => {
       const b = base.value.trim();
@@ -3168,7 +3177,35 @@ function openOobModal() {
       const sz = parseIntLoose(size.value);
       if (!sz) { toast("enter the buffer size in bytes", true); return; }
       const addr = sel.value ? +sel.value : null;
-      addCheck({ kind: "oob_write", base: b, size: sz, addr, name: `OOB write · ${b}[${sz}]` });
+      addCheck({ kind, base: b, size: sz, addr, name: `OOB ${rw} · ${b}[${sz}]` });
+      m.remove();
+    } }, "Add check")]);
+  $("#modalHost").append(m);
+}
+
+function openDivZeroModal() {
+  const sel = insnPicker();
+  const body = el("div", {}, field("Where", sel,
+    "Scan the whole function, or one instruction. Flags an integer division or remainder whose divisor the inputs can make zero — including the case angr normally prunes by assuming the divisor is non-zero. The witness zeroes the divisor."));
+  const m = modal("Detect divide-by-zero", body, [
+    el("button", { onclick: () => m.remove() }, "Cancel"),
+    el("button", { class: "primary", onclick: () => {
+      const addr = sel.value ? +sel.value : null;
+      addCheck({ kind: "div_by_zero", addr, name: addr ? `div0 @ ${hx64(addr)}` : "divide by zero (whole function)" });
+      m.remove();
+    } }, "Add check")]);
+  $("#modalHost").append(m);
+}
+
+function openNullDerefModal() {
+  const sel = insnPicker();
+  const body = el("div", {}, field("Where", sel,
+    "Scan the whole function, or one instruction. Flags a memory read/write through a pointer the inputs can drive into the null page. angr zero-fills unmapped memory, so these never crash on their own — this surfaces them. The witness makes the pointer NULL."));
+  const m = modal("Detect null-pointer dereferences", body, [
+    el("button", { onclick: () => m.remove() }, "Cancel"),
+    el("button", { class: "primary", onclick: () => {
+      const addr = sel.value ? +sel.value : null;
+      addCheck({ kind: "null_deref", addr, name: addr ? `null deref @ ${hx64(addr)}` : "null deref (whole function)" });
       m.remove();
     } }, "Add check")]);
   $("#modalHost").append(m);
