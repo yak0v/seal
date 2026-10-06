@@ -373,6 +373,8 @@ class Binary:
 
     def return_block_heads(self, func_addr: int) -> list[int]:
         f = self.get_function(func_addr)
+        if f is None:
+            return []
         heads = []
         for block_addr in sorted(f.block_addrs_set):
             try:

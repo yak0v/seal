@@ -837,8 +837,90 @@ class NullDerefCheck(BaseCheck):
                      dedup_key=(ins_addr, access))
 
 
+class DivByZeroCheck(BaseCheck):
+    """An integer division or remainder whose DIVISOR the inputs can make zero. On x86
+    this faults (SIGFPE); on arm64 sdiv/udiv return 0 instead of trapping, but a
+    zero-divisor is still a strong logic-bug signal. Add "addr" to pin one instruction."""
+    kind = "div_by_zero"
+    installs_breakpoint = True
+    _DIV_OPS = {"__floordiv__", "SDiv", "__mod__", "SMod"}   # UDiv / SDiv / URem / SMod
+
+    def __init__(self, spec, ctx):
+        super().__init__(spec, ctx)
+        self.addr = spec.get("addr")
+
+    def install(self, state):
+        state.inspect.b("expr", when=angr.BP_AFTER, action=self._on_expr)
+
+    def _on_expr(self, state):
+        insp = state.inspect
+        r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
+        if not isinstance(r, claripy.ast.BV):
+            return
+        # The division is the top op on x86, but arm64 udiv/sdiv don't trap on a zero
+        # divisor (they return 0), so angr models them as If(divisor==0, 0, n DIV d) —
+        # the division is nested one level under the If. Handle both shapes.
+        if r.op in self._DIV_OPS:
+            divs = [r]
+        elif r.op == "If":
+            divs = [a for a in r.args if isinstance(a, claripy.ast.BV) and a.op in self._DIV_OPS]
+        else:
+            return
+        divisor = next((d.args[1] for d in divs
+                        if isinstance(d.args[1], claripy.ast.BV) and d.args[1].symbolic), None)
+        if divisor is None:
+            return
+        ins_addr = state.scratch.ins_addr
+        if ins_addr is None:
+            return
+        if self.addr is not None:
+            if ins_addr != self.addr:
+                return
+        elif not self.ctx.in_target_function(ins_addr):
+            return
+        # angr executes a division by ASSUMING the divisor is non-zero: it adds a
+        # `divisor != 0` constraint to the path, silently PRUNING the div-by-zero case.
+        # So the state we see already forbids it. Test `divisor == 0` against the path
+        # constraints MINUS that auto-added guard, and build the witness from that relaxed
+        # solver (the state's own solver can't produce divisor==0).
+        cond = divisor == 0
+        guard = divisor != 0
+        try:
+            # Drop the auto-added divisor-nonzero guard by LOGICAL equivalence, not by
+            # identity: angr stores it simplified (e.g. `b != 5`) while our guard is
+            # `(b-5) != 0` — same meaning, different AST. A constraint is the guard iff it
+            # is equivalent to `divisor != 0` (their XOR is unsatisfiable).
+            others = []
+            for c in state.solver.constraints:
+                try:
+                    is_guard = not claripy.Solver().satisfiable(extra_constraints=[c != guard])
+                except Exception:
+                    is_guard = (c.cache_key == guard.cache_key)
+                if not is_guard:
+                    others.append(c)
+            relaxed = claripy.Solver()
+            if others:
+                relaxed.add(others)
+            if not relaxed.satisfiable(extra_constraints=[cond]):
+                return
+        except Exception:
+            return
+        witness = {}
+        try:
+            relaxed.add(cond)
+            for nm, ast in (state.globals.get("angrgui_vars") or {}).items():
+                if isinstance(ast, claripy.ast.Base) and getattr(ast, "symbolic", False):
+                    witness[nm] = _fmt(relaxed.eval(ast, 1)[0], ast.size())
+        except Exception:
+            pass
+        self._record(state, ins_addr, f"division by zero at {hex(ins_addr)}: the divisor can be 0",
+                     witness, extra={"src_line": self.ctx.line_for(ins_addr), "path": self.ctx.path_of(state)},
+                     dedup_key=(ins_addr,))
+
+
 CHECK_TYPES = {
     "int_overflow": IntOverflowCheck,
+    "div_by_zero": DivByZeroCheck,
     "narrowing_cast": NarrowingCastCheck,
     "float_anomaly": FloatAnomalyCheck,
     "oob_write": BufferBoundsCheck,

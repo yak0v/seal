@@ -1071,6 +1071,9 @@ flow). Add checks to hunt specific conditions. Every check may take an optional
   • int_overflow  {"kind":"int_overflow","signed":"either|signed|unsigned"}
         An add/sub/mul whose result wraps past the type width. Witness = operands that
         wrap (e.g. a size near INT_MAX). Classic size-computation bug.
+  • div_by_zero  {"kind":"div_by_zero"}
+        An integer division/remainder whose divisor the inputs can make zero. Witness =
+        the input that zeroes the divisor.
   • narrowing_cast  {"kind":"narrowing_cast"}
         A value truncated to a smaller integer where the dropped high bits can be
         non-zero (information lost). Catches BOTH ordinary C casts (long→int) AND NEON
@@ -1380,6 +1383,8 @@ CHECK_KINDS = [
      "fields": {"addr": "0x.. (optional; omit to scan every add/sub/mul)",
                 "signed": "either | unsigned | signed"}},
     {"kind": "narrowing_cast", "summary": "a value truncated to a smaller int type (int->short, ->char, 64->32) where the dropped high bits can be non-zero",
+     "fields": {"addr": "0x.. (optional; omit to scan the whole function)"}},
+    {"kind": "div_by_zero", "summary": "an integer division/remainder whose divisor the inputs can make zero (faults on x86; returns 0 on arm64 but still a logic bug)",
      "fields": {"addr": "0x.. (optional; omit to scan the whole function)"}},
     {"kind": "float_anomaly", "summary": "a floating-point add/sub/mul/div whose result can be NaN or +/-Inf (from special or extreme inputs)",
      "fields": {"addr": "0x.. (optional; omit to scan the whole function)"}},

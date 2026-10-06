@@ -126,6 +126,19 @@ class Run:
         self.arch = binary.arch
         self.func_addr = spec["func_addr"]
         self.func = binary.get_function(self.func_addr)
+        # A safe function size even when the CFG function object is missing (get_function
+        # can return None for some stripped/edge functions) — so a run never crashes at
+        # setup. Prefer the CFG size, then the lazy index's size estimate, then a default.
+        self.func_size = 0x1000
+        try:
+            if self.func is not None and self.func.size:
+                self.func_size = self.func.size
+            else:
+                ent = next((e for e in getattr(binary, "_index", []) if e["addr"] == self.func_addr), None)
+                if ent and ent.get("size"):
+                    self.func_size = ent["size"]
+        except Exception:
+            pass
 
         self.status = "pending"       # pending|running|done|error|cancelled
         self.error: str | None = None
@@ -554,7 +567,7 @@ class Run:
     # ------------------------------------------------------------------ checks
     def _make_context(self):
         lo = self.func_addr
-        hi = self.func_addr + (self.func.size or 0x1000)
+        hi = self.func_addr + self.func_size
         rets = self.binary.return_block_heads(self.func_addr)
 
         def line_for(addr):
@@ -713,7 +726,7 @@ class Run:
     def _ret_insn(self, state) -> int:
         """Address of the return instruction the state just executed (for reporting)."""
         for b in reversed(list(state.history.bbl_addrs)):
-            if self.binary.get_function(self.func_addr) and self.func_addr <= b < self.func_addr + (self.func.size or 0x1000):
+            if self.func_addr <= b < self.func_addr + self.func_size:
                 try:
                     return self.project.factory.block(b).instruction_addrs[-1]
                 except Exception:
@@ -771,7 +784,7 @@ class Run:
 
             # Bound loop iterations so a loop with a symbolic trip count can't unroll
             # forever; over-the-bound states go to the 'spinning' stash.
-            if loop_bound > 0:
+            if loop_bound > 0 and self.func is not None:
                 try:
                     from angr.exploration_techniques import LoopSeer
                     simgr.use_technique(LoopSeer(
