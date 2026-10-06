@@ -1085,6 +1085,9 @@ flow). Add checks to hunt specific conditions. Every check may take an optional
         argument name / expression and "size" its length. OMIT base to check every
         write against the allocations tracked by your alloc models (PART 9) — that is
         how you find heap overflows across library calls.
+  • oob_read   {"kind":"oob_read","base":"a1","size":16}
+        Same as oob_write but for a memory READ that can fall outside the buffer — an
+        out-of-bounds read / information leak. Same fields and modeled mode.
   • null_deref  {"kind":"null_deref"}
         A memory read/write through a pointer the inputs can drive into the null page.
         angr zero-fills unmapped memory, so these never crash on their own — this check
@@ -1383,6 +1386,9 @@ CHECK_KINDS = [
     {"kind": "oob_write", "summary": "a memory write that can fall outside a buffer. Explicit: give base+size. Modeled: omit base to check writes against every buffer an 'alloc' call model handed out (heap overflows).",
      "fields": {"base": "expression for the buffer start, e.g. a1 or rsp-0x40 (omit for modeled mode)",
                 "size": "buffer size in bytes (with base)", "addr": "0x.. (optional single write instruction)"}},
+    {"kind": "oob_read", "summary": "like oob_write but for a memory READ that can fall outside a buffer (out-of-bounds read / info leak). Same fields as oob_write.",
+     "fields": {"base": "expression for the buffer start (omit for modeled mode)",
+                "size": "buffer size in bytes (with base)", "addr": "0x.. (optional single read instruction)"}},
     {"kind": "null_deref", "summary": "a memory read/write through a pointer the inputs can drive into the null page (a null-pointer dereference). angr zero-fills unmapped memory so these never crash on their own — this surfaces them.",
      "fields": {"addr": "0x.. (optional single instruction; omit to scan the whole function)",
                 "page": "size of the near-null window in bytes (default 0x1000)"}},

@@ -689,10 +689,14 @@ class BufferBoundsCheck(BaseCheck):
         super().__init__(spec, ctx)
         self.base_expr = spec.get("base") or None     # None => check modeled allocations
         self.size = int(spec.get("size", 0))
-        self.addr = spec.get("addr")            # restrict to one write instruction, optional
+        self.addr = spec.get("addr")            # restrict to one access instruction, optional
+        # Same bounds logic for reads (oob_read: info-leak) and writes (oob_write: corruption).
+        self.access = "read" if spec.get("kind") == "oob_read" else "write"
+        self.kind = spec.get("kind") or self.kind
 
     def install(self, state):
-        state.inspect.b("mem_write", when=angr.BP_BEFORE, action=self._on_write)
+        ev = "mem_read" if self.access == "read" else "mem_write"
+        state.inspect.b(ev, when=angr.BP_BEFORE, action=self._on_write)
 
     def _on_write(self, state):
         ins_addr = state.scratch.ins_addr
@@ -703,14 +707,18 @@ class BufferBoundsCheck(BaseCheck):
                 return
         elif not self.ctx.in_target_function(ins_addr):
             return
-        wa = state.inspect.mem_write_address
+        if self.access == "read":
+            wa = state.inspect.mem_read_address
+            wl = state.inspect.mem_read_length
+        else:
+            wa = state.inspect.mem_write_address
+            wl = state.inspect.mem_write_length
         if wa is None or not isinstance(wa, claripy.ast.BV):
             return
         if self.base_expr is not None and not wa.symbolic:
             return                          # explicit mode: constant addresses are stack spills, not buffer indexing
-        wl = state.inspect.mem_write_length
         if wl is None:
-            expr = state.inspect.mem_write_expr
+            expr = state.inspect.mem_write_expr if self.access == "write" else None
             wl = (expr.size() // 8) if expr is not None else 1
         bits = wa.size()
         length = wl if isinstance(wl, claripy.ast.BV) else claripy.BVV(int(wl), bits)
@@ -766,7 +774,7 @@ class BufferBoundsCheck(BaseCheck):
             where = tmp.solver.eval(wa); base_v = tmp.solver.eval(base); size_v = tmp.solver.eval(size_bv)
         except Exception:
             pass
-        msg = f"out-of-bounds write at {hex(ins_addr)}: address can leave {label}"
+        msg = f"out-of-bounds {self.access} at {hex(ins_addr)}: address can leave {label}"
         self._record(state, ins_addr, msg, witness,
                      extra={"write_addr": (hex(where) if where is not None else None),
                             "buffer_base": (hex(base_v) if base_v is not None else None),
@@ -834,6 +842,7 @@ CHECK_TYPES = {
     "narrowing_cast": NarrowingCastCheck,
     "float_anomaly": FloatAnomalyCheck,
     "oob_write": BufferBoundsCheck,
+    "oob_read": BufferBoundsCheck,
     "null_deref": NullDerefCheck,
     "assert": AssertCheck,
     "reach": ReachCheck,

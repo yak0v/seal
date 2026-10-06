@@ -297,6 +297,21 @@ def apply() -> dict:
             op._calculate = types.MethodType(_op_generic_VectorFP, op)
             status[nm] = "overridden"
 
+    # Half-precision (f16) conversions: claripy's concrete backend can't represent a
+    # 16-bit float (no numpy either), so there is NO correct way to model these here —
+    # and a wrong/approximate one would produce spurious witnesses. angr's own handler
+    # raises a cryptic IndexError; replace it with a CLEAR UnsupportedIROpError so a path
+    # that hits f16 errors legibly (visible in get_run's detail) instead of mysteriously.
+    def _f16_unsupported(self, args):
+        raise UnsupportedIROpError(
+            f"{self.name}: half-precision (f16) conversion is not modeled — claripy has no "
+            "16-bit float type, so SEAL cannot represent it without producing wrong results")
+    for nm in ("Iop_F32toF16", "Iop_F16toF32", "Iop_F64toF16", "Iop_F16toF64"):
+        op = irop.operations.get(nm)
+        if op is not None:
+            op._calculate = types.MethodType(_f16_unsupported, op)
+            status[nm] = "f16-clean-error"
+
     _applied = True
     log.info("angr ARM NEON patch applied: %s", {k: v for k, v in status.items() if v != "ok"} or "all ok")
     return status
