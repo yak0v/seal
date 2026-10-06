@@ -13,7 +13,7 @@ CC ?= gcc
 CFLAGS ?= -g -O0 -fno-stack-protector -no-pie -fno-omit-frame-pointer -Wno-unused-result
 PYTHON ?= $(if $(wildcard ../.venv/bin/python),../.venv/bin/python,python3)
 
-all: vuln vuln.angrgui.json jsonc_printbuf
+all: vuln vuln.angrgui.json jsonc_printbuf checks_sample
 
 vuln: vuln.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -32,3 +32,7 @@ clean:
 	rm -f vuln vuln.angrgui.json jsonc_printbuf
 
 .PHONY: all clean
+
+# planted bugs for the div_by_zero / null_deref / oob_read checks
+checks_sample: checks_sample.c
+	$(CC) $(CFLAGS) -fno-inline -o $@ $<

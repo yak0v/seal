@@ -857,19 +857,26 @@ class DivByZeroCheck(BaseCheck):
         r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
         if not isinstance(r, claripy.ast.BV):
             return
-        # The division is the top op on x86, but arm64 udiv/sdiv don't trap on a zero
-        # divisor (they return 0), so angr models them as If(divisor==0, 0, n DIV d) —
-        # the division is nested one level under the If. Handle both shapes.
-        if r.op in self._DIV_OPS:
-            divs = [r]
-        elif r.op == "If":
-            divs = [a for a in r.args if isinstance(a, claripy.ast.BV) and a.op in self._DIV_OPS]
-        else:
+        # Find the division node. Its position in the result varies by arch: a clean top
+        # op on arm64 (SDiv), nested under an If on a trapping model, or under an Extract
+        # on x86 (idiv is 64/32->32, so the quotient is Extract(31:0, sext(n) /s sext(d))).
+        # Bounded DFS through the wrapper ops that can sit above a division.
+        _WRAP = {"If", "Extract", "Concat", "SignExt", "ZeroExt", "__add__", "__sub__"}
+        divnode = None
+        stack, seen = [(r, 0)], 0
+        while stack and seen < 40:
+            node, depth = stack.pop(); seen += 1
+            if not isinstance(node, claripy.ast.BV):
+                continue
+            if node.op in self._DIV_OPS and len(node.args) >= 2 \
+                    and isinstance(node.args[1], claripy.ast.BV) and node.args[1].symbolic:
+                divnode = node
+                break
+            if depth < 5 and node.op in _WRAP:
+                stack.extend((a, depth + 1) for a in node.args)
+        if divnode is None:
             return
-        divisor = next((d.args[1] for d in divs
-                        if isinstance(d.args[1], claripy.ast.BV) and d.args[1].symbolic), None)
-        if divisor is None:
-            return
+        divisor = divnode.args[1]
         ins_addr = state.scratch.ins_addr
         if ins_addr is None:
             return

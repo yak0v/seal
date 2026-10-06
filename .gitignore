@@ -45,3 +45,6 @@ seal_validation/glyph_harness
 seal_validation/snapshot/harness
 *.dSYM/
 seal_validation/*.log
+
+# built checks sample (rebuild: make -C samples checks_sample)
+samples/checks_sample
