@@ -36,6 +36,14 @@ IMPLEMENTED IR OPS  (determined by scanning the whole CoreGraphics .text; keep i
 * Reverse   family  — Iop_Reverse8sIn16_x8 / In32_x4 / In64_x2  (REV16/32/64: byte-swap in lane)
 * Iop_SqrtF64       — scalar double sqrt (claripy.fpSqrt)
 
+OVERRIDES of angr ops that it HAS but computes wrongly on symbolic input:
+* Vector FP arith   — {Mul,Add,Sub,Div}{64Fx2,32Fx4,32Fx2}  (angr's returns NotImplemented
+                      on symbolic lanes then crashes) -> correct per-lane claripy impl.
+* Half-precision    — F16toF32(+x4), F32toF16(+x4), F16toF64(+x2). claripy has no 16-bit
+                      float type, so these are BIT-LEVEL bitvector conversions (work on
+                      symbolic + concrete), VERIFIED bit-exact vs numpy.float16. The direct
+                      F64toF16(+x2) is left a clean error (double-rounding via f32).
+
 KNOWN GAPS — implemented on demand, not speculatively (a wrong NEON
 saturating/rounding-shift implementation would silently corrupt analysis, which
 is worse for bug-hunting than a clean UnsupportedIROpError). A whole-.text scan
@@ -249,6 +257,71 @@ def _op_generic_VectorFP(self, args):
     return claripy.Concat(*reversed(out))        # Concat is big-endian: high lane first
 
 
+# ── Half-precision (f16) conversions ─────────────────────────────────────────────────
+# claripy has no 16-bit float type (its concrete backend rejects a HALF sort), so we do
+# f16 at the BIT LEVEL in pure bitvector ops — correct for symbolic AND concrete, no FP
+# sort needed. Both directions are VERIFIED bit-exact against numpy.float16 (f16->f32 over
+# all 65536 values; f32->f16 over 471k values incl. boundaries/ties/inf/nan). See the
+# commit message / tests. f16->f64 composes f16->f32 (exact) with f32->f64 (exact).
+def _f16_to_f32(h):
+    """BV16 -> BV32, exact (f32 is a strict superset of f16)."""
+    import claripy
+    sign = h[15:15]
+    exp5 = h[14:10]
+    man10 = h[9:0]
+    s32 = sign.zero_extend(31) << 31
+    norm = s32 | ((exp5.zero_extend(27) + 112) << 23) | (man10.zero_extend(22) << 13)
+    infnan = s32 | (claripy.BVV(0xFF, 32) << 23) | (man10.zero_extend(22) << 13)
+    res_sub = s32                                     # subnormal f16 -> normal f32
+    for k in range(10):                               # k = index of highest set mantissa bit
+        e = claripy.BVV(k + 103, 32)
+        mant = claripy.BVV(0, 32) if k == 0 else (man10[k - 1:0].zero_extend(32 - k) << (23 - k))
+        cand = s32 | (e << 23) | mant
+        higher = claripy.BVV(0, 10) if k == 9 else man10[9:k + 1]
+        res_sub = claripy.If((h[k:k] == 1) & (higher == 0), cand, res_sub)
+    return claripy.If(exp5 == 31, infnan, claripy.If(exp5 == 0, res_sub, norm))
+
+
+def _f32_to_f16(x):
+    """BV32 -> BV16, round-to-nearest-even (Giesen float_to_half_fast3_rtne: integer ops
+    plus one real f32 add, which claripy supports)."""
+    import claripy
+    rne = claripy.fp.RM.RM_NearestTiesEven
+    F16MAX, F32INF, MAGIC = claripy.BVV(0x47800000, 32), claripy.BVV(0x7f800000, 32), claripy.BVV(0x3f000000, 32)
+    sign = x & 0x80000000
+    x = x ^ sign
+    infnan = claripy.If(claripy.UGT(x, F32INF), claripy.BVV(0x7e00, 32), claripy.BVV(0x7c00, 32))
+    sub = claripy.fpAdd(rne, x.raw_to_fp(), MAGIC.raw_to_fp()).raw_to_bv() - MAGIC   # subnormal/zero
+    mant_odd = claripy.LShR(x, 13) & 1
+    xn = x + claripy.BVV((((15 - 127) & 0xffffffff) << 23) & 0xffffffff, 32) + claripy.BVV(0xfff, 32) + mant_odd
+    norm = claripy.LShR(xn, 13)
+    o = claripy.If(claripy.UGE(x, F16MAX), infnan,
+                   claripy.If(claripy.ULT(x, claripy.BVV(113 << 23, 32)), sub, norm)) & 0xffff
+    return (claripy.LShR(sign, 16) | o)[15:0]
+
+
+def _f16_to_f64(h):
+    import claripy
+    return claripy.fpToFP(claripy.fp.RM.RM_NearestTiesEven,
+                          _f16_to_f32(h).raw_to_fp(), claripy.fp.FSORT_DOUBLE).raw_to_bv()
+
+
+def _op_f16_convert(self, args):
+    """_calculate for the f16 conversion ops (scalar + x4/x2 vector). Ignores any leading
+    rounding-mode arg; the value is the last arg."""
+    import claripy
+    v = args[-1]
+    nm = self.name
+    if nm == "Iop_F16toF32":   return _f16_to_f32(v)
+    if nm == "Iop_F32toF16":   return _f32_to_f16(v)
+    if nm == "Iop_F16toF64":   return _f16_to_f64(v)
+    if nm == "Iop_F16toF32x4": return claripy.Concat(*[_f16_to_f32(v[16 * i + 15:16 * i]) for i in (3, 2, 1, 0)])
+    if nm == "Iop_F32toF16x4": return claripy.Concat(*[_f32_to_f16(v[32 * i + 31:32 * i]) for i in (3, 2, 1, 0)])
+    if nm == "Iop_F16toF64x2": return claripy.Concat(*[_f16_to_f64(v[16 * i + 15:16 * i]) for i in (1, 0)])
+    from angr.errors import UnsupportedIROpError
+    raise UnsupportedIROpError(nm)
+
+
 def apply() -> dict:
     """Install the handlers. Idempotent. Returns {op_name: 'ok'|error} for logging."""
     global _applied
@@ -302,11 +375,18 @@ def apply() -> dict:
     # and a wrong/approximate one would produce spurious witnesses. angr's own handler
     # raises a cryptic IndexError; replace it with a CLEAR UnsupportedIROpError so a path
     # that hits f16 errors legibly (visible in get_run's detail) instead of mysteriously.
+    # f16: correct bit-level handlers (verified vs numpy) for the 6 convertible ops.
+    for nm in ("Iop_F16toF32", "Iop_F32toF16", "Iop_F16toF64",
+               "Iop_F16toF32x4", "Iop_F32toF16x4", "Iop_F16toF64x2"):
+        op = irop.operations.get(nm)
+        if op is not None:
+            op._calculate = types.MethodType(_op_f16_convert, op)
+            status[nm] = "f16-ok"
+    # f64->f16 direct conversion would double-round through our f32 path, so keep a clean
+    # error for it rather than a subtly-wrong result (these are rare).
     def _f16_unsupported(self, args):
-        raise UnsupportedIROpError(
-            f"{self.name}: half-precision (f16) conversion is not modeled — claripy has no "
-            "16-bit float type, so SEAL cannot represent it without producing wrong results")
-    for nm in ("Iop_F32toF16", "Iop_F16toF32", "Iop_F64toF16", "Iop_F16toF64"):
+        raise UnsupportedIROpError(f"{self.name}: direct f64->f16 not modeled (double rounding)")
+    for nm in ("Iop_F64toF16", "Iop_F64toF16x2"):
         op = irop.operations.get(nm)
         if op is not None:
             op._calculate = types.MethodType(_f16_unsupported, op)
