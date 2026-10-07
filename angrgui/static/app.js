@@ -233,7 +233,7 @@ function renderFunctions() {
 
 // ==================================================================== select function
 async function selectFunction(f) {
-  A.fn = f; A.run = null; A.selectedHit = null; A.selNode = null; A.pathHighlight = null; A.collapsed.clear(); A.loopCollapsed.clear();
+  A.fn = f; A.run = null; A.selectedHit = null; A.selNode = null; A.pathHighlight = null; A.collapsed.clear(); A.loopCollapsed.clear(); A.cfgExpanded = new Set();
   try { localStorage.setItem("lastFn:" + (A.binary && A.binary.name), f.addr); } catch (e) {}
   stopPolling();
   renderFunctions();
@@ -3394,13 +3394,19 @@ function drawCFG(pane, g) {
   const gr = new dagre.graphlib.Graph({ multigraph: true });
   gr.setGraph({ rankdir: "TB", nodesep: 26, ranksep: 34, marginx: 20, marginy: 20 });
   gr.setDefaultEdgeLabel(() => ({}));
-  const LINE_H = 16, CHAR_W = 7.3, PAD = 11;
+  const LINE_H = 16, CHAR_W = 7.3, PAD = 11, CAP = 8;
+  const expanded = (A.cfgExpanded || (A.cfgExpanded = new Set()));
   for (const n of g.nodes) {
-    const lines = n.insns.slice(0, 8).map(i => i.text);     // instructions only; addresses dropped
-    if (n.insns.length > 8) lines.push(`… +${n.insns.length - 8}`);
-    const w = Math.max(120, Math.min(460, Math.max(...lines.map(l => l.length)) * CHAR_W + PAD * 2));
+    // long blocks are capped to CAP instructions with a clickable "+N" line; an expanded
+    // node (#7) shows them all with a "collapse" line. expandLine = index of that line.
+    const showAll = expanded.has(n.addr), truncated = n.insns.length > CAP;
+    const lines = (showAll ? n.insns : n.insns.slice(0, CAP)).map(i => i.text);
+    let expandLine = -1;
+    if (truncated && !showAll) { lines.push(`… +${n.insns.length - CAP} more — click to expand`); expandLine = lines.length - 1; }
+    else if (truncated && showAll) { lines.push("▲ collapse"); expandLine = lines.length - 1; }
+    const w = Math.max(120, Math.min(560, Math.max(...lines.map(l => l.length)) * CHAR_W + PAD * 2));
     const h = lines.length * LINE_H + PAD * 2 + 16;
-    gr.setNode(n.addr, { label: hx64(n.addr), lines, width: w, height: h, insns: n.insns });
+    gr.setNode(n.addr, { label: hx64(n.addr), lines, width: w, height: h, insns: n.insns, expandLine });
   }
   let ei = 0;
   for (const e of g.edges) if (gr.hasNode(e.src) && gr.hasNode(e.dst)) gr.setEdge(e.src, e.dst, { kind: e.kind }, "e" + (ei++));
@@ -3418,6 +3424,16 @@ function drawCFG(pane, g) {
       <feDropShadow dx="0" dy="1.2" stdDeviation="1.6" flood-color="#000000" flood-opacity="0.55"/></filter></defs>`;
   const viewport = document.createElementNS(NS, "g");
   svg.append(viewport);
+
+  // #7: toggle a node between capped (8 insns) and fully expanded, then re-lay-out the
+  // graph (node heights change). cfgExpanded is reset when the function changes.
+  const toggleExpand = (addr) => {
+    const s = A.cfgExpanded || (A.cfgExpanded = new Set());
+    s.has(addr) ? s.delete(addr) : s.add(addr);
+    if (pane._cfg && pane._cfg.cleanup) pane._cfg.cleanup();
+    delete pane._cfg;
+    drawCFG(pane, g);
+  };
 
   const edgeEls = [], nodeEls = {};
   gr.edges().forEach(eid => {
@@ -3449,14 +3465,21 @@ function drawCFG(pane, g) {
       t.setAttribute("x", 9); t.setAttribute("y", 32 + i * LINE_H);
       t.setAttribute("font-family", "var(--mono)"); t.setAttribute("font-size", "12.5");
       t.setAttribute("xml:space", "preserve");
-      // syntax-highlight each instruction into coloured tspans (IDA-style)
-      asmSpans(ln).forEach(sp => {
-        const ts = document.createElementNS(NS, "tspan");
-        ts.setAttribute("xml:space", "preserve");
-        if (sp.cls !== "ws") ts.setAttribute("fill", IDA[sp.cls]);
-        ts.textContent = sp.s;
-        t.append(ts);
-      });
+      if (i === n.expandLine) {              // the "+N more" / "collapse" control line
+        t.setAttribute("fill", "var(--accent)");
+        t.style.cursor = "pointer";
+        t.textContent = ln;
+        t.addEventListener("click", ev => { ev.stopPropagation(); toggleExpand(+id); });
+      } else {
+        // syntax-highlight each instruction into coloured tspans (IDA-style)
+        asmSpans(ln).forEach(sp => {
+          const ts = document.createElementNS(NS, "tspan");
+          ts.setAttribute("xml:space", "preserve");
+          if (sp.cls !== "ws") ts.setAttribute("fill", IDA[sp.cls]);
+          ts.textContent = sp.s;
+          t.append(ts);
+        });
+      }
       gEl.append(t);
       lineEls.push(t);
     });
