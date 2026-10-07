@@ -291,3 +291,29 @@ miss.)
 the same caveat to the `assert` CHECK_KINDS entry and to exprlang's `ret`
 documentation. Verified `s32(ret) s>= 0` finds the counterexample over MCP; exprlang
 tests green.
+
+## Experiment 10 — the `oob_write` family (modeled heap overflow + direct write)
+
+**Use case:** validate the out-of-bounds *write* detection (recipe D, the
+heap-overflow headline) — which turned out to have **zero** automated test coverage.
+
+**Findings (all checked over MCP):**
+- `oob_write` on a **direct indexed store** (`buf[i] = v`, built as a throwaway
+  research function) fires correctly when `buf` is **declared as a buffer** — the
+  Exp-3 auto-anchor path works for writes too (witness: an out-of-range `i`).
+- **Gotcha:** an *explicit* `base=buf,size=16` where `buf` is just an **undeclared,
+  wild-symbolic pointer arg** did NOT fire — the write address is fully symbolic
+  with no concrete backing. Declaring the buffer (concrete base) is the robust path.
+- **Limitation:** modeling `malloc` as an `alloc` and running `vuln.alloc_msg`
+  (whose overflow is a **`memset` loop**) found nothing — a bulk SimProcedure write
+  (memset/memcpy, with skip_calls off) isn't observed per-byte by the oob check.
+  A direct indexed store is. (Noted; a deeper fix would hook bulk writes.)
+
+**Action — docs:** rewrote the `oob_write`/`oob_read` CHECK_KINDS guidance to lead
+with the recommended **declare-a-buffer** anchor (concrete base), warn that an
+explicit base on a wild-symbolic pointer often won't fire, and note the
+bulk-SimProcedure-write limitation. (Could not add a committable regression test:
+the canonical sample needs the x86-64 Linux cross-compiler, absent here; a zig build
+pulls UBSan/runtime and isn't equivalent. The coverage gap is logged for a follow-up
+on a toolchain-equipped machine — build cmd that works: `zig cc -target
+x86_64-linux-gnu -O0 -fno-stack-protector -no-pie -fno-sanitize=undefined`.)
