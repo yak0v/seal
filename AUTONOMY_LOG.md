@@ -487,3 +487,21 @@ checked against all oob/check tests).
 (symbolic length) still isn't caught per-byte — angr-internal write semantics,
 version-brittle to touch. Documented in the `oob_write` guidance (prefer a manual
 loop / model the allocator).
+
+## Experiment 18 — validate call models (concrete / symbolic / return_arg)
+
+**Use case:** model a function the target calls (recipe D) — untested over MCP for
+the non-alloc kinds. Clean setup: in `vuln.main`, `reach` the `alloc_msg` branch
+(taken only when `route(...)==7`).
+
+**Result (all correct, no bug):**
+- **control** (no model, real `route`): `r==7` is NOT reachable (0 hits) — right,
+  `route` can't return 7 for valid inputs.
+- **concrete** `route()=7`: branch reached (the model forces the return).
+- **symbolic** `route()`→fresh symbolic: branch reached (`r` unconstrained).
+- **return_arg** `route()`→arg0 (`cmd`): branch reached with witness
+  `stdin="0700000000000000"` — the solver set `buf[0]=7` so the returned `cmd` is 7.
+  Exactly right.
+
+The call-model feature works across all kinds (alloc validated earlier in Exp 10).
+A confidence experiment — no fix needed.
