@@ -604,7 +604,11 @@ function renderCode() {
     const row = el("div", { class: "insn" + (ins.arith ? " arith" : ""), "data-addr": ins.addr, "data-block": ins.block },
       el("span", { class: "ad" }, hx64(ins.addr)),
       el("span", { class: "mn" }, ins.mnemonic),
-      el("span", { class: "op" }, annotate(ins.op_str), ins.is_call && di.call_targets[ins.addr] ? "   ; " + (di.call_targets[ins.addr].name || "") : ""),
+      el("span", { class: "op" }, annotate(ins.op_str),
+        // name the call's target: prefer the reliable per-instruction call_name
+        // (resolved from the call operand), fall back to the callsite-keyed map
+        (() => { const nm = ins.call_name || (di.call_targets && di.call_targets[ins.addr] && di.call_targets[ins.addr].name);
+                 return ins.is_call && nm ? "   ; " + nm : ""; })()),
       callModelTag(ins),
       ins.src_line ? el("span", { class: "faint", style: "flex:0 0 auto;margin-right:6px" }, ":" + ins.src_line) : null,
       acts);

@@ -363,3 +363,16 @@ state-point checks once on the entry state). Verified over MCP:
   swallowed before because the entry-block check never ran);
 - Exp 6's "reach at the function entry" now works too.
 Full suite 68 passed.
+
+## Experiment 13 — surface the call-target names in the GUI disassembly
+
+**Follow-up to Exp 2:** the engine now attaches a reliable per-instruction
+`call_name`, and the MCP disassembly uses it — but the GUI code view still
+annotated calls from the old `call_targets` map (keyed by the transition-graph
+callsite address), which misaligns for many calls, so a human saw `call 0x4006f1`
+with no name for `scale`/`frame_size`.
+
+**Action:** the GUI disassembly now prefers `ins.call_name` (falling back to the
+old map). Verified in-browser on `vuln.route`: all three direct calls now read
+`call 0x… ; abort`, `; scale`, `; frame_size` (previously only the first was
+named); no console errors.
