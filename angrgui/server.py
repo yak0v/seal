@@ -826,16 +826,28 @@ def _mcp_add_model(addr, model):
     return _mcp_get_function(a)["config"]
 
 
-def _mcp_run(addr):
-    a = _addr(addr)
-    flat = Workspace.flatten(S.workspace.get_function(a))   # the active scenario
-    spec = {"func_addr": a, "args": flat.get("args") or [], "buffers": flat.get("buffers") or [],
+def _scenario_spec(a: int) -> dict:
+    """The run spec for a function's ACTIVE scenario (shared by run + script export)."""
+    flat = Workspace.flatten(S.workspace.get_function(a))
+    return {"func_addr": a, "args": flat.get("args") or [], "buffers": flat.get("buffers") or [],
             "assumptions": [x for x in (flat.get("assumptions") or []) if x.strip()],
             "stdin": flat.get("stdin"), "files": flat.get("files") or [], "limits": flat.get("limits") or {},
             "models": flat.get("models") or [], "initial_state": flat.get("initial_state"),
             "checks": [c for c in flat.get("checks", []) if c.get("enabled", True)]}
+
+
+def _mcp_run(addr):
+    a = _addr(addr)
     # checks are optional: with none, this just enumerates the paths (control-flow exploration)
-    return {"run_id": _start_run(spec, source="agent")}
+    return {"run_id": _start_run(_scenario_spec(a), source="agent")}
+
+
+def _mcp_script(addr):
+    """The standalone angr script equivalent to this function's active scenario —
+    a runnable .py an agent can hand to the user to reproduce the run outside SEAL."""
+    b = _need_binary()
+    a = _addr(addr)
+    return {"addr": hex(a), "code": generate_script(b, _scenario_spec(a))}
 
 
 def _mcp_get_run(run_id):
@@ -1465,6 +1477,10 @@ TOOL_DEFS = [
     {"name": "export_scenario", "description": "Bundle the active scenario's setup, the shared checks, and the latest run's "
      "findings + paths — the same data the GUI's Export produces.",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
+    {"name": "generate_script", "description": "The standalone, runnable angr Python script equivalent to this function's active "
+     "scenario (same initial state, assumptions, checks, limits). Hand it to the user to reproduce the run outside SEAL; "
+     "it reports the same findings.",
+     "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
     {"name": "ida_connect", "description": "Connect to an IDA MCP server for real names + Hex-Rays decompilation. "
      "url defaults to the configured one; host_header is auto-set to loopback for forwarded servers.",
      "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "host_header": {"type": "string"}}}},
@@ -1543,6 +1559,7 @@ _MCP_TOOLS = {
     "remove_assumption": lambda a: _mcp_remove_assumption(a["addr"], a.get("index"), a.get("expr")),
     "remove_check": lambda a: _mcp_remove_check(a["addr"], a["check"]),
     "export_scenario": lambda a: _mcp_export_scenario(a["addr"]),
+    "generate_script": lambda a: _mcp_script(a["addr"]),
     "ida_connect": lambda a: _mcp_ida_connect(a.get("url"), a.get("host_header")),
     "ida_disconnect": lambda a: _mcp_ida_disconnect(),
     "ida_refresh": lambda a: _mcp_ida_refresh(),

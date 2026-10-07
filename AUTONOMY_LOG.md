@@ -317,3 +317,23 @@ the canonical sample needs the x86-64 Linux cross-compiler, absent here; a zig b
 pulls UBSan/runtime and isn't equivalent. The coverage gap is logged for a follow-up
 on a toolchain-equipped machine — build cmd that works: `zig cc -target
 x86_64-linux-gnu -O0 -fno-stack-protector -no-pie -fno-sanitize=undefined`.)
+
+## Experiment 11 — the generated standalone angr script (codegen)
+
+**Use case:** the tool advertises an "equivalent standalone angr script" — verify it
+actually runs and reproduces the finding, and check it's reachable the way an agent
+would want it.
+
+**Verified:** generated the script for `vuln.alloc_msg` + `int_overflow`, ran it with
+plain `python3`, and it reports the SAME finding as the GUI/MCP —
+`0x400636: unsigned overflow in *`, witness `count=0xff7ff9ff, size=0x69a8bfff`.
+The codegen is faithful and runnable. Checked and it really runs.
+
+**Friction found:** the script was only reachable via the HTTP `/api/script` route
+(used by the GUI); there was **no MCP tool**, so an agent driving over MCP couldn't
+produce the runnable script to hand to the user.
+
+**Action — feature:** added a `generate_script` MCP tool (and refactored the run-spec
+build into a shared `_scenario_spec` so the script and the run can never diverge).
+Verified over MCP: `generate_script` returns the code, and the returned script runs
+standalone and reports the overflow. mcp + codegen tests green (31 passed).
