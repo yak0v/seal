@@ -266,3 +266,28 @@ instead of failing a run later. Also polished the parser's end-of-input messages
 unknown-name expression (`nope > 5`) is still accepted at add time and surfaces its
 clear "unknown name" error at run (name resolution needs a live state, by design).
 exprlang + full suite green (68 passed).
+
+## Experiment 9 — the GUIDE's `at_return` assert recipe (recipe E) silently finds nothing
+
+**Use case:** verify the shipped GUIDE recipe E ("prove a property on the return
+value") actually works — agents copy these verbatim. Tested on `vuln.scale`
+(`int scale(int a,int b){ return a*b+100; }`, which can clearly return negative).
+
+**Friction found (real, subtle):** `add_check assert "ret s>= 0" at_return:true`
+found **nothing** — the recipe as shipped is broken for the common case. Cause:
+`ret` resolves to the FULL return register (`rax`, 64-bit), but `scale` returns a
+32-bit `int` in `eax` with the high 32 bits zero, so as a 64-bit value `ret` is
+*always* ≥ 0 and the negation is unsatisfiable. Confirmed the fix:
+`s32(ret) s>= 0` fires immediately (witness `a=-101, b=1` → returns −1).
+
+(The runner's synthetic prototype hardcodes the return as `long long`, and real
+C return-type width isn't reliably known for stripped binaries — so making `ret`
+auto-narrow would be unreliable and could surprise ABI-level users who want the raw
+register. The safe, correct fix is to make the width explicit and impossible to
+miss.)
+
+**Action — docs:** fixed GUIDE recipe E to use `s32(ret)` with an explicit NOTE
+("`ret` is the full return register; wrap narrower returns with s32/u32"); added
+the same caveat to the `assert` CHECK_KINDS entry and to exprlang's `ret`
+documentation. Verified `s32(ret) s>= 0` finds the counterexample over MCP; exprlang
+tests green.

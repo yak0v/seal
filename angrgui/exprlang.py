@@ -16,7 +16,10 @@ Identifiers resolve, in this order, to
   1. names bound by the run (function arguments, buffers, stdin) - state.globals['angrgui_vars']
   2. DWARF local variables of the function - state.globals['angrgui_locals'] (loaded from the frame)
   3. CPU registers (rax, edi, ...)
-  4. `ret` - the return value register (rax/eax/...)
+  4. `ret` - the return value register, at FULL register width (rax, 64-bit on
+     x86-64). A function returning a 32-bit int leaves the high bits zero, so wrap
+     narrower returns to width — `s32(ret)` / `u32(ret)` — or a signed test like
+     `ret s>= 0` is always true.
 
 Comparisons are unsigned by default; prefix the operator with `s` for signed (s<, s<=, s>, s>=).
 Widths are matched automatically by zero-extending the narrower side.

@@ -1371,9 +1371,12 @@ D · Heap overflow across library calls
 
 E · Invariant / assertion (prove a property or get a counterexample)
    configure(a, {"args":[{"name":"n","mode":"symbolic","size":4}]})
-   add_check(a, {"kind":"assert","expr":"ret s>= 0","at_return":true})
+   add_check(a, {"kind":"assert","expr":"s32(ret) s>= 0","at_return":true})
    rid = run(a).run_id ; poll get_run(rid)
    # if the invariant can be false: finding with the n that makes the return negative.
+   # NOTE: `ret` is the FULL return register (64-bit on x86-64). A function returning a
+   # 32-bit int leaves the high bits zero, so `ret s>= 0` is ALWAYS true and finds
+   # nothing — wrap it to the real width: s32(ret) / u32(ret) (s16/u16, ... likewise).
 
 ════════════════════════════════════════════════════════════════════════
 PART 13 — GOTCHAS (the list of things that will waste your time)
@@ -1492,8 +1495,8 @@ CHECK_KINDS = [
      "fields": {"addr": "0x.. (required; any instruction, e.g. a call site)"}},
     {"kind": "avoid", "summary": "record + flag paths that reach an address (a 'bad' location). addr may be any instruction in a block.",
      "fields": {"addr": "0x.. (required; any instruction)"}},
-    {"kind": "assert", "summary": "a boolean that must always hold; a finding is any input that breaks it",
-     "fields": {"expr": "expression (required)", "addr": "0x.. (optional point; omit for return)",
+    {"kind": "assert", "summary": "a boolean that must always hold; a finding is any input that breaks it. In the expr, `ret` is the FULL return register (64-bit on x86-64) — for a 32-bit int return wrap it to width: s32(ret)/u32(ret), else a sign test like `ret s>= 0` is always true and finds nothing.",
+     "fields": {"expr": "expression (required); `ret` = return value (register-width; use s32(ret)/u32(ret) for narrower returns)", "addr": "0x.. (optional point; omit for return)",
                 "at_return": "true to check at function return"}},
     {"kind": "int_overflow", "summary": "integer add/sub/mul whose result overflows (wraps). Each finding's message carries the result width and source line, e.g. '32-bit overflow ... [file.c:34]'. TRIAGE TIP: a 64-bit add is usually pointer/address arithmetic (p->buf + i), not a value bug — the width + source line tell them apart; extra.result_bits and extra.src_line have the same data.",
      "fields": {"addr": "0x.. (optional; omit to scan every add/sub/mul)",
