@@ -736,8 +736,6 @@ class BufferBoundsCheck(BaseCheck):
             wl = state.inspect.mem_write_length
         if wa is None or not isinstance(wa, claripy.ast.BV):
             return
-        if self.base_expr is not None and not wa.symbolic:
-            return                          # explicit mode: constant addresses are stack spills, not buffer indexing
         if wl is None:
             expr = state.inspect.mem_write_expr if self.access == "write" else None
             wl = (expr.size() // 8) if expr is not None else 1
@@ -776,8 +774,14 @@ class BufferBoundsCheck(BaseCheck):
         REGION = 0x100000                    # 1 MiB window = "derived from this buffer"
         if end is not None:                  # modeled allocation: confine to its region
             anchor = claripy.And(claripy.UGE(wa, base), claripy.ULT(wa, end))
-        else:                                # explicit buffer: a window on both sides of base
+        elif wa.symbolic:                    # explicit buffer, symbolic index: window both sides of base
             anchor = claripy.And(claripy.UGE(wa, base - REGION), claripy.ULT(wa, base + REGION))
+        else:
+            # explicit buffer, CONCRETE address (a loop index or memcpy offset, base+k):
+            # anchor tightly at/just-past the buffer so an overflow fires, while an
+            # unrelated constant address (a stack spill before/far from base) does not.
+            GUARD = claripy.BVV(0x1000, size_bv.size())
+            anchor = claripy.And(claripy.UGE(wa, base), claripy.ULT(wa, base + size_bv + GUARD))
         oob = claripy.Or(claripy.ULT(wa, base), claripy.UGT(wa + length, base + size_bv))
         try:
             if not state.solver.satisfiable(extra_constraints=[anchor, oob]):

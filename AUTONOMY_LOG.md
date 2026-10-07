@@ -460,3 +460,27 @@ Having sorted the clean cross-build (`zig cc -target x86_64-linux-gnu
 to `checks_sample.c` and a `test_oob_write` (auto-anchored to a declared buffer, the
 robust path). Verified `oob_write` fires on the out-of-range store. `oob_write` —
 the heap-overflow headline check — now has regression coverage. Suite 72 passed.
+
+## Experiment 17 — catch bulk / loop writes past a buffer (partial fix of Exp 10's limit)
+
+**Investigation:** with a declared buffer, a **direct indexed store** fired but a
+**copy loop** (`for k<n: dst[k]=…`) and a `memcpy` did not. Root cause: in
+explicit/buffer mode the check skipped **every concrete write address**
+(`if base_expr and not wa.symbolic: return` — "constant addresses are stack
+spills"). But a declared buffer has a *concrete* base, so `base + concrete_offset`
+writes (loop indices, copy offsets) are concrete and were skipped — only a symbolic
+index survived.
+
+**Action — fix:** stop skipping concrete writes wholesale. Instead anchor by address
+kind: a symbolic address keeps the ±1 MiB window (unchanged); a **concrete** address
+is anchored tightly to `[base, base+size+0x1000)` — so an overflow at/just-past the
+buffer fires while an unrelated constant (a stack spill before/far from base) does
+not. Verified: a copy loop overflowing a 4-byte buffer now fires, the direct store
+and symbolic-index cases still fire, and an in-bounds loop does NOT (no false
+positive). Full suite 72 passed (no regressions — the riskiest change this session,
+checked against all oob/check tests).
+
+**Remaining (narrower):** a call into a libc `memset`/`memcpy` **SimProcedure**
+(symbolic length) still isn't caught per-byte — angr-internal write semantics,
+version-brittle to touch. Documented in the `oob_write` guidance (prefer a manual
+loop / model the allocator).
