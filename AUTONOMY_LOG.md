@@ -427,6 +427,9 @@ on branch `autonomy-2026-10-08` (pushed to `seal`).
 | 12 | point-checks | observe the ENTRY block — reach/avoid/assert/custom pinned there now fire (was silently missed) |
 | 13 | disassembly (GUI) | surface `call_name` in the GUI code view (all direct calls named) |
 | 14 | **`path_values`** | no longer hangs the whole server (skip calls + deadline in the concrete re-execution) |
+| 15 | `float_anomaly` | validated (was untested) + new `float_sample` + 3 tests |
+| 16 | `oob_write` | regression coverage: `oob_w` in checks_sample + test |
+| 17 | oob bulk writes | catch copy-loop / concrete-offset writes past a declared buffer (anchor concrete addresses tightly) |
 
 Cross-cutting theme: the worst failure mode is the **silent no-op** — a run or a
 check that quietly does nothing. The biggest wins (5, 6, 12, 8, 14) all convert a
