@@ -249,37 +249,34 @@ def run(db):
 """
 
 
-# The original input file IDA analysed: path + size + md5, so SEAL can pull the
-# bytes straight from IDA instead of the user opening the binary a second time (#9).
-_INPUT_INFO_CODE = r"""
-def run(db):
-    import json, os, ida_nalt
-    p = ida_nalt.get_input_file_path() or ""
+# IDAPython that sets `result` to a JSON string; run via the server's python-eval
+# tool (official execute_python or community py_eval). Used to pull the original
+# input file IDA analysed, so SEAL needn't have the user open the binary again (#9).
+#
+# The original input file IDA analysed: path + size + md5.
+_INPUT_INFO_BODY = r"""import json, os, ida_nalt
+p = ida_nalt.get_input_file_path() or ""
+try:
+    size = os.path.getsize(p)
+except OSError:
     size = None
-    try:
-        size = os.path.getsize(p)
-    except OSError:
-        size = None
+try:
+    m = ida_nalt.retrieve_input_file_md5()
+    md5 = m.hex() if isinstance(m, (bytes, bytearray)) else (str(m) if m else None)
+except Exception:
     md5 = None
-    try:
-        m = ida_nalt.retrieve_input_file_md5()
-        md5 = m.hex() if isinstance(m, (bytes, bytearray)) else (str(m) if m else None)
-    except Exception:
-        md5 = None
-    return json.dumps({"path": p, "name": os.path.basename(p),
-                       "size": size, "md5": md5,
-                       "readable": bool(p and os.path.isfile(p))})
+result = json.dumps({"path": p, "name": os.path.basename(p),
+                     "size": size, "md5": md5,
+                     "readable": bool(p and os.path.isfile(p))})
 """
 
 # Read a [off, off+len) slice of IDA's input file as base64. Chunked by the caller.
-_READ_FILE_CODE = r"""
-def run(db):
-    import json, base64, ida_nalt
-    p = ida_nalt.get_input_file_path()
-    with open(p, "rb") as fh:
-        fh.seek(%d)
-        data = fh.read(%d)
-    return json.dumps({"b64": base64.b64encode(data).decode(), "n": len(data)})
+_READ_FILE_BODY = r"""import json, base64, ida_nalt
+p = ida_nalt.get_input_file_path()
+with open(p, "rb") as fh:
+    fh.seek(%d)
+    data = fh.read(%d)
+result = json.dumps({"b64": base64.b64encode(data).decode(), "n": len(data)})
 """
 
 
@@ -305,6 +302,7 @@ class IdaSession:
         self.backend: str | None = None
         self._names: dict[int, str] | None = None
         self._decomp: dict[int, dict] = {}
+        self._tools: set[str] = set()
         self._lock = threading.Lock()
 
     # -- connection -----------------------------------------------------
@@ -312,6 +310,7 @@ class IdaSession:
         info = self.client.initialize()
         self.server = (info.get("serverInfo") or {}).get("name")
         tools = set(self.client.list_tools())
+        self._tools = tools
         if "list_funcs" in tools and "decompile" in tools:
             self.flavor = "community"          # reads the open IDA GUI; nothing to open
             self.backend = "gui"
@@ -494,48 +493,79 @@ class IdaSession:
             raise MCPError(f"could not read struct list from IDA: {str(s)[:200]}")
 
     # -- input file (#9: import the binary straight from IDA) -----------
+    def _eval_tool(self) -> str | None:
+        """The server's run-arbitrary-IDAPython tool, if any: official uses
+        ``execute_python``; richer community servers expose ``py_eval``."""
+        if self.flavor == "official" or "execute_python" in self._tools:
+            return "execute_python"
+        if "py_eval" in self._tools:
+            return "py_eval"
+        return None
+
+    def _eval_json(self, body: str) -> dict:
+        """Run IDAPython ``body`` (which sets ``result`` to a JSON string) through the
+        server's python-eval tool and return the parsed object."""
+        tool = self._eval_tool()
+        if tool is None:
+            raise MCPError("this IDA server exposes no way to run IDAPython "
+                           "(no execute_python / py_eval tool)")
+        if tool == "execute_python":
+            # this server calls run(db) and returns its value as `result`
+            wrapped = ("def run(db):\n"
+                       + "\n".join("    " + ln for ln in body.splitlines())
+                       + "\n    return result\n")
+            out = self._run(wrapped)
+        else:
+            res = self.client.call_tool("py_eval", {"code": body})
+            s = res.get("result") if isinstance(res, dict) else res
+            if isinstance(s, (dict, list)):
+                out = s
+            else:
+                try:
+                    out = json.loads(s)
+                except (ValueError, TypeError):
+                    raise MCPError(f"unexpected py_eval result: {str(s)[:200]}")
+        if not isinstance(out, dict):
+            raise MCPError(f"unexpected IDAPython result: {str(out)[:200]}")
+        return out
+
     def input_file_info(self) -> dict:
         """What IDA knows about the original input file: name, path (on the IDA
         host), size and md5. Lets SEAL pull the bytes without the user opening the
         binary a second time."""
-        if self.flavor == "community":
-            md = {}
-            for tool in ("get_metadata", "get_idb_metadata"):
-                try:
-                    res = self.client.call_tool(tool, {})
-                    md = res.get("result", res) if isinstance(res, dict) else {}
-                    if isinstance(md, dict) and md:
-                        break
-                except MCPError:
-                    continue
-            if not isinstance(md, dict) or not md:
-                raise MCPError("this IDA server doesn't expose input-file metadata "
-                               "(no get_metadata tool)")
-            path = md.get("path") or md.get("input_file") or md.get("module") or ""
-            size = md.get("size") or md.get("filesize") or md.get("input_size")
-            md5 = md.get("md5") or md.get("hash")
-            return {"path": path, "name": os.path.basename(path or ""),
-                    "size": int(size) if size else None,
-                    "md5": str(md5) if md5 else None,
-                    "readable": bool(path and os.path.isfile(path))}
-        info = self._run(_INPUT_INFO_CODE)
-        if not isinstance(info, dict):
-            raise MCPError(f"unexpected input-file info from IDA: {str(info)[:200]}")
-        return info
+        if self._eval_tool() is not None:
+            return self._eval_json(_INPUT_INFO_BODY)
+        # servers without a python-eval tool: fall back to a metadata tool if present
+        for tool in ("get_metadata", "get_idb_metadata", "survey_binary"):
+            if tool not in self._tools:
+                continue
+            try:
+                res = self.client.call_tool(tool, {})
+            except MCPError:
+                continue
+            md = res.get("result", res) if isinstance(res, dict) else {}
+            if isinstance(md, dict) and md:
+                path = md.get("path") or md.get("input_file") or md.get("module") or ""
+                size = md.get("size") or md.get("filesize") or md.get("input_size")
+                md5 = md.get("md5") or md.get("hash")
+                return {"path": path, "name": os.path.basename(path or ""),
+                        "size": int(size) if size else None,
+                        "md5": str(md5) if md5 else None,
+                        "readable": bool(path and os.path.isfile(path))}
+        raise MCPError("this IDA server exposes no way to read the input file "
+                       "(no execute_python / py_eval / get_metadata tool)")
 
     def read_input_file(self, offset: int, length: int) -> bytes:
-        """A slice of IDA's input file (official flavor; streams over execute_python)."""
-        if self.flavor != "official":
-            raise MCPError("byte streaming needs the official (execute_python) IDA server")
-        out = self._run(_READ_FILE_CODE % (int(offset), int(length)))
-        if not isinstance(out, dict) or "b64" not in out:
+        """A slice of IDA's input file (streams over the server's python-eval tool)."""
+        out = self._eval_json(_READ_FILE_BODY % (int(offset), int(length)))
+        if "b64" not in out:
             raise MCPError(f"unexpected file chunk from IDA: {str(out)[:200]}")
         return base64.b64decode(out["b64"])
 
     def fetch_input_file(self, dest: str, progress=None) -> dict:
         """Materialise IDA's input file at ``dest``. Prefers a plain copy when the
         path IDA reports is reachable on this machine (shared folder / same host);
-        otherwise streams the bytes through the MCP (official flavor only)."""
+        otherwise streams the bytes through the MCP (any server with a python-eval tool)."""
         info = self.input_file_info()
         path, size = info.get("path"), info.get("size")
         # 1) reachable here (same host or shared mount): copy, no transfer needed.
@@ -543,24 +573,35 @@ class IdaSession:
             shutil.copyfile(path, dest)
             return {**info, "via": "local-path", "size": os.path.getsize(dest)}
         # 2) stream the bytes over the MCP.
-        if self.flavor != "official":
+        if self._eval_tool() is None:
             raise MCPError(
                 f"this IDA server can't stream file bytes and its input path "
                 f"({path!r}) isn't reachable from SEAL; load the file by path instead")
         if not info.get("readable"):
             raise MCPError(f"IDA's input file {path!r} isn't readable on the IDA host")
-        CHUNK = 1 << 20
+        # Stream in chunks. Servers cap a single eval's output (one community py_eval
+        # here truncates above ~32 KB raw → ~43 KB base64), so start conservatively
+        # and halve on any truncated/garbled read until it parses, down to a floor.
+        chunk = 256 * 1024 if self._eval_tool() == "execute_python" else 32 * 1024
+        MIN = 2048
         got = 0
         with open(dest, "wb") as out:
-            while True:
-                part = self.read_input_file(got, CHUNK)
+            while not size or got < size:
+                want = min(chunk, size - got) if size else chunk
+                try:
+                    part = self.read_input_file(got, want)
+                except MCPError:
+                    if chunk > MIN:
+                        chunk //= 2                       # output too big: back off, retry offset
+                        continue
+                    raise
                 if not part:
                     break
                 out.write(part)
                 got += len(part)
                 if progress:
                     progress(got, size)
-                if (size and got >= size) or len(part) < CHUNK:
+                if not size and len(part) < want:
                     break
         if size and got != size:
             raise MCPError(f"short read from IDA: got {got} of {size} bytes")

@@ -59,8 +59,9 @@ class _Base(BaseHTTPRequestHandler):
         if method == "notifications/initialized":
             self.send_response(202); self.end_headers(); return
         if method == "tools/list":
-            names = (["list_databases", "open_database", "execute_python"]
-                     if self.FLAVOR == "official" else ["list_funcs", "decompile", "rename"])
+            default = (["list_databases", "open_database", "execute_python"]
+                       if self.FLAVOR == "official" else ["list_funcs", "decompile", "rename"])
+            names = getattr(self, "TOOLS", None) or default
             return self._send({"jsonrpc": "2.0", "id": rid,
                                "result": {"tools": [{"name": t, "inputSchema": {}} for t in names]}},
                               sse=True)
@@ -105,6 +106,8 @@ class FakeOfficial(_Base):
 
 class FakeCommunity(_Base):
     FLAVOR = "community"
+    # metadata-only server: no python-eval tool, but a get_metadata tool
+    TOOLS = ["list_funcs", "decompile", "rename", "get_metadata"]
 
     def _tool(self, name, args):
         if name == "list_funcs":
@@ -116,6 +119,35 @@ class FakeCommunity(_Base):
             return {"result": {"path": INPUT_PATH, "module": "target.bin",
                                "size": len(INPUT_BYTES),
                                "md5": hashlib.md5(INPUT_BYTES).hexdigest()}}
+        return {}
+
+
+class FakeCommunityEval(_Base):
+    """A richer community server (like mrexodia/ida-pro-mcp with py_eval): runs
+    arbitrary IDAPython that sets `result`. This mirrors the real server #9 was
+    validated against, which streams input-file bytes over py_eval."""
+    FLAVOR = "community"
+    TOOLS = ["list_funcs", "decompile", "rename", "py_eval", "get_bytes"]
+
+    def _tool(self, name, args):
+        if name == "list_funcs":
+            data = [{"addr": hex(ea), "name": nm, "size": "0x10"} for ea, nm in FUNCS]
+            return {"result": [{"data": data}]}
+        if name == "decompile":
+            return {"addr": args.get("addr"), "code": PSEUDOCODE, "line_count": 3}
+        if name == "py_eval":
+            code = args.get("code", "")
+            if "base64.b64encode" in code:                 # read_input_file chunk
+                off = int(re.search(r"seek\((\d+)\)", code).group(1))
+                ln = int(re.search(r"read\((\d+)\)", code).group(1))
+                data = INPUT_BYTES[off:off + ln]
+                return {"result": json.dumps({"b64": base64.b64encode(data).decode(),
+                                              "n": len(data)})}
+            if "get_input_file_path" in code:              # input_file_info
+                return {"result": json.dumps({"path": INPUT_PATH, "name": "target.bin",
+                                              "size": len(INPUT_BYTES),
+                                              "md5": hashlib.md5(INPUT_BYTES).hexdigest(),
+                                              "readable": True})}
         return {}
 
 
@@ -135,6 +167,13 @@ def official():
 @pytest.fixture()
 def community():
     srv = _serve(FakeCommunity)
+    yield f"http://127.0.0.1:{srv.server_address[1]}/mcp"
+    srv.shutdown()
+
+
+@pytest.fixture()
+def community_eval():
+    srv = _serve(FakeCommunityEval)
     yield f"http://127.0.0.1:{srv.server_address[1]}/mcp"
     srv.shutdown()
 
@@ -195,14 +234,29 @@ def test_fetch_prefers_local_copy_when_path_reachable(official, tmp_path):
     assert res["via"] == "local-path" and dest.read_bytes() == INPUT_BYTES
 
 
-def test_community_input_info(community):
+def test_community_metadata_only_input_info(community):
+    # a community server with no python-eval tool: info via get_metadata, but it
+    # cannot stream bytes, so fetch of an unreachable path must fail cleanly.
     s = IdaSession(community)
     s.connect()
     info = s.input_file_info()
     assert info["size"] == len(INPUT_BYTES) and info["path"] == INPUT_PATH
-    # community servers can't stream file bytes and the path isn't reachable here
     with pytest.raises(MCPError):
         s.fetch_input_file("/tmp/should-not-be-written")
+
+
+def test_community_py_eval_stream_fetch(community_eval, tmp_path):
+    # the real-world case (#9 validated against this): a community server with
+    # py_eval streams the input file byte-for-byte when its path isn't reachable here.
+    s = IdaSession(community_eval)
+    s.connect()
+    assert s.flavor == "community"
+    info = s.input_file_info()
+    assert info["size"] == len(INPUT_BYTES) and info["name"] == "target.bin"
+    dest = tmp_path / "target.bin"
+    res = s.fetch_input_file(str(dest))
+    assert res["via"] == "mcp-stream"
+    assert dest.read_bytes() == INPUT_BYTES
 
 
 def test_unreachable_server_raises_cleanly():
