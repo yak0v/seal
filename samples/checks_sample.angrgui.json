@@ -4,7 +4,7 @@
       "checks": [
         {
           "kind": "div_by_zero",
-          "id": "15d8b1",
+          "id": "63d8c3",
           "enabled": true,
           "func_addr": 4195589
         }
@@ -55,9 +55,55 @@
           "files": [],
           "limits": {},
           "models": []
+        },
+        {
+          "name": "ok",
+          "args": [
+            {
+              "name": "a",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": true
+            },
+            {
+              "name": "b",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": true
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        },
+        {
+          "name": "concrete",
+          "args": [
+            {
+              "name": "a",
+              "mode": "concrete",
+              "size": 4,
+              "value": 5
+            },
+            {
+              "name": "b",
+              "mode": "concrete",
+              "size": 4,
+              "value": 3
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
         }
       ],
-      "active": 1
+      "active": 3
     },
     "4195608": {
       "checks": [
@@ -110,7 +156,7 @@
       "checks": [
         {
           "kind": "oob_read",
-          "id": "7a38a7",
+          "id": "5fb515",
           "enabled": true,
           "func_addr": 4195627
         }
@@ -250,9 +296,55 @@
           "files": [],
           "limits": {},
           "models": []
+        },
+        {
+          "name": "noanchor",
+          "args": [
+            {
+              "name": "buf",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "i",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": false
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        },
+        {
+          "name": "na2",
+          "args": [
+            {
+              "name": "buf",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "i",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": false
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
         }
       ],
-      "active": 4
+      "active": 6
     }
   },
   "meta": {},

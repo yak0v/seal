@@ -1507,6 +1507,14 @@ function renderTree(force) {
   const summary = pathsSummary(T, snap);
   summary.append(pathsViewToggle());
   pane.replaceChildren(checksBar(), summary);
+  // diagnostics: when a run finds nothing (or something odd happened), explain why
+  const notes = snap.summary?.notes || [];
+  if (notes.length) {
+    const box = el("div", { class: "runnotes" });
+    box.append(el("b", {}, "⚠ why this run turned out this way"));
+    notes.forEach(n => box.append(el("div", { class: "rnote" }, n)));
+    pane.append(box);
+  }
   if (view === "tree") {
     pane.classList.add("treemode");
     const host = el("div", { class: "ptreegraph" });

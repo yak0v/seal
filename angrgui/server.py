@@ -1403,7 +1403,9 @@ TOOL_DEFS = [
     {"name": "path_values", "description": "Per-instruction destination values on one path (node id from get_run's paths): "
      "{addr: {reg, val, store}} — the concrete value of the variable assigned on each decompilation line for that path.",
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}, "node": {"type": "integer"}}, "required": ["run_id", "node"]}},
-    {"name": "get_run", "description": "Results of a run: status, findings (with concrete witnesses), and the path tree.",
+    {"name": "get_run", "description": "Results of a run: status, findings (with concrete witnesses), and the path tree. "
+     "summary.notes (when present) explains an empty or surprising run — e.g. a check with nothing to anchor to, "
+     "no symbolic inputs, or paths that went unconstrained — so a no-finding run tells you why instead of staying silent.",
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
     {"name": "load_binary", "description": "Load an ELF binary by absolute path (replaces the current one). Analyses before returning.",
      "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},

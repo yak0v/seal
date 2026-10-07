@@ -160,3 +160,32 @@ message text).
 *pointer* members symbolic. A future setup-side nicety: when declaring a buffer
 without a layout, offer to keep 8-byte slots that look like pointers concrete, or
 lean on the existing get_struct/layout path when IDA is connected.
+
+## Experiment 5 (feature) — run diagnostics: "why did this run find nothing?"
+
+**Motivation:** the sharpest recurring friction across Experiments 1–4 is the
+*silent no-op* — a run completes, finds nothing, and the agent/user is left
+guessing whether the bug isn't there, the setup is wrong, or the tool misbehaved.
+Exp 3's `oob_read` was the worst case.
+
+**Feature:** a run's `summary.notes` now explains an empty or surprising result:
+- an `oob_read`/`oob_write` check that has nothing to anchor to (no base, no single
+  buffer, no `alloc` model) — the exact Exp 3 trap, now named at setup time;
+- the ambiguous case (no base + multiple buffers);
+- no symbolic inputs at all (nothing to solve over);
+- paths that went **unconstrained** (IP hijacked → suggest skip_calls / models) or
+  **errored**;
+- exploration that stopped almost immediately (sites unreachable / step limit low).
+Generic guesses are suppressed when a concrete setup note already names the cause,
+so the banner stays signal, not noise. A healthy run emits no notes.
+
+**Surfaced in both faces of the app:** `get_run().summary.notes` for agents (tool
+description updated), and a styled "⚠ why this run turned out this way" banner in
+the GUI Paths panel for humans.
+
+**Verified:**
+- Over MCP: unanchored `oob_read` → one precise note; concrete-input run → "no
+  symbolic inputs" note; healthy `div_by_zero` → `notes: null`.
+- In the browser (real `renderTree`): the banner renders with the notes text, no
+  console errors.
+- Tests green (full suite 68 earlier; mcp+checks subset 7 after the doc edits).

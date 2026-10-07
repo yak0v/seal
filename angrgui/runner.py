@@ -149,6 +149,7 @@ class Run:
 
         self.checks = []
         self._state_checks = []
+        self._setup_notes: list[str] = []       # diagnostics gathered while installing checks
         self.hits: list[Hit] = []
         self.nodes: dict[int, PathNode] = {}
         self._node_counter = 0
@@ -574,16 +575,28 @@ class Run:
         repeat base+size on the check. Ambiguous (multiple buffers) is left alone."""
         if cspec.get("kind") not in ("oob_read", "oob_write") or cspec.get("base"):
             return cspec
-        if any(m.get("kind") == "alloc" for m in (self.spec.get("models") or [])):
-            return cspec                       # modeled mode is intended; don't override
+        has_alloc = any(m.get("kind") == "alloc" for m in (self.spec.get("models") or []))
         bufs = [b for b in (self.spec.get("buffers") or []) if b.get("arg") and b.get("size")]
-        if len(bufs) != 1:                     # none, or ambiguous -> leave as modeled
-            return cspec
-        b = bufs[0]
-        c = dict(cspec)
-        c["base"] = b["arg"]
-        c["size"] = int(b["size"])
-        return c
+        if has_alloc:
+            return cspec                       # modeled mode is intended; don't override
+        if len(bufs) == 1:
+            b = bufs[0]
+            c = dict(cspec)
+            c["base"] = b["arg"]
+            c["size"] = int(b["size"])
+            return c
+        # nothing to anchor to (no base, no single buffer, no alloc model): the check
+        # cannot fire. Record a diagnostic so the run doesn't just silently find nothing.
+        name = cspec.get("name") or cspec.get("id") or cspec["kind"]
+        if len(bufs) > 1:
+            self._setup_notes.append(
+                f"{cspec['kind']} check '{name}' has no base and {len(bufs)} buffers are "
+                f"declared — ambiguous; set base+size on the check (or declare one buffer).")
+        else:
+            self._setup_notes.append(
+                f"{cspec['kind']} check '{name}' has nothing to anchor to — give it base+size, "
+                f"declare a buffer on a pointer arg, or add an 'alloc' call model. It cannot fire as-is.")
+        return cspec
 
     def _make_context(self):
         lo = self.func_addr
@@ -1053,6 +1066,39 @@ class Run:
             "nodes": len(self.nodes),
             "elapsed": self.progress["elapsed"],
         })
+        notes = self._diagnose(simgr)
+        if notes:
+            self.summary["notes"] = notes
+
+    def _diagnose(self, simgr) -> list[str]:
+        """Human-readable hints about why a run turned out the way it did — so a
+        run that finds nothing explains itself instead of leaving the agent guessing."""
+        notes = list(self._setup_notes)
+        enabled_checks = [c for c in self.spec.get("checks", []) if c.get("enabled", True)]
+        unconstrained = len(getattr(simgr, "unconstrained", []))
+        errored = len(getattr(simgr, "errored", []))
+        if unconstrained:
+            notes.append(f"{unconstrained} path(s) went unconstrained (the instruction pointer "
+                         f"became symbolic — usually an unresolved/indirect call). Turn on skip_calls "
+                         f"or add call models so exploration stays in the function.")
+        if errored:
+            notes.append(f"{errored} path(s) errored out during execution (an unsupported op or a "
+                         f"bad memory access); they couldn't be explored further.")
+        if len(self.hits) == 0 and enabled_checks and not self._setup_notes:
+            # a setup note already names a concrete cause; only guess further when there isn't one.
+            sym_args = any(a.get("mode", "symbolic") == "symbolic" for a in self.spec.get("args", []))
+            has_input = (sym_args or self.spec.get("buffers") or self.spec.get("stdin")
+                         or self.spec.get("files") or self.spec.get("initial_state"))
+            if not has_input:
+                notes.append("no findings, and no symbolic inputs were set (no symbolic args, buffers, "
+                             "stdin, files, or seeded state) — there is nothing for the checks to solve over.")
+            elif self.progress["step"] <= 2 and not simgr.active:
+                notes.append("no findings, and exploration stopped almost immediately — the check sites "
+                             "may be unreachable from the entry, or the step limit is too low.")
+            else:
+                notes.append("no findings — the checks ran but nothing triggered. If you expected a hit, "
+                             "widen limits, relax assumptions, or confirm the check targets the right site.")
+        return notes
 
     # ---------------------------------------------------------------- reporting
     def _node_json(self, n: PathNode) -> dict:
