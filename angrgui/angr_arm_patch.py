@@ -415,11 +415,30 @@ def _install_pac_hook(project, ins) -> str | None:
             def run(self):
                 self.jump(self.state.regs.lr)
         proc = _Ret()
-    elif mn in _PAC_BR:                      # braa/blraa/… -> jump/call the target register
+    elif mn in _PAC_BR:
+        # braa/brab/braaz/brabz  -> tail BRANCH (jump to the target register).
+        # blraa/blrab/blraaz/blrabz -> CALL (branch-with-LINK). These are indirect calls
+        # through an authenticated pointer (ubiquitous in arm64e). Treating a CALL as a
+        # plain branch was the skip-calls bug: when the target register is unconstrained
+        # the path jumps to a symbolic/zero address and dies at the "bl". So:
+        #   * under CALLLESS (skip_calls): SKIP the call — continue at the return site with
+        #     an unconstrained return value, exactly like a skipped direct `bl`;
+        #   * otherwise: follow the (possibly symbolic) target, so a hijackable function
+        #     pointer still surfaces as an unconstrained / unknown-call leaf.
         reg = ins.op_str.split(",")[0].strip()
+        is_call = mn.startswith("bl")
+        nxt = ins.address + ins.size
         class _Br(angr.SimProcedure):
             def run(self):
-                self.jump(getattr(self.state.regs, reg))
+                import claripy
+                if is_call and angr.options.CALLLESS in self.state.options:
+                    try:
+                        self.state.regs.x0 = claripy.BVS("call_ret", 64)
+                    except Exception:
+                        pass
+                    self.jump(claripy.BVV(nxt, self.state.arch.bits))
+                else:
+                    self.jump(getattr(self.state.regs, reg))
         proc = _Br()
     elif mn.startswith(("pac", "aut", "xpac")):
         # pacibsp/autibsp/xpaclri/… sign or authenticate — a no-op for data-flow, but it
