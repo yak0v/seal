@@ -10,8 +10,11 @@ No real IDA is needed; this verifies the transport, flavor auto-detection, and
 the names/decompilation parsing so the integration works against the real
 servers unchanged (both were also verified live).
 """
+import base64
+import hashlib
 import json
 import os
+import re
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -22,6 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from angrgui.idamcp import IdaSession, MCPClient, MCPError   # noqa: E402
 
 FUNCS = [[0x400650, "validate"], [0x4006f0, "dispatch"], [0x400230, "main"]]
+INPUT_BYTES = bytes(range(256)) * 37 + b"\xde\xad\xbe\xef"   # the fake IDA's "input file"
+INPUT_PATH = "/ida-host/only/target.bin"                     # not reachable on this machine
 PSEUDOCODE = "int __fastcall validate(unsigned int user, unsigned int code)\n{\n  return 0;\n}"
 
 
@@ -81,6 +86,17 @@ class FakeOfficial(_Base):
             code = args.get("code", "")
             if "idautils.Functions" in code:
                 return {"result": json.dumps(FUNCS), "stdout": "", "stderr": ""}
+            if "base64.b64encode" in code:                 # read_input_file chunk
+                off = int(re.search(r"seek\((\d+)\)", code).group(1))
+                ln = int(re.search(r"read\((\d+)\)", code).group(1))
+                data = INPUT_BYTES[off:off + ln]
+                return {"result": json.dumps({"b64": base64.b64encode(data).decode(),
+                                              "n": len(data)}), "stdout": "", "stderr": ""}
+            if "get_input_file_path" in code:              # input_file_info
+                return {"result": json.dumps({"path": INPUT_PATH, "name": "target.bin",
+                                              "size": len(INPUT_BYTES),
+                                              "md5": hashlib.md5(INPUT_BYTES).hexdigest(),
+                                              "readable": True}), "stdout": "", "stderr": ""}
             if "decompile" in code:
                 return {"result": json.dumps({"start": 0x400650, "kind": "pseudocode",
                                               "code": PSEUDOCODE}), "stdout": "", "stderr": ""}
@@ -96,6 +112,10 @@ class FakeCommunity(_Base):
             return {"result": [{"data": data}]}
         if name == "decompile":
             return {"addr": args.get("addr"), "code": PSEUDOCODE, "line_count": 3}
+        if name == "get_metadata":
+            return {"result": {"path": INPUT_PATH, "module": "target.bin",
+                               "size": len(INPUT_BYTES),
+                               "md5": hashlib.md5(INPUT_BYTES).hexdigest()}}
         return {}
 
 
@@ -144,6 +164,45 @@ def test_community_flavor(community):
     d = s.decompile(0x400650)
     assert d["kind"] == "pseudocode" and "validate(" in d["code"]
     assert s.decompile(0x400650) is s._decomp[0x400650]    # cached
+
+
+def test_official_input_info_and_stream_fetch(official, tmp_path):
+    # #9: pull the binary straight from IDA. The fake reports a path that isn't
+    # reachable on this machine, so fetch streams the bytes over the MCP.
+    s = IdaSession(official)
+    s.connect("/ida-host/only/target.bin")
+    info = s.input_file_info()
+    assert info["size"] == len(INPUT_BYTES) and info["name"] == "target.bin"
+    chunk = s.read_input_file(10, 32)
+    assert chunk == INPUT_BYTES[10:42]
+    dest = tmp_path / "target.bin"
+    res = s.fetch_input_file(str(dest))
+    assert res["via"] == "mcp-stream" and res["size"] == len(INPUT_BYTES)
+    assert dest.read_bytes() == INPUT_BYTES                # byte-for-byte reconstruction
+
+
+def test_fetch_prefers_local_copy_when_path_reachable(official, tmp_path):
+    # When IDA's input path IS reachable here (shared folder / same host), copy it
+    # instead of streaming — no transfer.
+    real = tmp_path / "on-disk.bin"
+    real.write_bytes(INPUT_BYTES)
+    s = IdaSession(official)
+    s.connect("/ida-host/only/target.bin")
+    s.input_file_info = lambda: {"path": str(real), "name": "on-disk.bin",
+                                 "size": len(INPUT_BYTES), "readable": True}
+    dest = tmp_path / "copied.bin"
+    res = s.fetch_input_file(str(dest))
+    assert res["via"] == "local-path" and dest.read_bytes() == INPUT_BYTES
+
+
+def test_community_input_info(community):
+    s = IdaSession(community)
+    s.connect()
+    info = s.input_file_info()
+    assert info["size"] == len(INPUT_BYTES) and info["path"] == INPUT_PATH
+    # community servers can't stream file bytes and the path isn't reachable here
+    with pytest.raises(MCPError):
+        s.fetch_input_file("/tmp/should-not-be-written")
 
 
 def test_unreachable_server_raises_cleanly():

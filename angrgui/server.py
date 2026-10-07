@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -541,7 +542,10 @@ def ida_status():
 
 @app.post("/api/ida/connect")
 def ida_connect(req: IdaConnectReq):
-    b = _need_binary()
+    # A binary need not be loaded first (#9): you can connect to IDA and then import
+    # the binary straight from it. When one *is* loaded, pass its path so the official
+    # server attaches to the matching database.
+    b = S.binary
     # ida-pro-mcp rejects a non-loopback Host (DNS-rebind guard). When the URL is a
     # remote/forwarded address, default the Host header to loopback so it accepts us.
     host_header = req.host_header
@@ -555,7 +559,7 @@ def ida_connect(req: IdaConnectReq):
     sess = IdaSession(req.url, host_header=host_header)
     sess.client.timeout = 120           # open/analysis of a real binary can be slow
     try:
-        st = sess.connect(b.path)       # official: opens by path; community: uses the open GUI
+        st = sess.connect(b.path if b else None)  # official: opens/attaches by path; community: uses the open GUI
         sess.function_names()           # pull names up front so the list can show them
     except MCPError as e:
         raise HTTPException(502, str(e))
@@ -569,6 +573,48 @@ def ida_connect(req: IdaConnectReq):
 def ida_disconnect():
     S.ida = None
     return {"connected": False}
+
+
+@app.get("/api/ida/input")
+def ida_input_info():
+    """What IDA knows about its input file — so the GUI can show name/size before import."""
+    if S.ida is None:
+        raise HTTPException(400, "not connected to IDA")
+    try:
+        return S.ida.input_file_info()
+    except MCPError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/ida/import")
+def ida_import():
+    """Pull the binary straight from the connected IDA (its input file) and load it,
+    so the user needn't open the file in SEAL separately (#9)."""
+    if S.ida is None:
+        raise HTTPException(400, "not connected to IDA")
+    try:
+        info = S.ida.input_file_info()
+    except MCPError as e:
+        raise HTTPException(502, str(e))
+    name = info.get("name") or "ida_binary"
+    dest_dir = os.path.join(tempfile.gettempdir(), "seal_ida_import")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, name)
+    S.load_status = {"loading": True, "message": f"fetching {name} from IDA", "error": None}
+
+    def progress(got, total):
+        pct = f" {got * 100 // total}%" if total else ""
+        S.load_status["message"] = f"fetching {name} from IDA:{pct} ({got} bytes)"
+        BUS.publish("ida", f"importing {name}: {got} bytes{pct}", got=got, total=total)
+
+    try:
+        fetched = S.ida.fetch_input_file(dest, progress=progress)
+    except MCPError as e:
+        S.load_status = {"loading": False, "message": "", "error": str(e)}
+        raise HTTPException(502, str(e))
+    BUS.publish("ida", f"fetched {name} ({fetched.get('size')} bytes, {fetched.get('via')}); loading")
+    load(LoadReq(path=dest))            # analyse + install as the current binary
+    return {"binary": S.binary.info(), "source": fetched}
 
 
 @app.get("/api/ida/decompile/{addr}")
@@ -1359,6 +1405,10 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "ida_refresh", "description": "Re-pull names + decompilation from IDA (after you changed the IDB).",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "ida_import", "description": "Import the binary straight from the connected IDA: pulls IDA's input file "
+     "(copying it if its path is reachable here, otherwise streaming the bytes over the MCP) and loads it, so you "
+     "don't have to open the binary in SEAL separately. Connect first (ida_connect); no binary need be loaded.",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "get_struct", "description": "A struct type's member layout from IDA (name, offset, size, type; pointer/nested-struct "
      "members flagged). Use it to set up a pointer-to-struct argument: point the arg at a symbolic buffer and fill "
      "members via configure buffers[].layout.",
@@ -1429,6 +1479,7 @@ _MCP_TOOLS = {
     "ida_connect": lambda a: _mcp_ida_connect(a.get("url"), a.get("host_header")),
     "ida_disconnect": lambda a: _mcp_ida_disconnect(),
     "ida_refresh": lambda a: _mcp_ida_refresh(),
+    "ida_import": lambda a: ida_import(),
     "add_model": lambda a: _mcp_add_model(a["addr"], a["model"]),
     "get_struct": lambda a: (S.ida.struct_layout(a["name"]) if S.ida else _err_no_ida()),
 }

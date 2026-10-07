@@ -2448,7 +2448,7 @@ function openIdaModal() {
       "Point at a running IDA MCP server — <code>http://&lt;host&gt;:&lt;port&gt;/mcp</code>. Use <code>127.0.0.1</code> when IDA runs on this machine, " +
       "or the host's IP/name when it's elsewhere (e.g. a VM). Official Hex-Rays default: <code>http://127.0.0.1:8737/mcp</code> (IDA ≥9.4); " +
       "community <b>mrexodia/ida-pro-mcp</b> commonly <code>…:8744/mcp</code> (IDA ≥8.3). " +
-      "The binary open in IDA must be the same one loaded here."),
+      "No binary need be loaded first — once connected, use <b>⬇ Import binary from IDA</b> to pull it straight from IDA."),
     status);
   const connect = el("button", { class: "primary", onclick: async () => {
     const u = input.value.trim(); if (!u) { toast("enter a URL", true); return; }
@@ -2468,6 +2468,9 @@ function openIdaModal() {
     foot.unshift(el("button", { onclick: async () => {
       await jpost("/api/ida/disconnect", {}); A.ida = { connected: false }; updateIdaBtn(); await loadFunctions(); m.remove(); toast("IDA disconnected");
     } }, "Disconnect"));
+    // #9: pull the binary straight from IDA so the user needn't open the file separately
+    foot.unshift(el("button", { onclick: async () => { m.remove(); await importFromIda(); } },
+      "⬇ Import binary from IDA"));
     // re-pull names + decompilation after you change or reload something in IDA
     foot.unshift(el("button", { class: "primary", onclick: async () => { m.remove(); await refreshIda(); } }, "↻ Refresh from IDA"));
   }
@@ -2475,6 +2478,26 @@ function openIdaModal() {
   const m = modal("Connect to IDA", body, foot);
   $("#modalHost").append(m);
   setTimeout(() => input.focus(), 50);
+}
+
+// #9: fetch the binary from the connected IDA (copy if its path is reachable here,
+// else stream the bytes over the MCP) and load it — no separate "open binary" step.
+async function importFromIda() {
+  const busy = modal("Importing from IDA", el("div", { class: "col", style: "gap:10px" },
+    el("div", {}, "Pulling the binary from IDA…"),
+    el("div", { class: "prog" }, el("i", { style: "width:40%" })),
+    el("div", { class: "faint mono", id: "loadMsg" }, "contacting IDA…")), []);
+  const poll = setInterval(async () => {
+    try { const s = await api("/api/state"); if (s.load_status?.message) $("#loadMsg").textContent = s.load_status.message; } catch (e) {}
+  }, 400);
+  try {
+    const r = await jpost("/api/ida/import", {});
+    clearInterval(poll); busy.remove();
+    A.fn = A.detail = A.config = A.func = A.run = null;
+    await refreshState();
+    const src = r.source || {};
+    toast(`Imported ${src.name || "binary"} from IDA (${fmtSize(src.size || 0)}, ${src.via || "ok"})`);
+  } catch (e) { clearInterval(poll); busy.remove(); toast("Import failed: " + e.message, true); }
 }
 
 // ==================================================================== decompilation
