@@ -58,3 +58,32 @@ return to `{total, shown, truncated, functions[]}` so an agent knows when result
 were capped. Updated the tool schema, the in-app GUIDE (core loop + recipe that
 had assumed a bare list), and verified over MCP: `only:"interesting"` cuts
 `vuln` from 15 → the 6 real functions; `test_mcp_server` still green (3 passed).
+
+## Experiment 2 — "reach `abort()` in `vuln.route`" (CTF-style reach)
+
+**Use case:** find the input that drives the branchy dispatcher `route` to its
+`abort()` call (planted answer: `cmd=2, x=4242`).
+
+**MCP path:** `disassemble route` (locate the call) → `add_scenario` →
+`configure` (symbolic `cmd`,`x`) → `add_check {"kind":"reach","addr":"0x4007be"}`
+→ `run` → `get_run`.
+
+**Result:** the `reach` check solved `cmd=2, x=4242` (`0x1092`) in 0.4s — exactly
+the planted input. Checked and the witness really appears.
+
+**Friction found:** to pick the reach address the agent must read the
+disassembly, but a call to an imported function showed as a bare
+`call 0x4004c0` — nothing said that target is `abort`. On a no-source/stripped
+binary that leaves the agent guessing which call is the dangerous one. (The
+engine computed callee names in `call_targets`, but keyed by the transition-graph
+callsite address, which doesn't line up with the call *instruction*, so the MCP
+`disassemble` text never showed them.)
+
+**Action — feature + fix:** resolve each **direct** call's operand target to a
+name at disassembly time (`_direct_call_target` + hardened `_callee_name` that
+falls back through `kb.functions` → `loader.find_symbol` → PLT `reverse_plt`),
+expose it as a per-instruction `call_name`, and annotate the MCP `disassemble`
+text as `call 0x4004c0  <abort>`. Verified over MCP: all three direct calls in
+`route` now read `<abort>`, `<scale>`, `<frame_size>`. Full suite 68 passed.
+(`call_name` is now on every instruction, so the GUI disassembly view can show
+the same annotation — noted for a later GUI pass.)

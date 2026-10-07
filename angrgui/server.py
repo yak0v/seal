@@ -738,9 +738,14 @@ def _mcp_get_function(addr):
 def _mcp_disassemble(addr):
     b = _need_binary()
     d = b.disassemble(_addr(addr))
-    lines = [f"{i['addr']:#x}  {i['text']}" + (f"    ; {i['src_file']}:{i['src_line']}" if i.get('src_line') else "")
-             for i in d["instructions"]]
-    return {"addr": hex(_addr(addr)), "name": d["name"], "text": "\n".join(lines)}
+    def line(i):
+        s = f"{i['addr']:#x}  {i['text']}"
+        if i.get("call_name") and i["call_name"] not in i["text"]:   # call 0x.. <abort>
+            s += f"  <{i['call_name']}>"
+        if i.get("src_line"):
+            s += f"    ; {i['src_file']}:{i['src_line']}"
+        return s
+    return {"addr": hex(_addr(addr)), "name": d["name"], "text": "\n".join(line(i) for i in d["instructions"])}
 
 
 def _coerce_check(c, a):

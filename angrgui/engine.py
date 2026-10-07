@@ -533,6 +533,7 @@ class Binary:
         for block_addr in leaders:
             for ins in self._owned_capstone(block_addr, leaders):
                 src = self.line_for(ins.address)
+                is_call = ins.mnemonic in ("call", "bl", "blx")
                 insns.append({
                     "addr": ins.address,
                     "mnemonic": ins.mnemonic,
@@ -541,7 +542,9 @@ class Binary:
                     "size": ins.size,
                     "block": block_addr,
                     "arith": ins.mnemonic in ARITH_MNEMONICS,
-                    "is_call": ins.mnemonic in ("call", "bl", "blx"),
+                    "is_call": is_call,
+                    # resolve a DIRECT call's target to a name (indirect calls have none)
+                    "call_name": self._callee_name(self._direct_call_target(ins)) if is_call else None,
                     "src_line": src[1] if src else None,
                     "src_file": os.path.basename(src[0]) if src else None,
                 })
@@ -586,12 +589,48 @@ class Binary:
         for src, dst, data in f.transition_graph.edges(data=True):
             if data.get("type") == "call":
                 tgt = getattr(dst, "addr", None)
-                name = None
-                tf = self.project.kb.functions.get(tgt) if tgt else None
-                if tf is not None:
-                    name = tf.name
-                out[getattr(src, "addr", 0)] = {"target": tgt, "name": name}
+                out[getattr(src, "addr", 0)] = {"target": tgt, "name": self._callee_name(tgt)}
         return out
+
+    @staticmethod
+    def _direct_call_target(ins) -> int | None:
+        """The immediate target of a direct call/branch (e.g. `call 0x4004c0`,
+        `bl 0x...`); None for an indirect call (`call rax`, `blr x8`)."""
+        s = ins.op_str.strip()
+        if s.startswith("0x"):
+            try:
+                return int(s, 16)
+            except ValueError:
+                return None
+        return None
+
+    def _callee_name(self, tgt: int | None) -> str | None:
+        """Best-effort name for a call target: the kb function name, else the
+        imported symbol / PLT entry it resolves to (so a `call 0x4004c0` to a PLT
+        stub reads as `abort`, not a bare address)."""
+        if tgt is None:
+            return None
+        name = None
+        try:
+            tf = self.project.kb.functions.get(tgt)
+            if tf is not None:
+                name = tf.name
+        except Exception:
+            name = None
+        if name and not name.startswith("sub_"):
+            return name
+        lo = self.project.loader
+        try:
+            sym = lo.find_symbol(tgt)
+            if sym is not None and sym.name:
+                return sym.name
+        except Exception:
+            pass
+        for obj in (lo.main_object, *getattr(lo, "all_objects", [])):
+            rp = getattr(obj, "reverse_plt", None) or {}
+            if tgt in rp:
+                return rp[tgt]
+        return name
 
     # --------------------------------------------------------------------- cfg
     def cfg_graph(self, func_addr: int) -> dict:
