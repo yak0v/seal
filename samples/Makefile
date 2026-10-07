@@ -13,7 +13,7 @@ CC ?= gcc
 CFLAGS ?= -g -O0 -fno-stack-protector -no-pie -fno-omit-frame-pointer -Wno-unused-result
 PYTHON ?= $(if $(wildcard ../.venv/bin/python),../.venv/bin/python,python3)
 
-all: vuln vuln.angrgui.json jsonc_printbuf checks_sample
+all: vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample
 
 vuln: vuln.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -29,10 +29,14 @@ vuln.angrgui.json: vuln make_workspace.py
 	$(PYTHON) make_workspace.py vuln
 
 clean:
-	rm -f vuln vuln.angrgui.json jsonc_printbuf
+	rm -f vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample
 
 .PHONY: all clean
 
 # planted bugs for the div_by_zero / null_deref / oob_read checks
 checks_sample: checks_sample.c
+	$(CC) $(CFLAGS) -fno-inline -o $@ $<
+
+# planted floating-point anomalies (NaN / +-Inf) for the float_anomaly check
+float_sample: float_sample.c
 	$(CC) $(CFLAGS) -fno-inline -o $@ $<

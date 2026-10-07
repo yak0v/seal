@@ -437,3 +437,18 @@ Known limitations noted for follow-up: oob detection of **bulk** writes
 validation/coverage (needs a float sample — the x86-64 cross-compiler isn't present
 on this machine; `oob_write` likewise lacks a committable regression test for the
 same reason).
+
+## Experiment 15 — validate the `float_anomaly` check (was untested)
+
+**Use case:** `float_anomaly` (a FP add/sub/mul/div whose result can be NaN or
+±Inf) was a documented built-in with **no coverage** and no sample exercising it.
+
+**Result:** added `samples/float_sample.c` (`divf` a/b, `muld` a*b, `subd` a-b) and
+validated over MCP — `float_anomaly` fires on all three with concrete witnesses
+(e.g. `divf` → NaN). The check works correctly; no engine bug.
+
+**Action — coverage:** committed `float_sample.c` + a Makefile target + a
+build-or-skip `tests/test_float_anomaly.py` (3 cases, name lookup, mirrors
+test_new_checks) so the check is regression-covered on toolchain-equipped machines.
+Full suite now 71 passed. (The sample binary is gitignored like the others; built
+locally with `zig cc -target x86_64-linux-gnu -fno-sanitize=undefined`.)

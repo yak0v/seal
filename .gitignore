@@ -48,3 +48,7 @@ seal_validation/*.log
 
 # built checks sample (rebuild: make -C samples checks_sample)
 samples/checks_sample
+
+# built float-anomaly sample (rebuild: make -C samples float_sample)
+samples/float_sample
+samples/float_sample.angrgui.json
