@@ -1188,6 +1188,12 @@ def trace_assignments(binary, spec: dict, example: dict, max_steps: int = 6000) 
             cargs.append({**a, "mode": "concrete", "value": int(v or 0)})
         cspec["args"] = cargs
     cspec["checks"] = []
+    # Skip calls while tracing: we only want per-line values IN this function, and
+    # library-call internals aren't its source lines. Crucially, with the finding's
+    # CONCRETE inputs a call like memset(dst, c, size) can have a huge concrete size
+    # (e.g. an overflow witness ~1.7e9) and executing it for real would try to write
+    # gigabytes — CPU-bound under the GIL, hanging the whole server. CALLLESS avoids it.
+    cspec["limits"] = {**(cspec.get("limits") or {}), "skip_calls": True}
 
     run = Run(binary, cspec)
     state = run._build_state()
@@ -1228,7 +1234,8 @@ def trace_assignments(binary, spec: dict, example: dict, max_steps: int = 6000) 
     state.inspect.b("mem_write", when=angr.BP_BEFORE, action=on_mw)
     simgr = binary.project.factory.simgr(state)
     steps = 0
-    while simgr.active and steps < max_steps:
+    deadline = time.time() + 20                   # never let annotation hang the server
+    while simgr.active and steps < max_steps and time.time() < deadline:
         simgr.step()
         steps += 1
         if len(simgr.active) > 1:                 # inputs are concrete; keep a single path

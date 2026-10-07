@@ -376,3 +376,26 @@ with no name for `scale`/`frame_size`.
 old map). Verified in-browser on `vuln.route`: all three direct calls now read
 `call 0x… ; abort`, `; scale`, `; frame_size` (previously only the first was
 named); no console errors.
+
+## Experiment 14 — `path_values` could hang the WHOLE server (server-bricking bug)
+
+**Use case:** after a finding, call `path_values` to read the per-instruction
+concrete values along the path (the decompilation annotation / "understand the bug").
+
+**Friction found (serious bug):** calling `path_values` on the `alloc_msg`
+`int_overflow` finding **hung the entire server** — `/api/state` stopped responding
+and I had to `kill -9` it. Root cause: `path_values` → `trace_assignments`
+re-executes the path with the finding's **concrete** witness. The overflow witness
+makes `size ≈ 0x69a8bfff (~1.77e9)`, so the `memset(dst, c, size)` call tries to
+write ~1.8 GB for real — CPU-bound in angr under the Python GIL, starving every
+other thread, so the whole FastAPI server freezes. (The original run never hit this
+because there `size` is *symbolic* and angr keeps the write bounded; only the
+concrete re-execution explodes.)
+
+**Action — fix:** `trace_assignments` now (1) **skips calls** (CALLLESS) — it only
+needs per-line values inside the user function, and library-call internals aren't
+its source lines, so executing a giant concrete `memset`/`memcpy` is both useless
+and the hazard; and (2) has a **20 s wall-clock deadline** as a backstop. Verified
+over MCP: `path_values` on the same finding now returns in ~0 s with 20 per-line
+values, and the server stays responsive. Full suite 68 passed (trace/codegen
+fidelity unchanged — 28 path tests green).
