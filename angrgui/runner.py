@@ -805,6 +805,15 @@ class Run:
             self._printer = printer_for_state(state)
             self._return_addr = self.project.simos.return_deadend
 
+            # Observe the ENTRY block before stepping: the initial state's block is
+            # never a post-step successor, so a reach/avoid/assert/custom check pinned
+            # anywhere in the entry block would otherwise be silently missed.
+            for chk in self._state_checks:
+                try:
+                    chk.note_state(state)
+                except Exception:
+                    pass
+
             limits = self.spec.get("limits", {})
             max_steps = int(limits.get("steps", 200))
             max_active = int(limits.get("active", 400))

@@ -337,3 +337,29 @@ produce the runnable script to hand to the user.
 build into a shared `_scenario_spec` so the script and the run can never diverge).
 Verified over MCP: `generate_script` returns the code, and the returned script runs
 standalone and reports the overflow. mcp + codegen tests green (31 passed).
+
+## Experiment 12 — custom (Python) checks, and the entry-block blind spot
+
+**Use case:** the custom-check escape hatch — an agent writes `check(state, api)` in
+Python. Tested a valid predicate, a broken one, and an eval typo.
+
+**What worked:** a custom check with a Python syntax error records a clear
+"custom check failed to load: <traceback>" finding (not a silent no-op) — good.
+
+**Friction found (real, generalizable bug):** a custom check pinned at `0x400636`
+fired **zero** times, and so did `reach 0x400636` — while the *same* check with no
+address fired fine. Root cause: `note_state` is only called on post-step
+successors, so the **entry block is never observed**. Any point-check
+(reach / avoid / assert-at-addr / custom-at-addr) pinned anywhere in the entry block
+is silently missed. This is the broader form of the "reach at entry" edge noted in
+Exp 6.
+
+**Action — fix:** observe the initial state's entry block before stepping (run the
+state-point checks once on the entry state). Verified over MCP:
+- custom-at-`0x400636` and `reach 0x400636` now fire;
+- the valid predicate (`count > 0xfffffff`) fires;
+- an eval typo *inside* a custom check (`count u> 5`) now surfaces as
+  "custom check raised: <traceback>" instead of being swallowed (it was only
+  swallowed before because the entry-block check never ran);
+- Exp 6's "reach at the function entry" now works too.
+Full suite 68 passed.
