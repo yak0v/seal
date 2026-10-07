@@ -215,10 +215,14 @@ class Parser:
     def peek(self):
         return self.toks[self.i]
 
+    @staticmethod
+    def _desc(t):
+        return "end of input" if t[0] == "eof" else repr(t[1])
+
     def take(self, kind=None, val=None):
         t = self.toks[self.i]
         if kind and t[0] != kind or (val is not None and t[1] != val):
-            raise ExprError(f"expected {val or kind}, got {t[1]!r}")
+            raise ExprError(f"expected {val or kind}, got {self._desc(t)}")
         self.i += 1
         return t
 
@@ -230,7 +234,7 @@ class Parser:
     def parse(self):
         e = self.p_ternary()
         if self.peek()[0] != "eof":
-            raise ExprError(f"unexpected {self.peek()[1]!r}")
+            raise ExprError(f"unexpected {self._desc(self.peek())}")
         return e
 
     def p_ternary(self):
@@ -340,7 +344,7 @@ class Parser:
                 self.take()
                 size = self.take("num")[1]
             return self.funcs["mem"](addr, size)
-        raise ExprError(f"unexpected {t[1]!r}")
+        raise ExprError(f"unexpected {self._desc(t)}")
 
 
 def make_evaluator(state):
@@ -416,6 +420,37 @@ def make_evaluator(state):
         return e
 
     return evaluate
+
+
+def validate_expr(src: str) -> set[str]:
+    """Parse ``src`` for SYNTAX without a live angr state, so assumptions and assert
+    expressions can be checked the moment they're written instead of only when a run
+    fails. Any identifier resolves to a dummy value (names are resolved for real only
+    at run time, against the state), so this catches malformed input — bad operators,
+    unbalanced parens, unknown functions — not unknown variable names. Returns the set
+    of identifiers referenced; raises ExprError on a syntax error."""
+    used: set[str] = set()
+
+    def resolve(name):
+        used.add(name)
+        return claripy.BVS("_v", 64)        # any name is acceptable for a syntax check
+
+    def _mem(addr, size=8):
+        n = int(size) if isinstance(size, int) else 8
+        return claripy.BVS("_mem", max(8, n * 8))
+
+    funcs = {
+        "mem": _mem,
+        "u8": lambda x: _bv(x, 8), "u16": lambda x: _bv(x, 16),
+        "u32": lambda x: _bv(x, 32), "u64": lambda x: _bv(x, 64),
+        "s8": lambda x: _bv(x, 8), "s16": lambda x: _bv(x, 16),
+        "s32": lambda x: _bv(x, 32), "s64": lambda x: _bv(x, 64),
+        "zext": lambda x, n: _bv(x).zero_extend(int(n)),
+        "sext": lambda x, n: _bv(x).sign_extend(int(n)),
+        "bv": lambda v, n: claripy.BVV(int(v), int(n)),
+    }
+    Parser(src, resolve, funcs).parse()
+    return used
 
 
 def as_bool(ast):

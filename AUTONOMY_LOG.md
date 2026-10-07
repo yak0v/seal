@@ -242,3 +242,27 @@ real names, the #9 IDA-import path remains the better answer.
 
 Sources: [angr examples](https://docs.angr.io/examples),
 [OWASP MASTG — Symbolic Execution](https://mas.owasp.org/MASTG/techniques/android/MASTG-TECH-0037/).
+
+## Experiment 8 — malformed-input handling (assumptions / assert expressions)
+
+**Use case:** an agent writes a constraint or assert and makes a typo — the common
+reality of driving the tool programmatically.
+
+**Friction found (real):** `add_assumption` / `configure` accepted *any* string
+with no validation. A malformed expression (`count <<< )(`, `size +`) was stored
+silently and then **aborted the whole run** (`status: error`) only when it was
+reached — one wasted run, and `add_assumption` gave no hint anything was wrong.
+
+**Action — feature:** a new state-free `exprlang.validate_expr()` parses an
+expression for **syntax** without needing a live state (it reuses the real parser,
+so it can never reject an expression the run would accept). `add_assumption`,
+`add_check` (assert), and `configure` now validate assumption/assert expressions up
+front and return a clear `400 invalid assumption 'count <<< )(': unexpected '<'`
+instead of failing a run later. Also polished the parser's end-of-input messages
+("unexpected end of input" instead of "unexpected None").
+
+**Verified over MCP:** valid expressions accepted; `count <<< )(`, `size +`,
+`total <<` rejected at add time with precise messages; a syntactically-valid but
+unknown-name expression (`nope > 5`) is still accepted at add time and surfaces its
+clear "unknown name" error at run (name resolution needs a live state, by design).
+exprlang + full suite green (68 passed).

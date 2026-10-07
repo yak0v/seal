@@ -39,6 +39,7 @@ from .runner import Run
 from .backend import make_backend, AngrBackend
 from .workspace import Workspace
 from .checks import CUSTOM_TEMPLATE
+from .exprlang import validate_expr, ExprError
 from .codegen import generate_script
 from .idamcp import IdaSession, MCPError, DEFAULT_URL
 
@@ -764,10 +765,30 @@ def _coerce_check(c, a):
     return c
 
 
+def _check_expr(expr, what="expression"):
+    """Validate an exprlang string (assumption / assert expr) for syntax up front, so
+    a typo is reported the moment it's written rather than aborting a run later."""
+    if not isinstance(expr, str) or not expr.strip():
+        return
+    try:
+        validate_expr(expr)
+    except ExprError as e:
+        raise HTTPException(400, f"invalid {what} {expr!r}: {e}")
+
+
+def _validate_specs(assumptions=None, checks=None):
+    for a in (assumptions or []):
+        _check_expr(a, "assumption")
+    for c in (checks or []):
+        if isinstance(c, dict) and c.get("expr") and c.get("kind") != "custom":
+            _check_expr(c["expr"], f"{c.get('kind', 'assert')} expression")
+
+
 def _mcp_configure(addr, patch: dict):
     """Patch the ACTIVE scenario's initial state; checks are shared across scenarios."""
     _need_binary()
     a = _addr(addr)
+    _validate_specs(patch.get("assumptions"), patch.get("checks"))
     cfg = S.workspace.get_function(a)                   # structured
     sc = cfg["scenarios"][cfg["active"]]
     for k in ("args", "buffers", "assumptions", "stdin", "files", "limits", "models", "initial_state"):
@@ -782,6 +803,8 @@ def _mcp_configure(addr, patch: dict):
 def _mcp_add(addr, *, assumption=None, check=None):
     _need_binary()
     a = _addr(addr)
+    _validate_specs([assumption] if assumption is not None else None,
+                    [check] if check is not None else None)
     cfg = S.workspace.get_function(a)
     sc = cfg["scenarios"][cfg["active"]]
     if assumption is not None:
