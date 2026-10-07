@@ -691,7 +691,7 @@ def _addr(x) -> int:
     raise HTTPException(400, f"not an address or known function name: {s!r}")
 
 
-def _mcp_functions(query=None, limit: int = 200, only=None):
+def _mcp_functions(query=None, limit: int = 200, only=None, sort=None):
     """List functions. `query` is a name/address substring; `only` cuts noise:
     "named" (has a real symbol, not sub_/CRT), "source" (has DWARF line info),
     "configured" (already has checks/assumptions set), "interesting" (any of those)
@@ -714,11 +714,17 @@ def _mcp_functions(query=None, limit: int = 200, only=None):
             if o in ("interesting", "user"):  return named or src or conf
             return True               # unknown filter: don't hide anything
         fns = [f for f in fns if keep(f)]
+    if sort and str(sort).lower() in ("size", "blocks"):
+        # biggest first — a useful heuristic for finding the meaty logic in a
+        # stripped binary where names/source give no clue
+        fns = sorted(fns, key=lambda f: (f.get("block_count", 0), f.get("size", 0)), reverse=True)
+    elif sort and str(sort).lower() == "name":
+        fns = sorted(fns, key=lambda f: (f.get("ida_name") or f["name"]))
     total = len(fns)
     shown = fns[:int(limit)]
     return {"total": total, "shown": len(shown), "truncated": total > len(shown),
             "functions": [{"addr": hex(f["addr"]), "name": f.get("ida_name") or f["name"],
-                           "blocks": f["block_count"], "args": len(f["args"]),
+                           "blocks": f["block_count"], "size": f.get("size", 0), "args": len(f["args"]),
                            "checks": f.get("check_count", 0),
                            "has_source": f["has_source"], "named": bool(f.get("named"))}
                           for f in shown]}
@@ -1379,7 +1385,8 @@ TOOL_DEFS = [
      "you know when the list was capped by `limit`.",
      "inputSchema": {"type": "object", "properties": {
          "query": {"type": "string"}, "limit": {"type": "integer", "default": 200},
-         "only": {"type": "string", "enum": ["all", "named", "source", "configured", "interesting"]}}}},
+         "only": {"type": "string", "enum": ["all", "named", "source", "configured", "interesting"]},
+         "sort": {"type": "string", "enum": ["addr", "size", "name"], "description": "size = biggest first (find the meaty logic in a stripped binary)"}}}},
     {"name": "get_function", "description": "A function's saved setup (initial state, assumptions, checks, limits).",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
     {"name": "disassemble", "description": "Disassembly text of a function.",
@@ -1489,7 +1496,7 @@ CHECK_KINDS = [
 
 _MCP_TOOLS = {
     "get_status": lambda a: _mcp_status_payload(),
-    "list_functions": lambda a: _mcp_functions(a.get("query"), a.get("limit", 200), a.get("only")),
+    "list_functions": lambda a: _mcp_functions(a.get("query"), a.get("limit", 200), a.get("only"), a.get("sort")),
     "get_function": lambda a: _mcp_get_function(a["addr"]),
     "disassemble": lambda a: _mcp_disassemble(a["addr"]),
     "decompile": lambda a: _mcp_decompile(a["addr"]),

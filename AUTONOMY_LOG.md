@@ -217,3 +217,28 @@ instruction, e.g. a call site"). Full suite 68 passed.
 **Minor (left as-is):** `reach` at the function's own entry address doesn't fire
 (exploration starts there; "reaching" the entry is degenerate) — not worth a
 special case.
+
+## Experiment 7 — crackme on a stripped binary (`machine`)
+
+**Use case:** the classic symbolic-execution crackme — find the input that reaches
+the "valid" block — on a fully stripped binary (106 funcs, 0 symbols), matching the
+literature's top use cases (input-to-reach-block / crackme solving;
+see sources below).
+
+**Result:** comfortable. `sub_400650(user, code)` with a `reach` check solved
+`user=0xe05a, code=0x0` reaching the target block `0x40069b` in one run; witness is
+clean. Checked and it really appears. `list_functions only:interesting` surfaced
+the two configured functions despite zero symbols.
+
+**Friction found (inherent):** on a stripped binary with no workspace, an agent
+faces 106 anonymous `sub_` functions and `only:named`/`only:source` are empty —
+nothing to triage by. The data (`blocks`) was in the list but the agent had to sort
+it themselves.
+
+**Action — small aid:** `list_functions` gains `sort` (`size` = biggest first,
+plus `name`) and now reports each function's `size`, so "show me the meaty logic"
+is one call. Verified: `sort:size` surfaces `sub_400e40` (321 blocks) first. For
+real names, the #9 IDA-import path remains the better answer.
+
+Sources: [angr examples](https://docs.angr.io/examples),
+[OWASP MASTG — Symbolic Execution](https://mas.owasp.org/MASTG/techniques/android/MASTG-TECH-0037/).
