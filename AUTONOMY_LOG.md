@@ -399,3 +399,41 @@ and the hazard; and (2) has a **20 s wall-clock deadline** as a backstop. Verifi
 over MCP: `path_values` on the same finding now returns in ~0 s with 20 per-line
 values, and the server stays responsive. Full suite 68 passed (trace/codegen
 fidelity unchanged — 28 path tests green).
+
+---
+
+# Summary (so far)
+
+14 usability experiments driven entirely through the MCP across varied use cases
+(integer overflow, reach/CTF, memory-safety checks, a real CVE, stripped binaries,
+symbolic stdin, assertions, custom checks, script export, path annotation). Each
+surfaced real friction; every fix was validated through the running app/MCP (and
+in-browser for GUI changes) and the test suite (68 passing throughout). Commits are
+on branch `autonomy-2026-10-08` (pushed to `seal`).
+
+| # | Area | What changed |
+|---|------|--------------|
+| 1 | `list_functions` | `only` filter (named/source/configured/interesting) + `{total,shown,truncated}` — cut CRT noise on big binaries |
+| 2 | disassembly (MCP) | name direct call targets: `call 0x.. <abort>` (per-instruction `call_name`, PLT/symbol fallback) |
+| 3 | `oob_read`/`oob_write` | a no-`base` check auto-anchors to a single declared buffer (natural setup now fires) |
+| 4 | `int_overflow` | message leads with result width + source line → separate the value bug from 64-bit pointer math |
+| 5 | **run diagnostics** | `summary.notes` explain an empty/surprising run (unanchored check, no symbolic inputs, unconstrained…); GUI banner |
+| 6 | `reach`/`avoid` | match ANY instruction in a traversed block, not just block heads |
+| 7 | `list_functions` | `sort` (size/name) + report `size` — triage a stripped binary |
+| 8 | assumptions/asserts | `exprlang.validate_expr` — reject malformed expressions at add time (was: abort the run later) |
+| 9 | docs | fixed the GUIDE `at_return` recipe + documented `ret` is register-width (use `s32(ret)`) |
+| 10 | docs | `oob_write`/`oob_read` anchoring guidance (declare the buffer; bulk-write limit) |
+| 11 | **`generate_script`** | new MCP tool: the runnable standalone angr script (was HTTP-only) |
+| 12 | point-checks | observe the ENTRY block — reach/avoid/assert/custom pinned there now fire (was silently missed) |
+| 13 | disassembly (GUI) | surface `call_name` in the GUI code view (all direct calls named) |
+| 14 | **`path_values`** | no longer hangs the whole server (skip calls + deadline in the concrete re-execution) |
+
+Cross-cutting theme: the worst failure mode is the **silent no-op** — a run or a
+check that quietly does nothing. The biggest wins (5, 6, 12, 8, 14) all convert a
+silent failure into either a working result or a clear explanation.
+
+Known limitations noted for follow-up: oob detection of **bulk** writes
+(`memset`/`memcpy` with symbolic size) isn't per-byte; `float_anomaly` still lacks
+validation/coverage (needs a float sample — the x86-64 cross-compiler isn't present
+on this machine; `oob_write` likewise lacks a committable regression test for the
+same reason).
