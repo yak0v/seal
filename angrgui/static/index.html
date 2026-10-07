@@ -255,7 +255,15 @@ body.paths #dockGraph{flex:1 1 auto;height:auto}                 /* CFG graph fi
 .codeinputs{margin:2px 0 8px;padding:6px 12px;border-left:3px solid var(--accent);
   background:color-mix(in srgb,var(--accent) 10%,transparent);border-radius:4px;font-family:var(--mono);font-size:12px}
 .codeinputs .cilbl{color:var(--dim);margin-right:10px}
-.codeinputs .civals{color:var(--ink)}
+.codeinputs .civals{color:var(--ink);display:inline-flex;gap:8px;flex-wrap:wrap;vertical-align:top}
+/* one example-input as a chip: the variable NAME stands out from the value blob */
+.ci-chip{display:inline-flex;align-items:center;background:color-mix(in srgb,var(--accent) 14%,transparent);
+  border:1px solid color-mix(in srgb,var(--accent) 40%,transparent);border-radius:4px;padding:1px 6px;max-width:100%}
+.ci-name{color:var(--accent);font-weight:600}
+.ci-eq{color:var(--dim)}
+.ci-val{color:var(--ink);overflow:hidden;text-overflow:ellipsis}
+.ci-val.long,.dex .long,.hit .long{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
+.ci-val.long:hover,.dex .long:hover,.hit .long:hover{color:var(--accent)}
 .insn.oncur{background:#182338}
 .blocklabel{color:var(--faint);font-size:11px;padding:8px 12px 2px;border-top:1px solid #1a2029;margin-top:4px}
 

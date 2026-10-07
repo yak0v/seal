@@ -777,6 +777,16 @@ function sectionState() {
     }
   });
 
+  // add an argument by hand — essential on stripped binaries where the calling
+  // convention recovers 0 args (so there's nothing to click otherwise).
+  b.append(el("button", { class: "tiny", style: "margin-top:2px",
+    title: "add a function argument (symbolic by default)",
+    onclick: () => {
+      A.config.args = A.config.args || [];
+      A.config.args.push({ name: "arg" + A.config.args.length, mode: "symbolic", size: 8 });
+      renderRight(); scheduleSave();
+    } }, "+ argument"));
+
   // stdin
   const stdinOn = !!A.config.stdin;
   b.append(el("label", { class: "row", style: "font-size:12px;margin-top:4px;gap:5px" },
@@ -1338,10 +1348,11 @@ function renderHit(h, i) {
   const wit = h.witness || {};
   const scalars = Object.entries(wit).filter(([k, v]) => typeof v === "object" && !k.includes("->"));
   const byteInputs = Object.entries(wit).filter(([k, v]) => typeof v === "string" && v);
-  if (scalars.length) box.append(el("div", { class: "wit" }, "inputs: " + scalars.map(([k, v]) => `${k}=${fmtOne(k, v)}`).join(", ")));
+  if (scalars.length) box.append(el("div", { class: "wit" },
+    el("span", { class: "faint" }, "inputs: "), ...scalars.map(([k, v]) => valChip(k, fmtOne(k, v)))));
   for (const [k, v] of byteInputs) {                 // file / stdin contents = the solution
-    const label = k.startsWith("file:") ? k.slice(5) + " =" : k + " =";
-    box.append(el("div", { class: "wit solution" }, label + " " + bytesPretty(v.replace(/(00)+$/, ""))));
+    const name = k.startsWith("file:") ? k.slice(5) : k;
+    box.append(el("div", { class: "wit solution" }, valChip(name, bytesPretty(v.replace(/(00)+$/, "")))));
   }
   const node = h.extra?.node;
   if (node != null) box.append(el("button", { class: "tiny ghost", style: "margin-top:4px",
@@ -1349,7 +1360,8 @@ function renderHit(h, i) {
   box.addEventListener("click", () => {
     A.selectedHit = i;
     if (node != null) { A.selNode = node; updatePathHighlight(); }
-    selectTab("code"); scrollToAddr(h.addr); renderTree(true);
+    showAddr(h.addr);           // prefer the decompilation when IDA is connected (#1)
+    renderTree(true);
   });
   return box;
 }
@@ -1395,6 +1407,41 @@ function fmtInputs(wit) {
                         && !/_buf$/.test(k) && !/^(stdin|file:)/.test(k))   // skip buffer blobs / stdin / files
     .map(([k, v]) => `${k} = ${fmtOne(k, v)}`);
 }
+
+// A scrollable viewer for a long value (a buffer, a long byte string) — so it doesn't
+// overflow a panel as an unclickable blob (#4). Click any truncated value to open it.
+function openValueBox(title, text) {
+  text = String(text);
+  const ta = el("textarea", { readonly: "",
+    style: "width:100%;height:min(55vh,340px);box-sizing:border-box;font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all" });
+  ta.value = text;
+  const copy = el("button", { class: "tiny" }, "⧉ Copy");
+  copy.onclick = () => (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+    .then(() => toast("copied")).catch(() => toast("copy failed; select the text", true));
+  const m = modal(title, el("div", {}, el("div", { class: "faint", style: "margin-bottom:4px" }, text.length + " characters"), ta),
+    [copy, el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
+  $("#modalHost").append(m);
+}
+
+// One input as a chip: the variable NAME highlighted (so it isn't a text blob, #3) and the
+// value — truncated + click-to-expand when long (#4).
+function valChip(name, valStr) {
+  valStr = String(valStr);
+  const LONG = 44;
+  const val = valStr.length > LONG
+    ? el("span", { class: "ci-val long", title: "click to view all " + valStr.length + " characters",
+        onclick: (e) => { e.stopPropagation(); openValueBox(name, valStr); } }, valStr.slice(0, LONG) + "… ⤢")
+    : el("span", { class: "ci-val" }, valStr);
+  return el("span", { class: "ci-chip" }, el("span", { class: "ci-name" }, name), el("span", { class: "ci-eq" }, " = "), val);
+}
+
+// DOM version of fmtInputs: highlighted-name chips with expandable long values.
+function fmtInputEls(wit) {
+  return Object.entries(wit || {})
+    .filter(([k, v]) => typeof v === "object" && v && !k.includes("->")
+                        && !/_buf$/.test(k) && !/^(stdin|file:)/.test(k))
+    .map(([k, v]) => valChip(k, fmtOne(k, v)));
+}
 function highlightHits() {
   const pane = $("#pane-code"); if (!pane) return;
   const path = A.pathHighlight;            // blocks on the selected path (or null)
@@ -1403,11 +1450,11 @@ function highlightHits() {
   // the example inputs for this path, at the top (near where the args arrive)
   const banner = $("#codeInputs", pane);
   if (banner) {
-    const parts = fmtInputs(selectedInputs());
+    const chips = fmtInputEls(selectedInputs());
     banner.replaceChildren();
-    if (parts.length) {
+    if (chips.length) {
       banner.append(el("span", { class: "cilbl" }, "example inputs on this path:"),
-                    el("span", { class: "civals" }, parts.join("    ")));
+                    el("span", { class: "civals" }, ...chips));
       banner.style.display = "";
     } else banner.style.display = "none";
   }
@@ -1929,7 +1976,12 @@ function renderPathDetail(T, snap) {
   if (exTop.length) {
     colB.append(el("div", { class: "dlabel", style: "margin-top:10px" }, "Example input"));
     const tb = el("div", { class: "dex" });
-    exTop.forEach(([k, v]) => tb.append(el("div", {}, el("span", { class: "k" }, k), el("span", {}, fmtOne(k, v)))));
+    exTop.forEach(([k, v]) => {
+      const vs = String(fmtOne(k, v)), long = vs.length > 44;
+      tb.append(el("div", {}, el("span", { class: "k" }, k),
+        el("span", long ? { class: "long", title: "click to view all " + vs.length + " chars",
+            onclick: () => openValueBox(k, vs) } : {}, long ? vs.slice(0, 44) + "… ⤢" : vs)));
+    });
     colB.append(tb);
   }
 
@@ -2275,7 +2327,18 @@ function showAddr(addr) {
   if (A.ida && A.ida.connected) {
     selectTab("decomp");
     setTimeout(() => {
-      const line = $(`#pane-decomp .cline[data-addr="${addr}"]`);
+      // exact line for this address, else the nearest decompiled line at or before it
+      // (a finding's instruction may sit between pseudocode lines) — so the right line
+      // always highlights, not "something nearby".
+      let line = $(`#pane-decomp .cline[data-addr="${addr}"]`);
+      if (!line) {
+        let best = null, bestA = -1;
+        $$(`#pane-decomp .cline[data-addr]`).forEach(el => {
+          const a = +el.dataset.addr;
+          if (a <= addr && a > bestA) { bestA = a; best = el; }
+        });
+        line = best;
+      }
       if (line) { line.scrollIntoView({ block: "center", behavior: "smooth" }); line.classList.add("flash"); setTimeout(() => line.classList.remove("flash"), 1400); }
       else { selectTab("code"); scrollToAddr(addr); }
     }, 350);
@@ -2456,11 +2519,11 @@ async function renderDecomp(force) {
   renderDecompLines(d.code || "(empty)", pre);
   if (d.note) pre.prepend(el("div", { class: "faint", style: "margin-bottom:6px" }, d.note));
   // example inputs for the selected path, pinned at the top (where the args arrive)
-  const inputs = fmtInputs(selectedInputs());
-  const inbar = inputs.length
+  const inChips = fmtInputEls(selectedInputs());
+  const inbar = inChips.length
     ? el("div", { class: "codeinputs" },
         el("span", { class: "cilbl" }, "example inputs on this path:"),
-        el("span", { class: "civals" }, inputs.join("    ")))
+        el("span", { class: "civals" }, ...inChips))
     : null;
   pane.replaceChildren(el("div", { class: "decompwrap" }, bar, inbar, assumptionsBar(), pre));
   pre.scrollTop = keepScroll;
