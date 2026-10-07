@@ -96,3 +96,20 @@ def test_no_false_positive_div(binary):
     })
     assert snap["status"] == "done"
     assert not [h for h in snap["hits"] if h["kind"] == "div_by_zero"]
+
+
+def test_oob_write(binary):
+    """oob_w(buf, i, v) = buf[i] = v — with buf declared as a 16-byte buffer and no
+    explicit base, the check auto-anchors to that buffer and i can index out."""
+    snap = _run(binary, {
+        "func_addr": _addr(binary, "oob_w"),
+        "args": [{"name": "buf", "mode": "symbolic", "size": 8},
+                 {"name": "i", "mode": "symbolic", "size": 4},
+                 {"name": "v", "mode": "symbolic", "size": 4}],
+        "buffers": [{"arg": "buf", "size": 16}],
+        "checks": [{"id": "w", "kind": "oob_write", "enabled": True}],
+        "limits": {"steps": 40, "active": 60, "seconds": 30},
+    })
+    assert snap["status"] == "done"
+    hits = [h for h in snap["hits"] if h["kind"] == "oob_write"]
+    assert hits, "expected an oob_write finding"

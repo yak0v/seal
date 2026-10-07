@@ -452,3 +452,11 @@ build-or-skip `tests/test_float_anomaly.py` (3 cases, name lookup, mirrors
 test_new_checks) so the check is regression-covered on toolchain-equipped machines.
 Full suite now 71 passed. (The sample binary is gitignored like the others; built
 locally with `zig cc -target x86_64-linux-gnu -fno-sanitize=undefined`.)
+
+## Experiment 16 — fill the `oob_write` coverage gap (from Exp 10)
+
+Having sorted the clean cross-build (`zig cc -target x86_64-linux-gnu
+-fno-sanitize=undefined`), added a direct indexed-store function `oob_w(buf,i,v)`
+to `checks_sample.c` and a `test_oob_write` (auto-anchored to a declared buffer, the
+robust path). Verified `oob_write` fires on the out-of-range store. `oob_write` —
+the heap-overflow headline check — now has regression coverage. Suite 72 passed.

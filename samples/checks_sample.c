@@ -1,6 +1,6 @@
 /*
  * checks_sample.c — minimal, planted bugs for the newer built-in checks
- * (div_by_zero, null_deref, oob_read). Built like the other samples (x86-64 ELF,
+ * (div_by_zero, null_deref, oob_read, oob_write). Built like the other samples (x86-64 ELF,
  * -O0 -no-pie). Each function takes its inputs in the ABI arg registers so a test
  * can mark them symbolic and confirm the check fires with a concrete witness.
  */
@@ -21,6 +21,13 @@ int null_d(int *p) {
  * reads out of bounds (information leak). */
 int oob_r(const int *buf, uint32_t i) {
     return buf[i];
+}
+
+/* oob_write: writes buf[i] = v; with the buffer declared as 16 bytes (4 ints),
+ * i >= 4 writes out of bounds (memory corruption). A direct indexed store, so the
+ * oob_write check sees it per-byte (unlike a memset/memcpy SimProcedure). */
+void oob_w(int *buf, uint32_t i, int v) {
+    buf[i] = v;
 }
 
 int main(void) { return 0; }
