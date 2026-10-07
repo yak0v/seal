@@ -444,6 +444,8 @@ def _start_run(spec: dict, source: str = "gui") -> str:
 
     def on_event(kind, **data):
         msg = {"finding": lambda: f"finding: {data.get('check_kind')} at {data.get('addr', 0):#x} — {data.get('detail', '')}",
+               "run_progress": lambda: f"exploring {_fname(spec['func_addr'])}: {data.get('active', 0)} paths active, "
+                                       f"step {data.get('step', 0)}, {data.get('deadended', 0)} ended, {data.get('hits', 0)} finding(s)",
                "run_status": lambda: f"run of {_fname(spec['func_addr'])} {data.get('status')} "
                                      f"({data.get('hits', 0)} finding(s))"}.get(kind, lambda: kind)()
         BUS.publish(kind, msg, run_id=run_id, **data)

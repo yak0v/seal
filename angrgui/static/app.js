@@ -2875,6 +2875,14 @@ function connectEvents() {
 function setLiveDot(on) { const b = $("#actBtn"); if (b) b.classList.toggle("live", on); }
 
 function handleEvent(ev) {
+  // run_progress fires ~every 0.7s during a run; collapse it to ONE rolling entry so the
+  // feed shows live exploration without flooding (#6).
+  if (ev.type === "run_progress") {
+    if (A.activity[0] && A.activity[0].type === "run_progress") A.activity[0] = ev;
+    else A.activity.unshift(ev);
+    renderActivity();
+    return;
+  }
   A.activity.unshift(ev);
   if (A.activity.length > 120) A.activity.pop();
   if (!A.actOpen) { A._actUnseen = (A._actUnseen || 0) + 1; }

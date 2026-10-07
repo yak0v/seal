@@ -833,6 +833,14 @@ class Run:
                         found=len(getattr(simgr, "found", [])),
                         elapsed=round(time.time() - self.start_time, 2),
                     )
+                # throttled live progress to the activity feed, so a run reads as "N paths
+                # being explored" rather than looking stuck (#6).
+                now = time.time()
+                if now - getattr(self, "_last_progress", 0) >= 0.7:
+                    self._last_progress = now
+                    self._emit("run_progress", func=self.func_addr, step=step,
+                               active=len(simgr.active), deadended=len(simgr.deadended),
+                               hits=len(self.hits))
                 if len(simgr.active) > max_active:
                     # keep the search bounded; stash the overflow
                     extra = simgr.active[max_active:]
