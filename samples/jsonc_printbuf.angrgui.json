@@ -1,0 +1,112 @@
+{
+  "functions": {
+    "4195949": {
+      "checks": [
+        {
+          "kind": "int_overflow",
+          "id": "d5e54a",
+          "enabled": true,
+          "func_addr": 4195949
+        }
+      ],
+      "scenarios": [
+        {
+          "name": "Default",
+          "args": [],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        },
+        {
+          "name": "cve",
+          "args": [
+            {
+              "name": "p",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "buf",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "size",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": true
+            }
+          ],
+          "buffers": [
+            {
+              "arg": "p",
+              "size": 16
+            },
+            {
+              "arg": "buf",
+              "size": 16
+            }
+          ],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {
+            "steps": 120,
+            "seconds": 40,
+            "skip_calls": true
+          },
+          "models": []
+        },
+        {
+          "name": "cve2",
+          "args": [
+            {
+              "name": "p",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "buf",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "size",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": true
+            }
+          ],
+          "buffers": [
+            {
+              "arg": "p",
+              "size": 16
+            },
+            {
+              "arg": "buf",
+              "size": 16
+            }
+          ],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {
+            "steps": 120,
+            "seconds": 40,
+            "skip_calls": true
+          },
+          "models": []
+        }
+      ],
+      "active": 2
+    }
+  },
+  "meta": {}
+}

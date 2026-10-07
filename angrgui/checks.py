@@ -311,10 +311,20 @@ class IntOverflowCheck(BaseCheck):
             witness = self._witness_with(state, [cond])
             opvals = self._concrete_ops(state, (a, b), cond)
             shown = op_char.join(v["hex"] for v in opvals) if opvals else "..."
-            msg = f"{label} overflow possible at {text or hex(ins_addr)}  ({shown})"
+            loc = self.ctx.line_for(ins_addr)
+            # surface the source location + result width in the headline: an agent
+            # triaging many hits can tell a 32-bit value overflow (often the real
+            # bug) from a 64-bit add that is usually pointer/address arithmetic.
+            if isinstance(loc, dict) and loc.get("line"):
+                where = f" [{loc.get('file')}:{loc['line']}]"
+            elif isinstance(loc, (tuple, list)) and len(loc) == 2:
+                where = f" [{loc[0]}:{loc[1]}]"
+            else:
+                where = ""
+            msg = f"{label} {n}-bit overflow possible at {text or hex(ins_addr)}{where}  ({shown})"
             self._record(state, ins_addr, msg, witness,
                          extra={"mnemonic": mn, "op": op_char, "signedness": label,
-                                "operands": opvals, "src_line": self.ctx.line_for(ins_addr),
+                                "operands": opvals, "src_line": loc,
                                 "result_bits": n, "path": self.ctx.path_of(state)},
                          dedup_key=(ins_addr, label, op_char))
 

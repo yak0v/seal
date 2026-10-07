@@ -1463,7 +1463,7 @@ CHECK_KINDS = [
     {"kind": "assert", "summary": "a boolean that must always hold; a finding is any input that breaks it",
      "fields": {"expr": "expression (required)", "addr": "0x.. (optional point; omit for return)",
                 "at_return": "true to check at function return"}},
-    {"kind": "int_overflow", "summary": "integer add/sub/mul whose result overflows (wraps)",
+    {"kind": "int_overflow", "summary": "integer add/sub/mul whose result overflows (wraps). Each finding's message carries the result width and source line, e.g. '32-bit overflow ... [file.c:34]'. TRIAGE TIP: a 64-bit add is usually pointer/address arithmetic (p->buf + i), not a value bug — the width + source line tell them apart; extra.result_bits and extra.src_line have the same data.",
      "fields": {"addr": "0x.. (optional; omit to scan every add/sub/mul)",
                 "signed": "either | unsigned | signed"}},
     {"kind": "narrowing_cast", "summary": "a value truncated to a smaller int type (int->short, ->char, 64->32) where the dropped high bits can be non-zero",

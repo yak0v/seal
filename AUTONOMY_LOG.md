@@ -124,3 +124,39 @@ natural paths; full suite 68 passed (explicit + modeled oob tests unchanged).
 **Still open (noted):** a check that ends up with no anchor at all still no-ops
 silently — a run-summary "this check had nothing to anchor to" note would close
 the loop. Deferred to a later pass.
+
+## Experiment 4 — real CVE flow: `jsonc_printbuf` (CVE-2020-12762)
+
+**Use case:** analyze `printbuf_memappend(struct printbuf *p, char *buf, int size)`
+— whose `p->bpos + size + 1` overflows `int` — the way an agent would without IDA:
+declare `p` as a 16-byte buffer (so its members go symbolic) and hunt `int_overflow`.
+
+**MCP path:** `load_binary` → `get_function` (args + struct pointer auto-detected
+from DWARF) → `configure` (p,buf as buffers, skip_calls) → `add_check int_overflow`
+→ `run` → `get_run`.
+
+**Result:** the real CVE overflow is found — `add eax, 1` at the
+`p->bpos + size + 1` site, witness `size = 0x7fffffff` (INT_MAX → +1 wraps).
+Checked and it really appears.
+
+**Friction found:** the run returned **12** `int_overflow` hits with near-identical
+headlines (`add X+Y`), several of which were 64-bit `add rcx,rax` / `add rax,rdx`
+— i.e. **pointer arithmetic** (`p->buf + p->bpos` for the memcpy/store), flagged
+only because the symbolic struct made the `buf` *pointer* member a wild symbolic
+value. The real 32-bit value overflow was buried, and the headline gave no way to
+tell signal from address-math noise (the distinguishing data — `result_bits`,
+`src_line` — was in `extra` but not surfaced).
+
+**Action — improvement:** the `int_overflow` message now leads with the **result
+width and source location**, e.g. `signed 32-bit overflow ... add eax, 1
+[jsonc_printbuf.c:34]` (the CVE line) vs `64-bit overflow ... add rcx, rax
+[jsonc_printbuf.c:39]` (the memcpy pointer add). Added a triage tip to the
+`int_overflow` CHECK_KINDS doc (a 64-bit add is usually address arithmetic).
+Verified over MCP: the headlines now separate the line-34 value overflow from the
+line-39/41 pointer math at a glance. Full suite 68 passed (no test tied to the
+message text).
+
+**Note for later:** the deeper cause is that a declared struct buffer makes
+*pointer* members symbolic. A future setup-side nicety: when declaring a buffer
+without a layout, offer to keep 8-byte slots that look like pointers concrete, or
+lean on the existing get_struct/layout path when IDA is connected.
