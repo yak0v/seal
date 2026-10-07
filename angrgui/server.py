@@ -691,16 +691,37 @@ def _addr(x) -> int:
     raise HTTPException(400, f"not an address or known function name: {s!r}")
 
 
-def _mcp_functions(query=None, limit: int = 200):
+def _mcp_functions(query=None, limit: int = 200, only=None):
+    """List functions. `query` is a name/address substring; `only` cuts noise:
+    "named" (has a real symbol, not sub_/CRT), "source" (has DWARF line info),
+    "configured" (already has checks/assumptions set), "interesting" (any of those)
+    — invaluable on big stripped binaries where the raw list is thousands of CRT
+    stubs. Returns totals so an agent knows when the list was capped by `limit`."""
     fns = functions()["functions"]
     if query:
         q = str(query).lower()
         fns = [f for f in fns if q in f["name"].lower()
                or q in (f.get("ida_name") or "").lower() or q in hex(f["addr"])]
-    return [{"addr": hex(f["addr"]), "name": f.get("ida_name") or f["name"],
-             "blocks": f["block_count"], "args": len(f["args"]),
-             "checks": f.get("check_count", 0), "has_source": f["has_source"]}
-            for f in fns[:int(limit)]]
+    if only and str(only).lower() not in ("all", ""):
+        o = str(only).lower()
+        def keep(f):
+            named = bool(f.get("named"))
+            src = bool(f.get("has_source"))
+            conf = bool(f.get("configured") or f.get("check_count"))
+            if o in ("named",):       return named
+            if o in ("source", "has_source"): return src
+            if o in ("configured",):  return conf
+            if o in ("interesting", "user"):  return named or src or conf
+            return True               # unknown filter: don't hide anything
+        fns = [f for f in fns if keep(f)]
+    total = len(fns)
+    shown = fns[:int(limit)]
+    return {"total": total, "shown": len(shown), "truncated": total > len(shown),
+            "functions": [{"addr": hex(f["addr"]), "name": f.get("ida_name") or f["name"],
+                           "blocks": f["block_count"], "args": len(f["args"]),
+                           "checks": f.get("check_count", 0),
+                           "has_source": f["has_source"], "named": bool(f.get("named"))}
+                          for f in shown]}
 
 
 def _mcp_get_function(addr):
@@ -1026,10 +1047,12 @@ PART 3 — THE CORE LOOP (the happy path, in order)
 1. get_status
      Is a binary loaded? Is IDA connected (for names/decompilation)? If no binary,
      load one yourself: list_files(dir) to browse, then load_binary(absolute_path).
-2. list_functions(query)
-     Find your target by name or address substring. Note its integer "addr". For a
-     big stripped binary most functions are "sub_<addr>" with named:false — that's
-     normal; search by address or connect IDA for names.
+2. list_functions(query, only, limit)
+     Find your target by name or address substring. Returns {total, shown, truncated,
+     functions:[...]} — iterate the "functions" list; "truncated" means raise limit or
+     narrow the query. Note each entry's integer "addr". For a big stripped binary most
+     functions are "sub_<addr>" with named:false — pass only:"interesting" (or "source"
+     / "named" / "configured") to skip the CRT/library noise, or connect IDA for names.
 3. get_function(addr)
      Read the current setup: the active scenario's initial state (args, buffers,
      assumptions, stdin, files, limits, models, initial_state), the shared checks, and
@@ -1278,7 +1301,7 @@ PART 12 — RECIPES (copy the shape, get real addresses from list_functions)
 ════════════════════════════════════════════════════════════════════════
 
 A · Reach a target (CTF "find the input that wins")
-   f = list_functions("check")[0]
+   f = list_functions("check")["functions"][0]
    decompile(f.addr)                                   # find the "you win" block @ 0x4012f0
    configure(f.addr, {"args":[{"name":"key","mode":"symbolic","size":8}]})
    add_check(f.addr, {"kind":"reach","addr":0x4012f0})
@@ -1345,9 +1368,13 @@ _A = {"addr": {"type": "string", "description": "function address, e.g. \"0x4006
 TOOL_DEFS = [
     {"name": "get_status", "description": "What binary is loaded and whether IDA is connected.",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "list_functions", "description": "List functions (optionally filtered by name/address substring).",
+    {"name": "list_functions", "description": "List functions. `query` filters by name/address substring. "
+     "`only` cuts CRT/library noise: \"named\" | \"source\" | \"configured\" | \"interesting\" (any of those) | "
+     "\"all\" (default) — essential on big stripped binaries. Returns {total, shown, truncated, functions[]} so "
+     "you know when the list was capped by `limit`.",
      "inputSchema": {"type": "object", "properties": {
-         "query": {"type": "string"}, "limit": {"type": "integer", "default": 200}}}},
+         "query": {"type": "string"}, "limit": {"type": "integer", "default": 200},
+         "only": {"type": "string", "enum": ["all", "named", "source", "configured", "interesting"]}}}},
     {"name": "get_function", "description": "A function's saved setup (initial state, assumptions, checks, limits).",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
     {"name": "disassemble", "description": "Disassembly text of a function.",
@@ -1455,7 +1482,7 @@ CHECK_KINDS = [
 
 _MCP_TOOLS = {
     "get_status": lambda a: _mcp_status_payload(),
-    "list_functions": lambda a: _mcp_functions(a.get("query"), a.get("limit", 200)),
+    "list_functions": lambda a: _mcp_functions(a.get("query"), a.get("limit", 200), a.get("only")),
     "get_function": lambda a: _mcp_get_function(a["addr"]),
     "disassemble": lambda a: _mcp_disassemble(a["addr"]),
     "decompile": lambda a: _mcp_decompile(a["addr"]),
