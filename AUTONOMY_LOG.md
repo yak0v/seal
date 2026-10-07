@@ -189,3 +189,31 @@ the GUI Paths panel for humans.
 - In the browser (real `renderTree`): the banner renders with the notes text, no
   console errors.
 - Tests green (full suite 68 earlier; mcp+checks subset 7 after the doc edits).
+
+## Experiment 6 — symbolic stdin + the `reach` block-head trap (`vuln.main`)
+
+**Use case:** `main` reads 8 bytes from stdin and dispatches; drive it with
+symbolic stdin and `reach` a specific call site.
+
+**What worked:** symbolic stdin flows cleanly — the path tree branches on
+`stdin[0] == 4` etc., and witnesses render stdin as a byte string
+(`"0000000000000000"`). The Exp-2 call-naming also helped here (`<read>`,
+`<route>`, `<alloc_msg>` in the disassembly). The Exp-5 diagnostics fired on an
+unreachable target ("no findings — the checks ran but nothing triggered").
+
+**Friction found (real bug):** `reach` at the obvious target — the `call`
+instruction (`0x40084c`, `0x400874`) — silently never fired, while `reach` at the
+*next* address (`0x400851`, a block head) did. Cause: `reach`/`avoid` matched only
+basic-block **leaders** (`state.addr == target`), but a `call` is the *last*
+instruction of its block. An agent naturally points reach at the instruction of
+interest, so this was a silent miss with no explanation.
+
+**Action — fix:** `reach`/`avoid` now match the target **anywhere in a traversed
+block** (`target in state.block().instruction_addrs`), not just at the head.
+Verified over MCP: `reach 0x40084c` and `reach 0x400874` now fire with stdin
+witnesses. Updated the reach/avoid CHECK_KINDS docs ("addr may be any
+instruction, e.g. a call site"). Full suite 68 passed.
+
+**Minor (left as-is):** `reach` at the function's own entry address doesn't fire
+(exploration starts there; "reaching" the entry is degenerate) — not worth a
+special case.

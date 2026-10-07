@@ -1458,10 +1458,10 @@ TOOL_DEFS = [
 
 # documented check kinds (what add_check accepts); kept in sync with checks.py
 CHECK_KINDS = [
-    {"kind": "reach", "summary": "record any path that reaches an address",
-     "fields": {"addr": "0x.. (required)"}},
-    {"kind": "avoid", "summary": "record + flag paths that reach an address (a 'bad' location)",
-     "fields": {"addr": "0x.. (required)"}},
+    {"kind": "reach", "summary": "record any path that reaches an address. addr may be ANY instruction (it need not start a basic block) — a path counts if it executes the block containing that address.",
+     "fields": {"addr": "0x.. (required; any instruction, e.g. a call site)"}},
+    {"kind": "avoid", "summary": "record + flag paths that reach an address (a 'bad' location). addr may be any instruction in a block.",
+     "fields": {"addr": "0x.. (required; any instruction)"}},
     {"kind": "assert", "summary": "a boolean that must always hold; a finding is any input that breaks it",
      "fields": {"expr": "expression (required)", "addr": "0x.. (optional point; omit for return)",
                 "at_return": "true to check at function return"}},

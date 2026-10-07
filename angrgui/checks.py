@@ -407,12 +407,23 @@ class ReachCheck(BaseCheck):
         self.prune = spec.get("prune", False)
 
     def note_state(self, state):
-        if state.addr != self.addr:
+        if not self._reaches(state):
             return
         witness = self._witness(state)
         self._record(state, self.addr, f"{self.verb} {self.addr:#x}", witness,
                      extra={"src_line": self.ctx.line_for(self.addr),
                             "path": self.ctx.path_of(state)}, dedup_key=self.addr)
+
+    def _reaches(self, state):
+        # Match the target anywhere in the block being executed, not only at the block
+        # head — so an agent can point reach/avoid at *any* instruction (e.g. a `call`
+        # that ends a block), not just basic-block leaders.
+        if state.addr == self.addr:
+            return True
+        try:
+            return self.addr in state.block().instruction_addrs
+        except Exception:
+            return False
 
 
 class AvoidCheck(ReachCheck):
