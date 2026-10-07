@@ -87,3 +87,40 @@ text as `call 0x4004c0  <abort>`. Verified over MCP: all three direct calls in
 `route` now read `<abort>`, `<scale>`, `<frame_size>`. Full suite 68 passed.
 (`call_name` is now on every instruction, so the GUI disassembly view can show
 the same annotation — noted for a later GUI pass.)
+
+## Experiment 3 — memory-safety hunt on `checks_sample` (div/null/oob)
+
+**Use case:** point an agent at `samples/checks_sample` and have it find the three
+planted memory bugs — `div_z` (÷0), `null_d` (NULL deref), `oob_r` (OOB read).
+Also exercises `load_binary` over MCP.
+
+**MCP path:** `load_binary` → `list_functions only:interesting` → for each:
+`get_function` (args auto-detected) → `add_check {kind}` → `run` → `get_run`.
+
+**What worked well:** `load_binary` over MCP is clean; the new `only:interesting`
+filter surfaced exactly `div_z, null_d, oob_r, main`; args auto-detected from
+DWARF with correct names/sizes (`a,b` / `p` / `buf,i`). `div_by_zero` and
+`null_deref` fired first try with clear witnesses (`b=0`; `p=0xfff`). Checked —
+both findings really appear.
+
+**Friction found (real):** `oob_read` added the obvious way
+(`add_check {"kind":"oob_read"}`) found **nothing**, silently. The check needs a
+region to be "out of"; without an explicit `base`+`size` it falls back to
+"modeled" mode (watch `alloc`-model allocations), of which `oob_r` has none. Even
+declaring `buf` as a buffer didn't help, because modeled mode confines its anchor
+to `[base,end)` and so only catches *straddling* reads, not a far `buf[0x2c00]`.
+Nothing told the agent any of this — the worst kind of UX (a silent no-op).
+
+**Action — feature:** a no-`base` `oob_read`/`oob_write` check now auto-anchors to
+a **single declared buffer** (explicit mode, ±window anchor), unless an `alloc`
+model is present (then modeled mode is clearly intended and left alone); ambiguous
+(multiple buffers) is left as-is. So the natural setup — declare `buf` as a 16-byte
+buffer, add `oob_read` — now fires (`i=0x1ffff`, reads far past the buffer).
+Updated the `oob_read`/`oob_write` CHECK_KINDS docs to spell out the three ways to
+anchor (explicit base+size / single declared buffer / modeled alloc) and that with
+none it cannot fire. Verified over MCP: all three checks now FOUND via their
+natural paths; full suite 68 passed (explicit + modeled oob tests unchanged).
+
+**Still open (noted):** a check that ends up with no anchor at all still no-ops
+silently — a run-summary "this check had nothing to anchor to" note would close
+the loop. Deferred to a later pass.

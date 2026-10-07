@@ -1,0 +1,263 @@
+{
+  "functions": {
+    "4195589": {
+      "checks": [
+        {
+          "kind": "div_by_zero",
+          "id": "15d8b1",
+          "enabled": true,
+          "func_addr": 4195589
+        }
+      ],
+      "scenarios": [
+        {
+          "name": "Default",
+          "args": [
+            {
+              "name": "a",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": true
+            },
+            {
+              "name": "b",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": true
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        },
+        {
+          "name": "div_by_zero-nat",
+          "args": [
+            {
+              "name": "a",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": true
+            },
+            {
+              "name": "b",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": true
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        }
+      ],
+      "active": 1
+    },
+    "4195608": {
+      "checks": [
+        {
+          "kind": "null_deref",
+          "id": "5cc2e0",
+          "enabled": true,
+          "func_addr": 4195608
+        }
+      ],
+      "scenarios": [
+        {
+          "name": "Default",
+          "args": [
+            {
+              "name": "p",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        },
+        {
+          "name": "null_deref-nat",
+          "args": [
+            {
+              "name": "p",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        }
+      ],
+      "active": 1
+    },
+    "4195627": {
+      "checks": [
+        {
+          "kind": "oob_read",
+          "id": "7a38a7",
+          "enabled": true,
+          "func_addr": 4195627
+        }
+      ],
+      "scenarios": [
+        {
+          "name": "Default",
+          "args": [
+            {
+              "name": "buf",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "i",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": false
+            }
+          ],
+          "buffers": [
+            {
+              "arg": "buf",
+              "size": 16
+            }
+          ],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        },
+        {
+          "name": "proper",
+          "args": [
+            {
+              "name": "buf",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "i",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": false
+            }
+          ],
+          "buffers": [],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        },
+        {
+          "name": "natural",
+          "args": [
+            {
+              "name": "buf",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "i",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": false
+            }
+          ],
+          "buffers": [
+            {
+              "arg": "buf",
+              "size": 16
+            }
+          ],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        },
+        {
+          "name": "natural2",
+          "args": [
+            {
+              "name": "buf",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "i",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": false
+            }
+          ],
+          "buffers": [
+            {
+              "arg": "buf",
+              "size": 16
+            }
+          ],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        },
+        {
+          "name": "oob_read-nat",
+          "args": [
+            {
+              "name": "buf",
+              "mode": "symbolic",
+              "size": 8,
+              "signed": false
+            },
+            {
+              "name": "i",
+              "mode": "symbolic",
+              "size": 4,
+              "signed": false
+            }
+          ],
+          "buffers": [
+            {
+              "arg": "buf",
+              "size": 16
+            }
+          ],
+          "assumptions": [],
+          "stdin": null,
+          "files": [],
+          "limits": {},
+          "models": []
+        }
+      ],
+      "active": 4
+    }
+  },
+  "meta": {},
+  "function_models": {
+    "by_name": {},
+    "by_site": {}
+  }
+}

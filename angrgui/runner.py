@@ -565,6 +565,26 @@ class Run:
         return out
 
     # ------------------------------------------------------------------ checks
+    def _anchor_oob_to_buffer(self, cspec: dict) -> dict:
+        """An oob_read/oob_write check with no explicit `base` falls back to its
+        "modeled" mode (watch hooked allocations). If the scenario instead declares
+        a buffer on a pointer arg — and nothing is allocating via an `alloc` model —
+        anchor the check to that buffer automatically, so the natural setup
+        (declare a sized buffer, add an oob check) fires without the user having to
+        repeat base+size on the check. Ambiguous (multiple buffers) is left alone."""
+        if cspec.get("kind") not in ("oob_read", "oob_write") or cspec.get("base"):
+            return cspec
+        if any(m.get("kind") == "alloc" for m in (self.spec.get("models") or [])):
+            return cspec                       # modeled mode is intended; don't override
+        bufs = [b for b in (self.spec.get("buffers") or []) if b.get("arg") and b.get("size")]
+        if len(bufs) != 1:                     # none, or ambiguous -> leave as modeled
+            return cspec
+        b = bufs[0]
+        c = dict(cspec)
+        c["base"] = b["arg"]
+        c["size"] = int(b["size"])
+        return c
+
     def _make_context(self):
         lo = self.func_addr
         hi = self.func_addr + self.func_size
@@ -755,6 +775,7 @@ class Run:
             for cspec in self.spec.get("checks", []):
                 if not cspec.get("enabled", True):
                     continue
+                cspec = self._anchor_oob_to_buffer(cspec)
                 chk = build_check(cspec, ctx)
                 chk.install(state)
                 self.checks.append(chk)
