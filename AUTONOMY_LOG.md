@@ -505,3 +505,19 @@ the non-alloc kinds. Clean setup: in `vuln.main`, `reach` the `alloc_msg` branch
 
 The call-model feature works across all kinds (alloc validated earlier in Exp 10).
 A confidence experiment — no fix needed.
+
+## Experiment 19 — pointer-arg hint (explored, NOT shipped — unvalidatable here)
+
+**Idea:** the biggest recurring setup friction is knowing which args are pointers
+(they need a buffer for reads/writes and oob checks). I prototyped surfacing the C
+`type` and a `pointer:true` hint in `get_function`'s args, plus rendering a pointer
+type as `"<pointed> *"` instead of `"?"`.
+
+**Why it's not shipped:** I couldn't validate the hint actually fires on any bundled
+sample — their DWARF carries almost no pointer-type info (`buf`/`p`/`hdr` resolve to
+`"?"` or no type at all; the zig and local builds don't present params as cle
+`PointerType`). Shipping a feature I can't demonstrate working would violate this
+session's verify-first rule, so I reverted it. Logged as a follow-up to revisit on a
+binary with rich DWARF or IDA-provided types (where the `"*"` → pointer hint would
+fire): a validated version would meaningfully cut setup friction for memory-safety
+hunts.
