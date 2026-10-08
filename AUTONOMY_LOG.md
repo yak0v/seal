@@ -430,6 +430,10 @@ on branch `autonomy-2026-10-08` (pushed to `seal`).
 | 15 | `float_anomaly` | validated (was untested) + new `float_sample` + 3 tests |
 | 16 | `oob_write` | regression coverage: `oob_w` in checks_sample + test |
 | 17 | oob bulk writes | catch copy-loop / concrete-offset writes past a declared buffer (anchor concrete addresses tightly) |
+| 18 | call models | validated concrete/symbolic/return_arg (confidence; no bug) |
+| 19 | pointer-arg hint | explored, NOT shipped — unvalidatable on the bundled samples |
+| 20 | CoreGraphics CVE | regression check — flagship recovery still works on the branch |
+| 21 | `narrowing_cast` | headline shows source line too (consistency with int_overflow) |
 
 Cross-cutting theme: the worst failure mode is the **silent no-op** — a run or a
 check that quietly does nothing. The biggest wins (5, 6, 12, 8, 14) all convert a
