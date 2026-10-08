@@ -521,3 +521,14 @@ session's verify-first rule, so I reverted it. Logged as a follow-up to revisit 
 binary with rich DWARF or IDA-provided types (where the `"*"` → pointer hint would
 fire): a validated version would meaningfully cut setup friction for memory-safety
 hunts.
+
+## Experiment 20 — regression check: the CoreGraphics CVE still recovers
+
+**Why:** 17 changes touched the check engine (checks.py anchors, runner entry-block
+observation, trace), so I re-ran the flagship on this branch to make sure nothing
+regressed.
+
+**Result:** restarted the CoreGraphics server scoped to `_aa_lineto` with the branch
+code and ran the snapshot-free recovery (symbolic args + a0 buffer + skip_calls +
+narrowing_cast). The CVE-2026-86950 `xtn` truncation at `0x186a24fd0` is still found,
+**0 unconstrained** paths. The usability work is safe for the crown-jewel capability.
