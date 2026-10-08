@@ -617,10 +617,17 @@ class NarrowingCastCheck(BaseCheck):
             mn, text = insn.mnemonic, f"{insn.mnemonic} {insn.op_str}".strip()
         except Exception:
             pass
-        msg = f"narrowing {big}->{small} bits may lose data at {text or hex(ins_addr)}"
+        loc = self.ctx.line_for(ins_addr)
+        if isinstance(loc, dict) and loc.get("line"):
+            where = f" [{loc.get('file')}:{loc['line']}]"
+        elif isinstance(loc, (tuple, list)) and len(loc) == 2:
+            where = f" [{loc[0]}:{loc[1]}]"
+        else:
+            where = ""
+        msg = f"narrowing {big}->{small} bits may lose data at {text or hex(ins_addr)}{where}"
         self._record(state, ins_addr, msg, witness,
                      extra={"from_bits": big, "to_bits": small, "mnemonic": mn,
-                            "src_line": self.ctx.line_for(ins_addr), "path": self.ctx.path_of(state)},
+                            "src_line": loc, "path": self.ctx.path_of(state)},
                      dedup_key=(ins_addr, big, small))
 
 

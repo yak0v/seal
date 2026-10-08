@@ -532,3 +532,11 @@ regressed.
 code and ran the snapshot-free recovery (symbolic args + a0 buffer + skip_calls +
 narrowing_cast). The CVE-2026-86950 `xtn` truncation at `0x186a24fd0` is still found,
 **0 unconstrained** paths. The usability work is safe for the crown-jewel capability.
+
+## Experiment 21 — consistency: narrowing_cast message carries the source line too
+
+Small consistency follow-up to Exp 4: the `narrowing_cast` finding (the CVE's own
+check) recorded `src_line` in `extra` but didn't show it in the headline, unlike
+`int_overflow`. Now it appends `[file:line]` when source is available. Verified the
+CoreGraphics `xtn` message is UNCHANGED (no DWARF → no suffix), so the recovery
+guides stay exact; a source-having binary gets the location inline. 72 passed.
