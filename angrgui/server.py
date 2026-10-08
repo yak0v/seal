@@ -845,9 +845,19 @@ def _mcp_run(addr):
 def _mcp_script(addr):
     """The standalone angr script equivalent to this function's active scenario —
     a runnable .py an agent can hand to the user to reproduce the run outside SEAL."""
+    from .codegen import CODEGEN_SUPPORTED_CHECKS
     b = _need_binary()
     a = _addr(addr)
-    return {"addr": hex(a), "code": generate_script(b, _scenario_spec(a))}
+    spec = _scenario_spec(a)
+    unsupported = sorted({c["kind"] for c in spec.get("checks", [])
+                          if c.get("kind") not in CODEGEN_SUPPORTED_CHECKS})
+    out = {"addr": hex(a), "code": generate_script(b, spec)}
+    if unsupported:
+        # be honest: the script can't reproduce these check kinds yet
+        out["unsupported_checks"] = unsupported
+        out["note"] = ("the generated script does not reproduce these check kinds "
+                       f"({', '.join(unsupported)}); use the GUI/MCP run for those.")
+    return out
 
 
 def _mcp_get_run(run_id):
@@ -1478,8 +1488,10 @@ TOOL_DEFS = [
      "findings + paths — the same data the GUI's Export produces.",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
     {"name": "generate_script", "description": "The standalone, runnable angr Python script equivalent to this function's active "
-     "scenario (same initial state, assumptions, checks, limits). Hand it to the user to reproduce the run outside SEAL; "
-     "it reports the same findings.",
+     "scenario (same initial state, assumptions, limits). Hand it to the user to reproduce the run outside SEAL. It emits the "
+     "int_overflow/assert/reach/avoid/custom checks; the breakpoint-driven bug-class checks (oob_read/oob_write/div_by_zero/"
+     "null_deref/narrowing_cast/float_anomaly) are NOT reproduced yet — when any are present the result includes "
+     "`unsupported_checks` and the script warns, so run those via the GUI/MCP.",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
     {"name": "ida_connect", "description": "Connect to an IDA MCP server for real names + Hex-Rays decompilation. "
      "url defaults to the configured one; host_header is auto-set to loopback for forwarded servers.",

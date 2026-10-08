@@ -614,3 +614,24 @@ showed.
 `frame_size` → `[vuln.c:35]`. CoreGraphics (no source) is unchanged — `nearest_line`
 returns None, so the recovery guides stay exact. This also improves the GUI's
 finding→source-line highlighting (more findings now map to a line). 72 passed.
+
+## Experiment 27 — codegen silently omits 6 of 11 check kinds (honesty fix)
+
+**Investigation:** `generate_script` for an `oob_write` scenario produced a script
+that ran clean but reported **0 findings** — while SEAL finds the bug. Cause: codegen
+only emits `int_overflow / assert / reach / avoid / custom`; the breakpoint-driven
+bug-class checks (`oob_read/oob_write`, `div_by_zero`, `null_deref`, `narrowing_cast`,
+`float_anomaly`) are **silently skipped** (a buried `# unknown check kind, skipped`
+comment), yet the docstring still claimed "reports the same findings as the GUI." A
+user exporting such a script would be misled.
+
+**Action — make it honest** (implementing all 6 correctly as standalone angr code is a
+large, high-risk task — out of scope for one pass): defined `CODEGEN_SUPPORTED_CHECKS`;
+when a scenario has unsupported checks, the script's docstring carries a prominent NOTE,
+it prints a runtime WARNING naming them, and the `generate_script` MCP result includes
+`unsupported_checks` + a note. The tool description now lists exactly what it can
+reproduce. Verified: oob/div scenarios flagged (script WARNING + MCP `unsupported_checks`),
+an int_overflow-only scenario has no false warning, codegen tests 28/ mcp tests green.
+
+**Follow-up (significant):** implement the 6 breakpoint-driven checks in codegen so the
+"equivalent script" is truly equivalent. Logged for a dedicated effort.
