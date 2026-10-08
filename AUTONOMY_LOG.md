@@ -437,6 +437,8 @@ on branch `autonomy-2026-10-08` (pushed to `seal`).
 | 22 | assumptions | confidence: assumptions constrain the witness (count<0x100 honored) |
 | 23 | GUI decomp tab | without IDA, default to Disassembly (has source) + helpful message/link |
 | 24 | diagnostics | errored-paths note names the actual error (e.g. the missing arm64 IR op) |
+| 25 | diagnostics | arch-neutral error advice (x87 dirty helpers too); LIVE-validated on machine/sub_400e40 |
+| 26 | source lines | findings use nearest_line → carry [file:line] on continuation instructions (int_overflow→[vuln.c:21]) |
 
 Cross-cutting theme: the worst failure mode is the **silent no-op** — a run or a
 check that quietly does nothing. The biggest wins (5, 6, 12, 8, 14) all convert a
