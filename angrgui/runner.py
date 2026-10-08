@@ -1091,8 +1091,23 @@ class Run:
                          f"became symbolic — usually an unresolved/indirect call). Turn on skip_calls "
                          f"or add call models so exploration stays in the function.")
         if errored:
-            notes.append(f"{errored} path(s) errored out during execution (an unsupported op or a "
-                         f"bad memory access); they couldn't be explored further.")
+            # surface the ACTUAL errors, deduplicated — on arm64 an
+            # UnsupportedIROpError/decode error names the exact op to add to
+            # angr_arm_patch.py, which is far more useful than a bare count.
+            counts: dict[str, int] = {}
+            for rec in getattr(simgr, "errored", []):
+                try:
+                    e = rec.error
+                    msg = f"{type(e).__name__}: {e}"
+                except Exception:
+                    msg = "unknown error"
+                counts[msg] = counts.get(msg, 0) + 1
+            top = "; ".join(m[:140] + (f" (x{c})" if c > 1 else "")
+                            for m, c in sorted(counts.items(), key=lambda kv: -kv[1])[:3])
+            notes.append(f"{errored} path(s) errored out: {top or 'unknown error'}. "
+                         f"An UnsupportedIROpError or decode error means angr lacks that op "
+                         f"(on arm64, implement it in angr_arm_patch.py); a memory error may need a "
+                         f"buffer/model, and skip_calls avoids stepping into unsupported library code.")
         if len(self.hits) == 0 and enabled_checks and not self._setup_notes:
             # a setup note already names a concrete cause; only guess further when there isn't one.
             sym_args = any(a.get("mode", "symbolic") == "symbolic" for a in self.spec.get("args", []))

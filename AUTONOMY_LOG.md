@@ -568,3 +568,12 @@ Decompilation pane; (2) the Decompilation tab's no-IDA message now points to the
 Disassembly tab (with a working link) and notes the setup/run panel works either way.
 Verified in-browser: selecting `alloc_msg` (no IDA) lands on Disassembly with source;
 the Decompilation message + link render; no console errors.
+
+## Experiment 24 — diagnostics name the actual error (serves the arm64 mission)
+
+Enhanced the run diagnostics (Exp 5): an errored-paths note used to be a bare count.
+It now surfaces the **actual, deduplicated errors** — e.g. "3 path(s) errored out:
+UnsupportedIROpError: Iop_QandQRSarNnarrow16Uto8Uxn (x2); …" — and points to the fix
+(on arm64, implement that op in angr_arm_patch.py; a memory error wants a buffer/model;
+skip_calls avoids unsupported library code). This directly supports SEAL's core arm64
+workflow: the note tells you exactly which op to add. Validated the aggregation; suite green.
