@@ -251,7 +251,10 @@ async function selectFunction(f) {
   }
   renderCode();
   renderRight();
-  selectTab("decomp");   // decompilation is always the default view
+  // Decompilation is the default when IDA is connected; otherwise land on
+  // Disassembly, which has real content (incl. source lines for a -g binary)
+  // instead of an empty "connect IDA" pane.
+  selectTab(A.ida && A.ida.connected ? "decomp" : "code");
   renderDock();                                               // graph + paths, always visible
 }
 
@@ -2521,9 +2524,15 @@ async function renderDecomp(force) {
   const sameFn = pane._fnAddr === A.fn.addr;
   const keepScroll = sameFn ? (($(".ccode", pane) || {}).scrollTop || 0) : 0;
   if (!A.ida || !A.ida.connected) {
+    const hasSrc = A.fn.has_source;
     pane.replaceChildren(el("div", { class: "empty" },
       "Not connected to IDA. ", el("button", { class: "tiny", onclick: openIdaModal }, "Connect to IDA"),
-      el("div", { style: "margin-top:8px" }, "Then IDA's decompilation of the selected function shows here.")));
+      el("div", { style: "margin-top:8px" }, "Then IDA's Hex-Rays decompilation shows here."),
+      el("div", { style: "margin-top:10px" },
+        "Meanwhile, the ",
+        el("a", { href: "#", onclick: (e) => { e.preventDefault(); selectTab("code"); } }, "Disassembly"),
+        hasSrc ? " tab shows this function with its source lines — set up and run checks from the right panel either way."
+               : " tab shows this function — set up and run checks from the right panel either way.")));
     return;
   }
   let d = A.decompCache[A.fn.addr];

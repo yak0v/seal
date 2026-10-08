@@ -552,3 +552,19 @@ Verified end-to-end (Exp 8 covered only syntax validation): `alloc_msg` int_over
 with `count < 0x100` and `size < 0x80000000` → both show in
 `summary.assumptions_applied`, and the witness honors them (`count=0xd1`,
 `size=0x58000001`) while still being a real 32-bit overflow. Assumptions work.
+
+## Experiment 23 — GUI usability: the empty Decompilation tab without IDA
+
+**Use case (human, GUI):** a full hunt in the browser on `samples/vuln`.
+
+**Friction found:** the default view is the **Decompilation** tab, which without IDA
+shows only "Not connected to IDA" — even though the binary has DWARF **source** (the
+Disassembly tab shows it annotated with `vuln.c` lines). A new user with a `-g`
+binary and no IDA lands on what looks like a dead end.
+
+**Action — GUI fix:** (1) when IDA isn't connected, selecting a function now defaults
+to the **Disassembly** tab (real content, incl. source lines) instead of the empty
+Decompilation pane; (2) the Decompilation tab's no-IDA message now points to the
+Disassembly tab (with a working link) and notes the setup/run panel works either way.
+Verified in-browser: selecting `alloc_msg` (no IDA) lands on Disassembly with source;
+the Decompilation message + link render; no console errors.
