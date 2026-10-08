@@ -595,3 +595,20 @@ a real case.)
 angr_arm_patch.py"); made it architecture-neutral — a NEON/arm64e op can be patched,
 but an x86 x87/SIMD **dirty helper** (loadF80le, long double) is an angr limitation
 with no easy fix (avoid that path / pick another function). Verified live; tests green.
+
+## Experiment 26 — findings now carry a source line far more often (line_for → nearest_line)
+
+**Investigation:** validating the Exp 21 enrichment, `narrowing_cast` and
+`int_overflow` on `vuln` showed NO `[file:line]` — even though vuln has DWARF lines.
+Cause: the DWARF line table marks where each *statement starts* (e.g. `imul` at
+`0x400636` continues the line whose entry is at `0x400633`), and the checks used the
+**exact** `line_for`, which only hits statement-start addresses. The overflow/narrowing
+instruction itself usually has no entry → `src_line` was null and the enrichment never
+showed.
+
+**Action — fix:** the checks' `line_for` now uses the existing **`nearest_line`**
+(nearest preceding entry, guarded to the same function). Verified: `int_overflow` on
+`alloc_msg` → `[vuln.c:21]` (the `total = count*size` line), `narrowing_cast` on
+`frame_size` → `[vuln.c:35]`. CoreGraphics (no source) is unchanged — `nearest_line`
+returns None, so the recovery guides stay exact. This also improves the GUI's
+finding→source-line highlighting (more findings now map to a line). 72 passed.

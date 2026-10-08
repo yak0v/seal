@@ -604,7 +604,11 @@ class Run:
         rets = self.binary.return_block_heads(self.func_addr)
 
         def line_for(addr):
-            e = self.binary.line_for(addr)
+            # nearest_line (not the exact line_for): the DWARF line table only marks
+            # where each statement starts, so the instruction that actually overflows/
+            # narrows often continues a line and has no entry of its own. Map it to the
+            # nearest preceding entry in the same function so findings carry a source line.
+            e = self.binary.nearest_line(addr)
             return {"file": e[0].split("/")[-1], "line": e[1]} if e else None
 
         def path_of(state):
