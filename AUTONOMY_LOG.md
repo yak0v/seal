@@ -434,6 +434,7 @@ on branch `autonomy-2026-10-08` (pushed to `seal`).
 | 19 | pointer-arg hint | explored, NOT shipped — unvalidatable on the bundled samples |
 | 20 | CoreGraphics CVE | regression check — flagship recovery still works on the branch |
 | 21 | `narrowing_cast` | headline shows source line too (consistency with int_overflow) |
+| 22 | assumptions | confidence: assumptions constrain the witness (count<0x100 honored) |
 
 Cross-cutting theme: the worst failure mode is the **silent no-op** — a run or a
 check that quietly does nothing. The biggest wins (5, 6, 12, 8, 14) all convert a
@@ -544,3 +545,10 @@ check) recorded `src_line` in `extra` but didn't show it in the headline, unlike
 `int_overflow`. Now it appends `[file:line]` when source is available. Verified the
 CoreGraphics `xtn` message is UNCHANGED (no DWARF → no suffix), so the recovery
 guides stay exact; a source-having binary gets the location inline. 72 passed.
+
+## Experiment 22 — confidence: assumptions constrain the solver
+
+Verified end-to-end (Exp 8 covered only syntax validation): `alloc_msg` int_overflow
+with `count < 0x100` and `size < 0x80000000` → both show in
+`summary.assumptions_applied`, and the witness honors them (`count=0xd1`,
+`size=0x58000001`) while still being a real 32-bit overflow. Assumptions work.
