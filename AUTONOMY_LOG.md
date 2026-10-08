@@ -579,3 +579,19 @@ UnsupportedIROpError: Iop_QandQRSarNnarrow16Uto8Uxn (x2); …" — and points to
 (on arm64, implement that op in angr_arm_patch.py; a memory error wants a buffer/model;
 skip_calls avoids unsupported library code). This directly supports SEAL's core arm64
 workflow: the note tells you exactly which op to add. Validated the aggregation; suite green.
+
+## Experiment 25 — large/complex function: path explosion + LIVE diagnostic validation
+
+**Use case:** explore the biggest `machine` function (`sub_400e40`, 321 blocks) — a
+scale/path-explosion stress case on a stripped binary.
+
+**Result + live validation of Exp 24:** all 17 paths errored, and the new diagnostic
+named the exact cause **live**: `UnsupportedDirtyError: amd64g_dirtyhelper_loadF80le`
+— an x87 80-bit long-double load angr can't model. The note told me precisely why
+the function is unanalyzable, instantly. (So the Exp 24 diagnostic earns its keep on
+a real case.)
+
+**Action — refine:** the note had over-indexed on arm64 ("implement it in
+angr_arm_patch.py"); made it architecture-neutral — a NEON/arm64e op can be patched,
+but an x86 x87/SIMD **dirty helper** (loadF80le, long double) is an angr limitation
+with no easy fix (avoid that path / pick another function). Verified live; tests green.

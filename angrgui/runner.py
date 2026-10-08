@@ -1105,9 +1105,11 @@ class Run:
             top = "; ".join(m[:140] + (f" (x{c})" if c > 1 else "")
                             for m, c in sorted(counts.items(), key=lambda kv: -kv[1])[:3])
             notes.append(f"{errored} path(s) errored out: {top or 'unknown error'}. "
-                         f"An UnsupportedIROpError or decode error means angr lacks that op "
-                         f"(on arm64, implement it in angr_arm_patch.py); a memory error may need a "
-                         f"buffer/model, and skip_calls avoids stepping into unsupported library code.")
+                         f"UnsupportedIROpError / UnsupportedDirtyError / decode error = angr can't model "
+                         f"that op or helper: a NEON op or arm64e instruction can be added in "
+                         f"angr_arm_patch.py; an x86 x87/SIMD dirty helper (e.g. loadF80le, long double) "
+                         f"is an angr limitation with no easy fix — avoid that path or pick another function. "
+                         f"A memory error may need a buffer/model; skip_calls avoids stepping into library code.")
         if len(self.hits) == 0 and enabled_checks and not self._setup_notes:
             # a setup note already names a concrete cause; only guess further when there isn't one.
             sym_args = any(a.get("mode", "symbolic") == "symbolic" for a in self.spec.get("args", []))
