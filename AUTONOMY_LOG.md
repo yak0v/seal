@@ -435,6 +435,8 @@ on branch `autonomy-2026-10-08` (pushed to `seal`).
 | 20 | CoreGraphics CVE | regression check — flagship recovery still works on the branch |
 | 21 | `narrowing_cast` | headline shows source line too (consistency with int_overflow) |
 | 22 | assumptions | confidence: assumptions constrain the witness (count<0x100 honored) |
+| 23 | GUI decomp tab | without IDA, default to Disassembly (has source) + helpful message/link |
+| 24 | diagnostics | errored-paths note names the actual error (e.g. the missing arm64 IR op) |
 
 Cross-cutting theme: the worst failure mode is the **silent no-op** — a run or a
 check that quietly does nothing. The biggest wins (5, 6, 12, 8, 14) all convert a
