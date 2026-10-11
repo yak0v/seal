@@ -182,6 +182,26 @@ class Run:
             return claripy.BVV(val & ((1 << bits) - 1), bits), False
         return claripy.BVS(name, bits), True
 
+    def _restore_flags(self, state, val: int) -> None:
+        """Set the condition flags from a captured flags register (CPSR/NZCV/eflags).
+
+        angr has no plain ``cpsr``/``eflags`` register — it computes flags lazily from a
+        VEX thunk. For ARM/AArch64 the COPY op (op==0) makes the flags read straight out
+        of cc_dep1, where NZCV sit in bits 31:28 — exactly the CPSR/NZCV layout — so we
+        copy the top nibble across. For x86 angr exposes an ``eflags`` setter that drives
+        the thunk for us."""
+        an = (getattr(self.arch, "name", "") or "").upper()
+        if an.startswith("ARM") or an in ("AARCH64",):
+            bits = self.arch.bits
+            state.regs.cc_op   = claripy.BVV(0, bits)                 # {ARM64G,ARMG}_CC_OP_COPY
+            state.regs.cc_dep1 = claripy.BVV(val & 0xF0000000, bits)  # NZCV in bits 31:28
+            state.regs.cc_dep2 = claripy.BVV(0, bits)
+            state.regs.cc_ndep = claripy.BVV(0, bits)
+        elif an in ("X86", "AMD64"):
+            state.regs.eflags = claripy.BVV(val, self.arch.bits)
+        else:
+            setattr(state.regs, "flags", claripy.BVV(val, self.arch.bits))
+
     def _build_state_from_snapshot(self, snap: dict, opts: set):
         """Concolic seed: start from a REAL execution state (registers + memory captured
         from a live run) and overlay fresh symbolic values only on the fields the caller
@@ -216,10 +236,21 @@ class Run:
         # x29/x30 fp/lr), and size each value by the register's REAL width so a 128-bit
         # NEON reg (v0..v31) isn't truncated to 64 bits.
         _ALIAS = {"fp": "x29", "lr": "x30", "w0": None}   # (sub-regs handled below)
+        # Condition flags aren't a plain register in angr: AArch64/ARM model NZCV through
+        # the VEX flag thunk (cc_op/cc_dep1/...) and x86 through eflags. A plain
+        # setattr(state.regs, "cpsr", ...) therefore throws and silently drops the flags,
+        # which diverges any snapshot seeded right before a flag-dependent branch.
+        _FLAG_REGS = ("cpsr", "nzcv", "pstate", "spsr", "eflags", "rflags", "flags")
         regmap = getattr(self.arch, "registers", {}) or {}
         for r, v in _regs.items():
             rl = r.lower()
             if rl in _IP:
+                continue
+            if rl in _FLAG_REGS:
+                try:
+                    self._restore_flags(state, int(v))
+                except Exception as e:
+                    log.warning("snapshot flags %s: %s", r, e)
                 continue
             name = _ALIAS.get(rl, rl) or rl
             try:
