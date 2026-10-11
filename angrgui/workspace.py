@@ -74,7 +74,9 @@ class Workspace:
     def __init__(self, binary_path: str):
         self.binary_path = os.path.abspath(binary_path)
         self.store_path = self.binary_path + SUFFIX
-        self._lock = threading.Lock()
+        # RLock (re-entrant): atomic read-modify-write helpers take the lock and call
+        # _save_locked, so concurrent agents/users editing the project can't corrupt it.
+        self._lock = threading.RLock()
         self.data = {"functions": {}, "meta": {}}
         self.load()
 
@@ -105,19 +107,67 @@ class Workspace:
 
     def save(self):
         with self._lock:
-            tmp = self.store_path + ".tmp"
-            with open(tmp, "w") as fh:
-                json.dump(self.data, fh, indent=2)
-            os.replace(tmp, self.store_path)
+            self._save_locked()
+
+    def _save_locked(self):
+        tmp = self.store_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(self.data, fh, indent=2)
+        os.replace(tmp, self.store_path)
 
     # ------------------------------------------------------------- per function
     def get_function(self, addr: int) -> dict:
         """The function's setup in the structured (scenarios) shape."""
-        return self._migrate(self.data["functions"].get(str(addr)))
+        with self._lock:
+            return self._migrate(self.data["functions"].get(str(addr)))
 
     def set_function(self, addr: int, cfg: dict):
-        self.data["functions"][str(addr)] = self._migrate(cfg)
-        self.save()
+        with self._lock:
+            self.data["functions"][str(addr)] = self._migrate(cfg)
+            self._save_locked()
+
+    def update_function(self, addr: int, mutate):
+        """Atomic read-modify-write of one function's setup (concurrency-safe): reads the
+        migrated config, hands it to `mutate(cfg)`, stores + saves — all under the lock, so
+        two agents editing the SAME function can't lose each other's change."""
+        with self._lock:
+            cfg = self._migrate(self.data["functions"].get(str(addr)))
+            mutate(cfg)
+            self.data["functions"][str(addr)] = self._migrate(cfg)
+            self._save_locked()
+            return cfg
+
+    # ------------------------------------------------------------- run records (#8/#9)
+    # Durable run results — findings + metadata (NOT the huge path tree) — so a project's
+    # findings survive restart and feed the review/documentation layer. Keyed nowhere
+    # special: a flat list, newest last, capped to avoid unbounded growth.
+    def add_run(self, record: dict):
+        with self._lock:
+            runs = self.data.setdefault("runs", [])
+            runs.append(record)
+            if len(runs) > 1000:
+                del runs[:len(runs) - 1000]
+            self._save_locked()
+
+    def runs(self, func_addr: int | None = None) -> list:
+        with self._lock:
+            runs = list(self.data.get("runs", []))
+        if func_addr is not None:
+            return [r for r in runs if r.get("func") == int(func_addr)]
+        return runs
+
+    def get_run_record(self, run_id: str) -> dict | None:
+        with self._lock:
+            return next((dict(r) for r in self.data.get("runs", []) if r.get("id") == run_id), None)
+
+    def update_run(self, run_id: str, **fields) -> dict | None:
+        with self._lock:
+            for r in self.data.get("runs", []):
+                if r.get("id") == run_id:
+                    r.update(fields)
+                    self._save_locked()
+                    return dict(r)
+        return None
 
     # ------------------------------------------------------------- shape helpers
     @staticmethod

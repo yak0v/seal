@@ -337,6 +337,20 @@ def save_config(addr: int, req: ConfigReq):
     return {"ok": True}
 
 
+def _mutate_config(addr: int, mutate, source: str = "agent") -> dict:
+    """Atomic read-modify-write of a function's setup (concurrency-safe): `mutate(cfg)`
+    runs under the workspace lock, so two agents editing the SAME function can't clobber
+    each other. Publishes a config activity line afterwards."""
+    cfg = S.workspace.update_function(addr, mutate)
+    sc = cfg["scenarios"][cfg["active"]]
+    na, nc = len(sc.get("assumptions", [])), len(cfg.get("checks", []))
+    if source != "gui":
+        BUS.publish("config", f"{source} configured {_fname(addr)}: {na} assumption(s), {nc} check(s)",
+                    func=addr, assumptions=sc.get("assumptions", []),
+                    checks=[c.get("name") or c.get("kind") for c in cfg.get("checks", [])])
+    return cfg
+
+
 def _store_config(addr: int, cfg: dict, source: str = "gui"):
     cfg = Workspace._migrate(cfg)
     prev = S.workspace.get_function(addr)
@@ -435,6 +449,42 @@ def _enrich_buffer_members(spec: dict) -> dict:
     return spec
 
 
+def _persist_run_record(run_id: str, spec: dict, source: str):
+    """Save a finished run's findings + metadata to the workspace (durable, concurrency-
+    safe). The huge path tree is NOT stored — just the summary and the findings (with
+    their concrete witnesses), which are the lasting artifact."""
+    if S.workspace is None:
+        return
+    try:
+        snap = S.runs[run_id].snapshot() if run_id in S.runs else None
+    except Exception:
+        snap = None
+    summary = (snap or {}).get("summary", {}) or {}
+    findings = list((snap or {}).get("hits", []) or [])
+    scen_names = spec.get("scenarios") or []
+    scen = scen_names[spec["active"]] if (0 <= spec.get("active", 0) < len(scen_names)) else None
+    rec = {
+        "id": run_id,
+        "func": spec["func_addr"],
+        "func_name": _fname(spec["func_addr"]),
+        "when": time.time(),
+        "by": source,                       # "gui" (user) or "agent"
+        "scenario": scen,
+        "status": summary.get("status") or (snap or {}).get("status"),
+        "summary": {k: summary.get(k) for k in
+                    ("hits", "steps", "active", "deadended", "unconstrained", "errored",
+                     "nodes", "elapsed", "found", "notes") if k in summary},
+        "findings": findings,
+        "checks": [c.get("name") or c.get("kind") for c in spec.get("checks", []) if c.get("enabled", True)],
+        "review": None,                     # user verdict: good | bad | refine (#9)
+        "note": None,                       # free-text comment (#9)
+    }
+    try:
+        S.workspace.add_run(rec)
+    except Exception as e:
+        log.warning("could not persist run record %s: %s", run_id, e)
+
+
 def _start_run(spec: dict, source: str = "gui") -> str:
     if S.backend is None:
         raise HTTPException(400, "no binary loaded")
@@ -451,6 +501,10 @@ def _start_run(spec: dict, source: str = "gui") -> str:
                "run_status": lambda: f"run of {_fname(spec['func_addr'])} {data.get('status')} "
                                      f"({data.get('hits', 0)} finding(s))"}.get(kind, lambda: kind)()
         BUS.publish(kind, msg, run_id=run_id, **data)
+        # persist the finished run (findings + metadata) durably so it survives restart
+        # and feeds the review/documentation layer (#8/#9)
+        if kind == "run_status" and data.get("status") in ("done", "cancelled", "error"):
+            _persist_run_record(run_id, spec, source)
 
     S.backend.start_run(run_id, spec, on_event=on_event)   # backend owns the run object
     S.last_run[spec["func_addr"]] = run_id
@@ -789,14 +843,14 @@ def _mcp_configure(addr, patch: dict):
     _need_binary()
     a = _addr(addr)
     _validate_specs(patch.get("assumptions"), patch.get("checks"))
-    cfg = S.workspace.get_function(a)                   # structured
-    sc = cfg["scenarios"][cfg["active"]]
-    for k in ("args", "buffers", "assumptions", "stdin", "files", "limits", "models", "initial_state"):
-        if k in patch and patch[k] is not None:
-            sc[k] = {**sc.get("limits", {}), **patch[k]} if k == "limits" else patch[k]
-    if patch.get("checks") is not None:
-        cfg["checks"] = [_coerce_check(c, a) for c in patch["checks"]]
-    _store_config(a, cfg, source="agent")
+    def mutate(cfg):
+        sc = cfg["scenarios"][cfg["active"]]
+        for k in ("args", "buffers", "assumptions", "stdin", "files", "limits", "models", "initial_state"):
+            if k in patch and patch[k] is not None:
+                sc[k] = {**sc.get("limits", {}), **patch[k]} if k == "limits" else patch[k]
+        if patch.get("checks") is not None:
+            cfg["checks"] = [_coerce_check(c, a) for c in patch["checks"]]
+    _mutate_config(a, mutate)
     return _mcp_get_function(a)["config"]
 
 
@@ -805,13 +859,13 @@ def _mcp_add(addr, *, assumption=None, check=None):
     a = _addr(addr)
     _validate_specs([assumption] if assumption is not None else None,
                     [check] if check is not None else None)
-    cfg = S.workspace.get_function(a)
-    sc = cfg["scenarios"][cfg["active"]]
-    if assumption is not None:
-        sc["assumptions"] = list(sc.get("assumptions", [])) + [assumption]
-    if check is not None:
-        cfg["checks"] = list(cfg.get("checks", [])) + [_coerce_check(check, a)]
-    _store_config(a, cfg, source="agent")
+    def mutate(cfg):
+        sc = cfg["scenarios"][cfg["active"]]
+        if assumption is not None:
+            sc["assumptions"] = list(sc.get("assumptions", [])) + [assumption]
+        if check is not None:
+            cfg["checks"] = list(cfg.get("checks", [])) + [_coerce_check(check, a)]
+    _mutate_config(a, mutate)
     return _mcp_get_function(a)["config"]
 
 
@@ -819,10 +873,10 @@ def _mcp_add_model(addr, model):
     """Append a call model (hook) to the active scenario."""
     _need_binary()
     a = _addr(addr)
-    cfg = S.workspace.get_function(a)
-    sc = cfg["scenarios"][cfg["active"]]
-    sc["models"] = list(sc.get("models", [])) + [dict(model)]
-    _store_config(a, cfg, source="agent")
+    def mutate(cfg):
+        sc = cfg["scenarios"][cfg["active"]]
+        sc["models"] = list(sc.get("models", [])) + [dict(model)]
+    _mutate_config(a, mutate)
     return _mcp_get_function(a)["config"]
 
 
@@ -872,9 +926,33 @@ def _mcp_script(addr):
     return out
 
 
+def _mcp_list_runs(func=None, limit=50):
+    """Stored run records (findings + metadata), newest first — durable across restarts
+    and shared, so concurrent agents/the user can see each other's results. `func` limits
+    to one function (addr or name)."""
+    fa = _addr(func) if func is not None else None
+    recs = S.workspace.runs(fa) if S.workspace else []
+    recs = sorted(recs, key=lambda r: r.get("when", 0), reverse=True)[:int(limit)]
+    # a compact view — full findings via get_run(run_id)
+    return [{"id": r.get("id"), "func": hex(r["func"]) if r.get("func") is not None else None,
+             "func_name": r.get("func_name"), "when": r.get("when"), "by": r.get("by"),
+             "scenario": r.get("scenario"), "status": r.get("status"),
+             "findings": (r.get("summary") or {}).get("hits", len(r.get("findings") or [])),
+             "checks": r.get("checks"), "review": r.get("review"), "note": r.get("note")}
+            for r in recs]
+
+
 def _mcp_get_run(run_id):
     r = S.runs.get(run_id)
     if r is None:
+        # fall back to the persisted record (survives restart / another process's run)
+        rec = S.workspace.get_run_record(run_id) if S.workspace else None
+        if rec is not None:
+            return {"status": rec.get("status"), "stored": True, "when": rec.get("when"),
+                    "by": rec.get("by"), "func": hex(rec["func"]) if rec.get("func") is not None else None,
+                    "func_name": rec.get("func_name"), "scenario": rec.get("scenario"),
+                    "summary": rec.get("summary"), "findings": rec.get("findings"),
+                    "review": rec.get("review"), "note": rec.get("note"), "paths": []}
         raise HTTPException(404, "no such run")
     snap = r.snapshot()
     # expose the end REASON plus its human text, so an agent can see WHY a path ended —
@@ -1484,6 +1562,10 @@ TOOL_DEFS = [
      "summary.notes (when present) explains an empty or surprising run — e.g. a check with nothing to anchor to, "
      "no symbolic inputs, or paths that went unconstrained — so a no-finding run tells you why instead of staying silent.",
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
+    {"name": "list_runs", "description": "Stored run records (findings + metadata), newest first — DURABLE across restarts and "
+     "shared, so you can see the user's and other agents' results. `func` (addr/name) limits to one function. Get full "
+     "findings for one via get_run(run_id). Each row has review (good/bad/refine, set by the user) and note.",
+     "inputSchema": {"type": "object", "properties": {"func": {"type": "string"}, "limit": {"type": "integer", "default": 50}}}},
     {"name": "load_binary", "description": "Load an ELF binary by absolute path (replaces the current one). Analyses before returning.",
      "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "add_scenario", "description": "Add a scenario (a separate initial-state setup) to a function and make it active. "
@@ -1599,6 +1681,7 @@ _MCP_TOOLS = {
     "export_scenario": lambda a: _mcp_export_scenario(a["addr"]),
     "generate_script": lambda a: _mcp_script(a["addr"]),
     "show_function": lambda a: _mcp_show_function(a["addr"], a.get("run_id"), a.get("message")),
+    "list_runs": lambda a: _mcp_list_runs(a.get("func"), a.get("limit", 50)),
     "ida_connect": lambda a: _mcp_ida_connect(a.get("url"), a.get("host_header")),
     "ida_disconnect": lambda a: _mcp_ida_disconnect(),
     "ida_refresh": lambda a: _mcp_ida_refresh(),
