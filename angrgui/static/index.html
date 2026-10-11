@@ -115,6 +115,15 @@ select{font-family:var(--sans)}
 .pill.bad{background:rgba(248,81,73,.15);color:var(--bad)}
 .pill.warn{background:rgba(227,179,65,.15);color:var(--warn)}
 .pill.info{background:rgba(88,166,255,.15);color:var(--info)}
+.notebook{padding:10px 12px;overflow:auto;height:100%}
+.nbsec{margin-bottom:16px}
+.nbhead{display:flex;gap:10px;align-items:center;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--line)}
+.nbtarget{display:flex;gap:8px;align-items:center;padding:5px 8px;border:1px solid var(--line);border-radius:6px;margin:4px 0}
+.nbtarget a,.nbfn{color:var(--accent);font-weight:600;cursor:pointer}
+.nbaddr{font-size:11px}
+.nbnote{color:var(--dim);font-size:12px;font-style:italic}
+.nbrun{padding:7px 9px;border:1px solid var(--line);border-radius:7px;margin:5px 0;background:var(--chip)}
+.nbrunnote{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--text);padding:2px 6px;font-size:12px}
 .runnotes{margin:8px 6px;padding:8px 10px;border:1px solid var(--warn);border-radius:8px;background:rgba(227,179,65,.08)}
 .runnotes>b{display:block;color:var(--warn);font-size:12px;margin-bottom:4px}
 .runnotes .rnote{font-size:12px;color:var(--dim);line-height:1.45;margin:3px 0}
@@ -675,6 +684,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
         <div class="tab" data-tab="code">Disassembly</div>
         <div class="tab" data-tab="state">State</div>
         <div class="tab" data-tab="script">angr script</div>
+        <div class="tab" data-tab="notebook" title="run history, reviews &amp; the TODO queue">Notebook</div>
         <span class="grow"></span>
         <div class="fontsize" title="code text size">
           <button id="fsDown" title="smaller text">A−</button>
@@ -686,6 +696,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
         <div class="tabpane" id="pane-script"><div class="empty">Select a function to see its setup as an angr script.</div></div>
         <div class="tabpane" id="pane-state"><div class="empty">Select a function.</div></div>
         <div class="tabpane sel" id="pane-decomp"><div class="empty">Connect to IDA (top bar) for decompilation.</div></div>
+        <div class="tabpane" id="pane-notebook"><div class="empty">Run history, reviews &amp; the TODO queue.</div></div>
       </div>
     </div>
     <div class="splitter-h" data-target="bottom" id="bottomSplit"></div>

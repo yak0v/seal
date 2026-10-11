@@ -437,6 +437,72 @@ function selectTab(name) {
   if (name === "script") renderScript();
   if (name === "decomp") renderDecomp();
   if (name === "state") renderState();
+  if (name === "notebook") renderNotebook();
+}
+
+// ===================================================================== Notebook tab (#9)
+// Run history, the user's reviews, free-text notes, and the TODO queue of functions to
+// test next — a documentation platform for the user and a control panel for the agents.
+async function renderNotebook() {
+  const pane = $("#pane-notebook"); if (!pane) return;
+  pane.replaceChildren(el("div", { class: "empty" }, "loading…"));
+  let runs = [], targets = [];
+  try { runs = (await api("/api/runs?limit=200")).runs || []; } catch (e) {}
+  try { targets = (await api("/api/targets?status=all")).targets || []; } catch (e) {}
+  const wrap = el("div", { class: "notebook" });
+
+  // --- TODO queue ---
+  const tgtAdd = el("input", { placeholder: "function name/addr to queue…", style: "flex:1" });
+  const noteIn = el("input", { placeholder: "why / what to look for (optional)", style: "flex:1" });
+  const tsec = el("div", { class: "nbsec" },
+    el("div", { class: "nbhead" }, el("b", {}, "TODO — functions to test next"),
+      A.fn ? btn("+ queue current (" + (A.fn.ida_name || A.fn.name) + ")", async () => { await nbAddTarget(A.fn.addr); }, "tiny") : null),
+    el("div", { class: "row", style: "gap:6px;margin:6px 0" }, tgtAdd, noteIn,
+      btn("Add", async () => { if (!tgtAdd.value.trim()) return; await nbAddTarget(tgtAdd.value.trim(), noteIn.value.trim()); }, "tiny primary")));
+  const openT = targets.filter(t => t.status === "open"), doneT = targets.filter(t => t.status !== "open");
+  if (!openT.length) tsec.append(el("div", { class: "faint", style: "padding:4px" }, "nothing queued."));
+  openT.forEach(t => tsec.append(el("div", { class: "nbtarget" },
+    el("a", { href: "#", onclick: e => { e.preventDefault(); goToFn(t.func); } }, t.name),
+    el("span", { class: "nbaddr mono faint" }, t.func),
+    t.note ? el("span", { class: "nbnote" }, t.note) : null,
+    el("span", { class: "grow" }),
+    btn("✓ done", () => nbResolve(t.func, "done"), "tiny ghost"))));
+  if (doneT.length) tsec.append(el("div", { class: "faint", style: "padding:4px;margin-top:4px" },
+    doneT.length + " done: " + doneT.map(t => t.name).join(", ")));
+  wrap.append(tsec);
+
+  // --- run history ---
+  const rsec = el("div", { class: "nbsec" }, el("div", { class: "nbhead" },
+    el("b", {}, `Run history (${runs.length})`), el("span", { class: "faint" }, "newest first")));
+  if (!runs.length) rsec.append(el("div", { class: "faint", style: "padding:4px" }, "no runs yet."));
+  runs.forEach(r => rsec.append(nbRunRow(r)));
+  wrap.append(rsec);
+  pane.replaceChildren(wrap);
+}
+function nbRunRow(r) {
+  const when = r.when ? new Date(r.when * 1000).toLocaleString() : "";
+  const verdictPill = r.review ? el("span", { class: "pill " + (r.review === "good" ? "ok" : r.review === "bad" ? "bad" : "warn") }, r.review) : null;
+  const noteIn = el("input", { class: "nbrunnote", value: r.note || "", placeholder: "note…",
+    onchange: async e => { try { await jpost(`/api/runs/${r.id}/note`, { note: e.target.value }); toast("note saved"); } catch (err) { toast("save failed", true); } } });
+  const review = async (v) => { try { await jpost(`/api/runs/${r.id}/review`, { verdict: v }); toast("marked " + v); renderNotebook(); } catch (e) { toast("failed", true); } };
+  return el("div", { class: "nbrun" },
+    el("div", { class: "row", style: "gap:8px;align-items:center" },
+      el("a", { href: "#", class: "nbfn", onclick: e => { e.preventDefault(); goToFn(r.func, r.id); } }, r.func_name || r.func),
+      el("span", { class: "pill " + (r.findings ? "bad" : "") }, (r.findings || 0) + " finding" + (r.findings === 1 ? "" : "s")),
+      el("span", { class: "faint mono", style: "font-size:11px" }, (r.by || "") + " · " + (r.checks || []).join(",")),
+      verdictPill, el("span", { class: "grow" }),
+      el("span", { class: "faint", style: "font-size:11px" }, when)),
+    el("div", { class: "row", style: "gap:6px;margin-top:4px;align-items:center" },
+      el("span", { class: "faint", style: "font-size:11px" }, "review:"),
+      btn("✓ good", () => review("good"), "tiny"), btn("↻ refine", () => review("refine"), "tiny"),
+      btn("✕ bad", () => review("bad"), "tiny"), noteIn));
+}
+async function nbAddTarget(func, note) { try { await jpost("/api/targets", { func: "" + func, note: note || undefined }); renderNotebook(); } catch (e) { toast("add failed: " + e.message, true); } }
+async function nbResolve(func, status) { try { await jpost(`/api/targets/${func}/resolve`, { status }); renderNotebook(); } catch (e) { toast("failed", true); } }
+async function goToFn(addr, runId) {
+  const a = typeof addr === "string" ? parseInt(addr, 16) : addr;
+  const f = (A.functions || []).find(x => x.addr === a);
+  if (f) await selectFunction(f);   // jump to the function; its stored config/last run load with it
 }
 
 // ===================================================================== State tab

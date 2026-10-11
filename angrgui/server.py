@@ -584,6 +584,39 @@ def run_cancel(run_id: str):
     return {"ok": True}
 
 
+# --------------------------------------------------------------------------- notebook (#9)
+# Run history, reviews and the TODO queue — the documentation/control layer. These reuse
+# the same logic as the MCP tools so the GUI and agents share one source of truth.
+@app.get("/api/runs")
+def api_runs(func: str | None = None, limit: int = 100):
+    return {"runs": _mcp_list_runs(func, limit)}
+
+
+@app.post("/api/runs/{run_id}/review")
+def api_review(run_id: str, body: dict = Body(...)):
+    return _mcp_review_run(run_id, body.get("verdict"), body.get("note"))
+
+
+@app.post("/api/runs/{run_id}/note")
+def api_note(run_id: str, body: dict = Body(...)):
+    return _mcp_note_run(run_id, body.get("note", ""))
+
+
+@app.get("/api/targets")
+def api_targets(status: str = "open"):
+    return {"targets": _mcp_list_targets(status)}
+
+
+@app.post("/api/targets")
+def api_add_target(body: dict = Body(...)):
+    return _mcp_add_target(body["func"], body.get("note"))
+
+
+@app.post("/api/targets/{func}/resolve")
+def api_resolve_target(func: str, body: dict = Body(default={})):
+    return _mcp_resolve_target(func, (body or {}).get("status", "done"))
+
+
 # --------------------------------------------------------------------------- IDA MCP
 class IdaConnectReq(BaseModel):
     url: str = DEFAULT_URL
