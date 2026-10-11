@@ -699,12 +699,17 @@ function renderCode() {
       callModelTag(ins),
       ins.src_line ? el("span", { class: "faint", style: "flex:0 0 auto;margin-right:6px" }, ":" + ins.src_line) : null,
       acts);
-    // concrete value written here on the selected (seeded) path
+    // every concrete value involved here on the selected (seeded) path (#4): the
+    // destination write, the memory store/load, and each operand register read.
     const av = A.pathAsgn && A.pathAsgn["0x" + ins.addr.toString(16)];
     if (av) {
-      const val = av.store ? av.store.val : av.val;
-      const dst = av.store ? "[" + av.store.addr + "]" : av.reg;
-      if (val != null) row.append(el("span", { class: "cvals asgn", style: "flex:0 0 auto" }, `  ${dst} = ${val}`));
+      const parts = [], seen = new Set();
+      const push = (k, v) => { if (v != null && !seen.has(k + v)) { seen.add(k + v); parts.push(el("span", { class: "cv1" }, k + "=" + v)); } };
+      if (av.store && av.store.val != null) push("[" + av.store.addr + "]", av.store.val);
+      else if (av.reg && av.val != null) push(av.reg, av.val);
+      if (av.reads) for (const [r, v] of Object.entries(av.reads)) if (r !== av.reg) push(r, v);
+      if (av.load && av.load.val != null) push("[" + av.load.addr + "]", av.load.val);
+      if (parts.length) row.append(el("span", { class: "cvals asgn", style: "flex:0 0 auto" }, ...parts));
     }
     wrap.append(row);
   }
@@ -2094,10 +2099,14 @@ function updatePathHighlight() {
 async function loadPathValues() {
   const id = A.run && A.run.id, node = A.selNode;
   if (id == null || node == null) return;
-  const key = id + ":" + node;
+  // when a finding is selected, stop the value trace AT the finding so loop values
+  // reflect the iteration that caused it (#4)
+  const hits = (A.run.snapshot && A.run.snapshot.hits) || [];
+  const until = (A.selectedHit != null && hits[A.selectedHit]) ? hits[A.selectedHit].addr : null;
+  const key = id + ":" + node + (until != null ? ":u" + until : "");
   A._pvCache = A._pvCache || {};
   try {
-    A.pathAsgn = A._pvCache[key] || (A._pvCache[key] = (await api(`/api/run/${id}/values?node=${node}`)).values || {});
+    A.pathAsgn = A._pvCache[key] || (A._pvCache[key] = (await api(`/api/run/${id}/values?node=${node}` + (until != null ? "&until=" + until : ""))).values || {});
   } catch (e) { A.pathAsgn = null; return; }
   if (A.selNode === node) {   // still the same selection
     if ($("#pane-decomp").classList.contains("sel")) renderDecomp();

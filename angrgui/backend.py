@@ -166,10 +166,10 @@ class AngrBackend(Backend):
         r = self._runs.get(run_id)
         return r.snapshot() if r is not None else None
 
-    def run_values(self, run_id: str, example: dict) -> dict:
+    def run_values(self, run_id: str, example: dict, until_addr: int | None = None) -> dict:
         from .runner import trace_assignments
         r = self._runs.get(run_id)
-        return trace_assignments(self._binary, r.spec, example) if r is not None else {}
+        return trace_assignments(self._binary, r.spec, example, until_addr=until_addr) if r is not None else {}
 
     def cancel_run(self, run_id: str) -> bool:
         r = self._runs.get(run_id)

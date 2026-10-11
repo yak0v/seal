@@ -1245,13 +1245,16 @@ class Run:
             }
 
 
-def trace_assignments(binary, spec: dict, example: dict, max_steps: int = 6000) -> dict:
+def trace_assignments(binary, spec: dict, example: dict, max_steps: int = 6000,
+                      until_addr: int | None = None) -> dict:
     """Re-execute a function with the example's concrete inputs and record, per
-    instruction address, the value written to its destination register (and memory
-    stores). That is the concrete value of the variable assigned on each source line,
-    on this path — used to annotate assignment lines in the decompilation.
+    instruction address, the concrete values involved: the destination register
+    written (an assignment), memory stores, AND the operand registers/memory READ
+    (so EVERY value on a line is visible, not just the assignment result — #4). If
+    `until_addr` is given (the finding's address), the trace stops the first time it
+    reaches there, so values reflect the loop ITERATION that caused the finding.
 
-    Returns {hex_addr: {"reg": name, "val": hex, "store": {"addr","val"}?}}.
+    Returns {hex_addr: {"reg","val","store"?, "reads": {reg:val,...}, "load": {addr,val}?}}.
     """
     import angr
     import claripy
@@ -1303,8 +1306,9 @@ def trace_assignments(binary, spec: dict, example: dict, max_steps: int = 6000) 
     state = run._build_state()
     run._install_models(state)                    # honour alloc/return models (e.g. malloc)
     arch = binary.arch
-    SKIP = {"ip", "pc", "sp", "xsp", "bp", "x29", "lr", "x30", "cc_op", "cc_dep1",
-            "cc_dep2", "cc_ndep", "nzcv", "cpsr", "fpcr", "fpsr", "qc"}
+    SKIP = {"ip", "rip", "eip", "pc", "sp", "rsp", "esp", "xsp", "bp", "x29", "lr", "x30",
+            "cc_op", "cc_dep1", "cc_dep2", "cc_ndep", "nzcv", "cpsr", "fpcr", "fpsr", "qc",
+            "d", "ac", "id", "fs", "gs", "fs_const", "gs_const"}
     regvals, memvals = {}, {}
 
     def on_rw(s):
@@ -1334,8 +1338,45 @@ def trace_assignments(binary, spec: dict, example: dict, max_steps: int = 6000) 
         except Exception:
             pass
 
+    reads, loads = {}, {}
+    hit = {"until": False}
+
+    def on_rr(s):                                 # operand register READ (feeds this line)
+        ia = s.scratch.ins_addr
+        if ia is None:
+            return
+        if until_addr is not None and ia == until_addr:
+            hit["until"] = True
+        try:
+            off = s.inspect.reg_read_offset
+            if isinstance(off, claripy.ast.Base):
+                off = s.solver.eval(off)
+            length = s.inspect.reg_read_length or arch.bytes
+            if isinstance(length, claripy.ast.Base):
+                length = s.solver.eval(length)
+            name = arch.translate_register_name(off, int(length))
+            if not name or name in SKIP:
+                return
+            val = s.inspect.reg_read_expr
+            reads.setdefault(ia, {})[name] = hex(s.solver.eval(val)) if val is not None else None
+        except Exception:
+            pass
+
+    def on_mr(s):                                 # memory LOAD (a deref / struct member read)
+        ia = s.scratch.ins_addr
+        if ia is None:
+            return
+        try:
+            val = s.inspect.mem_read_expr
+            loads[ia] = {"addr": hex(s.solver.eval(s.inspect.mem_read_address)),
+                         "val": hex(s.solver.eval(val)) if val is not None else None}
+        except Exception:
+            pass
+
     state.inspect.b("reg_write", when=angr.BP_AFTER, action=on_rw)
     state.inspect.b("mem_write", when=angr.BP_BEFORE, action=on_mw)
+    state.inspect.b("reg_read", when=angr.BP_AFTER, action=on_rr)
+    state.inspect.b("mem_read", when=angr.BP_AFTER, action=on_mr)
     simgr = binary.project.factory.simgr(state)
     steps = 0
     deadline = time.time() + 20                   # never let annotation hang the server
@@ -1344,10 +1385,16 @@ def trace_assignments(binary, spec: dict, example: dict, max_steps: int = 6000) 
         steps += 1
         if len(simgr.active) > 1:                 # inputs are concrete; keep a single path
             del simgr.active[1:]
+        if hit["until"]:                          # reached the finding — stop at this iteration
+            break
 
     out = {}
     for ia, rv in regvals.items():
         out[hex(ia)] = dict(rv)
     for ia, mv in memvals.items():
         out.setdefault(hex(ia), {})["store"] = mv
+    for ia, rd in reads.items():
+        out.setdefault(hex(ia), {})["reads"] = rd
+    for ia, ld in loads.items():
+        out.setdefault(hex(ia), {})["load"] = ld
     return out

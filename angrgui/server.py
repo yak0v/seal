@@ -566,15 +566,17 @@ def _leaf_example(snap: dict, node: int) -> dict:
 
 
 @app.get("/api/run/{run_id}/values")
-def run_values(run_id: str, node: int):
-    """Per-instruction destination values on a path: {hex_addr: {reg, val, store?}},
-    computed by re-executing the function with that path's concrete example inputs.
-    Lets the UI show the value of the variable assigned on each decompilation line."""
+def run_values(run_id: str, node: int, until: int | None = None):
+    """Per-instruction values on a path: {hex_addr: {reg, val, store?, reads?, load?}},
+    computed by re-executing the function with that path's concrete example inputs — so
+    the UI can show EVERY value on a decompilation line (operands + loads, not just the
+    assignment result). `until` (a finding's address) stops the trace at that instruction,
+    so values reflect the loop iteration that caused the finding."""
     snap = S.backend.run_snapshot(run_id) if S.backend else None
     if snap is None:
         raise HTTPException(404, "no such run")
     example = _leaf_example(snap, node)
-    return {"node": node, "values": S.backend.run_values(run_id, example)}
+    return {"node": node, "values": S.backend.run_values(run_id, example, until)}
 
 
 @app.post("/api/run/{run_id}/cancel")
