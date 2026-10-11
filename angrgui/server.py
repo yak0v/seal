@@ -1280,10 +1280,15 @@ standard handshake: initialize → tools/list → tools/call. The initialize res
 `instructions` field, and the `get_guide` tool, both return THIS document — reread it
 any time.
 
-Everything you call is published to the GUI's live "Activity" feed, and with "follow
-agent" on (default) the human's view auto-jumps to the function you configure and the
-run you start. You are performing for an audience; narrate nothing, just operate — the
-GUI shows them what you did.
+Everything you call is published to the GUI's live "Activity" feed, but ordinary
+configure/run do NOT move the human's view — by default "follow agent" is OFF, so many
+agents (and the human) can work on different functions at once without yanking each
+other's screen around. When you specifically want the human to LOOK at something —
+a finding worth their eyes, a function you want reviewed — call show_function(addr,
+run_id?, message?); that is the only thing that jumps their view. (If the human turns
+"follow agent" on, their view then follows you automatically; don't assume it is.) You
+are performing for an audience; narrate nothing, just operate — the GUI shows them what
+you did, and show_function points them at what matters.
 
 ════════════════════════════════════════════════════════════════════════
 PART 3 — THE CORE LOOP (the happy path, in order)
@@ -1537,7 +1542,41 @@ rename_scenario, delete_scenario (each by name or index). Use scenarios to compa
 e.g., a fresh-call setup vs a concolic-snapshot setup of the same function.
 
 ════════════════════════════════════════════════════════════════════════
-PART 11 — ARM64 / arm64e NOTES (iOS / macOS system binaries)
+PART 11 — THE SHARED WORKSPACE (run history, the user's feedback, the TODO queue)
+════════════════════════════════════════════════════════════════════════
+
+SEAL is multi-user: the human and any number of agents share one workspace, saved next
+to the binary and DURABLE across restarts. Four things are shared, and you are expected
+to use them to coordinate rather than work blind:
+
+• RUN HISTORY — every run is stored (findings + metadata), not just the latest.
+  list_runs(func?) returns them newest-first (across the user and other agents);
+  get_run(run_id) still returns the full findings of any stored run, even one from
+  another process or a previous session. Check list_runs before re-running a function
+  someone already covered.
+
+• THE USER'S FEEDBACK — the human triages your results with a verdict: good (real,
+  keep), bad (wrong, discard), or refine (right idea, needs a better setup), plus an
+  optional note. Read it with list_reviews(verdict?). This is your correction signal:
+  re-run the "refine" and "bad" ones with a better setup (tighter assumptions, a
+  concolic snapshot, the right symbolic field) and leave the "good" ones alone. You can
+  also review_run / note_run yourself to record what YOU think of a result, but the
+  verdict is normally the human's.
+
+• THE TODO QUEUE — the human (or you) queues functions worth analysing with
+  add_target(func, note?). list_targets(status) shows them; work the open ones, then
+  resolve_target(func) when done. This is how the human tells you "test these next".
+
+• FOCUS — show_function(addr, run_id?, message?) is how you pull the human's attention
+  to a specific function/run (see PART 2); nothing else moves their view.
+
+The GUI exposes all of this in its Notebook / control-panel tab, so whatever you record
+here the human sees there, and vice-versa. Concurrency is safe: configuration, runs,
+reviews and targets are serialized under a lock, so you and other agents editing
+DIFFERENT functions never corrupt each other's state.
+
+════════════════════════════════════════════════════════════════════════
+PART 12 — ARM64 / arm64e NOTES (iOS / macOS system binaries)
 ════════════════════════════════════════════════════════════════════════
 
 SEAL runs on arm64 and arm64e, not just x86-64. At load it applies a portable runtime
@@ -1552,7 +1591,7 @@ implemented: a wrong handler would silently corrupt analysis, so SEAL raises a c
 error instead — if you hit one in a hot path, it needs a real handler added.
 
 ════════════════════════════════════════════════════════════════════════
-PART 12 — RECIPES (copy the shape, get real addresses from list_functions)
+PART 13 — RECIPES (copy the shape, get real addresses from list_functions)
 ════════════════════════════════════════════════════════════════════════
 
 A · Reach a target (CTF "find the input that wins")
@@ -1600,7 +1639,7 @@ E · Invariant / assertion (prove a property or get a counterexample)
    # nothing — wrap it to the real width: s32(ret) / u32(ret) (s16/u16, ... likewise).
 
 ════════════════════════════════════════════════════════════════════════
-PART 13 — GOTCHAS (the list of things that will waste your time)
+PART 14 — GOTCHAS (the list of things that will waste your time)
 ════════════════════════════════════════════════════════════════════════
 
 • Addresses IN are a hex string "0x400743" or a function name; addresses OUT (in

@@ -59,11 +59,11 @@ angrgui/
   server.py                FastAPI app: HTTP routes + MCP server + SSE EventBus + the agent GUIDE
   backend.py               Backend ABC + AngrBackend + registry; the NEUTRAL JSON CONTRACT (read its docstring)
   engine.py                Binary: load a program, index/analyze functions, disassemble, DWARF, arm64e patch
-  runner.py                Run: build the initial state, install checks, explore paths, collect findings; trace_assignments
-  checks.py                the check kinds (reach/avoid/assert/int_overflow/narrowing_cast/float_anomaly/oob_write/custom)
-  exprlang.py              the assumption/assert expression language -> claripy ASTs (hand-rolled parser, no eval)
+  runner.py                Run: build the initial state (incl. nested-pointer buffers + snapshot regs/flags), install checks, explore paths, classify path ends, collect findings; trace_assignments
+  checks.py                the check kinds (reach/avoid/assert/int_overflow/narrowing_cast/div_by_zero/float_anomaly/oob_write/oob_read/null_deref/custom)
+  exprlang.py              the assumption/assert expression language -> claripy ASTs (hand-rolled parser, no eval; int + float compares)
   pretty.py                format claripy ASTs + witness values for humans (inverse of exprlang)
-  workspace.py             per-binary project file (<binary>.angrgui.json): scenarios + shared checks, migration
+  workspace.py             per-binary project file (<binary>.angrgui.json): scenarios + shared checks + stored runs/reviews/targets, lock-serialized, migration
   codegen.py               export a standalone runnable angr script from a function's config (transparency)
   idamcp.py                optional IDA bridge (MCP client): names, Hex-Rays pseudocode, struct layouts
   angr_arm_patch.py        portable runtime patch: missing NEON IR ops + arm64e PAC hooks (no edits to installed angr)
@@ -71,11 +71,11 @@ angrgui/
     capture.py             lldb script: dump a live process's regs + pointer-reachable memory as an initial_state snapshot
     rebase.py              rebase a live (ASLR-slid) snapshot into the binary's file-address space
   static/
-    app.js, index.html     the GUI (vanilla JS); consumes the neutral contract + SSE; framework-ignorant
+    app.js, index.html     the GUI (vanilla JS); consumes the neutral contract + SSE; framework-ignorant; Notebook/control-panel tab (runs, reviews, targets), busy indicator, check-detail + per-line value views
 seal_validation/           the CVE-2026-86950 validation harness + the live-capture scripts + notes (see §8)
   snapshot/live_bp.py      lldb helper: break by ADDRESS in a dyld-shared-cache image (name resolution hangs)
 concolic_demo/             a tiny self-contained example proving concolic snapshot seeding (demo.c + demo)
-tests/                     pytest suite (exprlang, paths/codegen, …) — 57 tests
+tests/                     pytest suite (exprlang, paths/codegen, nested pointers, snapshot flags, …) — 81 tests
 docs/                      this guide + screenshots
 ```
 
@@ -140,8 +140,19 @@ Each module's own docstring has the detail; this is the cross-cutting summary.
 - **runner.py** — *why:* `_set_arg` is arch-aware (it was x86-only and crashed with
   `KeyError 'rdi'` on AArch64). The concolic seeder `_build_state_from_snapshot` skips
   `pc`/`ip` when applying captured registers so a saved `pc` can't clobber the chosen
-  start address — **this is what makes mid-function seeding work**. *Pitfall:* `skip_calls`
-  (CALLLESS) **bypasses call models** — don't enable it when you rely on modeled allocs.
+  start address — **this is what makes mid-function seeding work** — and restores each
+  register at its real width (so a 128-bit NEON reg isn't truncated) and the condition
+  flags via `_restore_flags` (angr has no plain `cpsr`/`eflags` register: NZCV live in the
+  VEX flag thunk, so a naive `setattr` drops them and diverges a mid-branch seed).
+  *Nested-pointer buffers:* a buffer `layout` member with `mode:"pointer"` is materialized
+  into a REAL sub-region (recursively, depth-capped) so `p->data[i]` / `p->next->val`
+  deref correctly instead of hitting a wild symbolic address; the member name resolves to
+  the sub-region address so an oob check can anchor to it. *Path-end classification:* each
+  successor is labelled (returned / deadended / unconstrained / `left_image` — a tail-call
+  to an address in no loaded object, ended cleanly rather than treated as an error), and the
+  run `summary.stopped` says WHY exploration stopped (complete / step limit / timeout / …).
+  *Pitfall:* `skip_calls` (CALLLESS) **bypasses call models** — don't enable it when you
+  rely on modeled allocs.
 
 - **checks.py** — *extend:* subclass `BaseCheck` and register it in the kind→class map;
   set `installs_breakpoint = True` and hook `state.inspect` for per-operation checks.
@@ -161,7 +172,15 @@ Each module's own docstring has the detail; this is the cross-cutting summary.
   checks**, saved next to the binary as `<binary>.angrgui.json`. `SCEN_FIELDS` is the
   authoritative per-scenario field list (note `initial_state` lives there). *Extend:* a new
   per-scenario field must be added to `SCEN_FIELDS` (and the GUI/MCP that read it) or it is
-  silently dropped on save.
+  silently dropped on save. *Shared collaborative state:* the file also stores **runs**
+  (full findings + metadata, durable so results survive a restart and are visible to the
+  user and other agents), **reviews** (the user's good/bad/refine verdict + note on a run),
+  and **targets** (the shared TODO queue). *Concurrency:* all mutation goes through an
+  **`RLock`** with a single `_save_locked`, and config edits use an atomic read-modify-write
+  (`update_function`) — so several agents (plus the human) editing *different* functions
+  never corrupt the file or clobber each other. *Pitfall:* never write the JSON outside the
+  lock, and keep per-run records append-mostly (don't rewrite history another agent may be
+  reading).
 
 - **server.py** — HTTP + MCP + the `EventBus`. *Why:* `/` and `/app.js` are served with
   no-cache headers so a plain reload shows edits. The SSE `/api/events` endpoint tolerates a
@@ -169,7 +188,11 @@ Each module's own docstring has the detail; this is the cross-cutting summary.
   "now" instead of waiting for a sequence that will never arrive) — without this, a tab
   silently receives nothing after a restart. *Extend an MCP tool:* add a `_mcp_*` handler, a
   `TOOL_DEFS` entry (name + inputSchema), and a dispatch entry; publish to the bus so the GUI
-  reflects it.
+  reflects it. *Run persistence:* a finished run is persisted via `_persist_run_record`
+  (so `list_runs`/`get_run` serve it after a restart or from another process); the
+  review/target endpoints (`review_run`, `note_run`, `list_reviews`, `add_target`,
+  `list_targets`, `resolve_target`) and `show_function` (publishes a `focus` event — the
+  one thing that moves the human's view) round-trip through the workspace.
 
 - **idamcp.py** — optional IDA bridge for names/pseudocode/structs (angr still does all the
   analysis). *Pitfall:* `decompile`/`get_struct` need a live IDA connection; IDA's load base
@@ -182,9 +205,14 @@ Each module's own docstring has the detail; this is the cross-cutting summary.
   the runner builds state.
 
 - **GUI (static/app.js, index.html)** — framework-ignorant; renders the neutral contract and
-  the live SSE feed; "follow agent" auto-navigates to the agent's function/run. State is in a
-  single `A` object. *Pitfall:* the GUI is loaded once per tab, so JS changes need a reload;
-  server changes need a restart.
+  the live SSE feed. State is in a single `A` object. *View movement:* "follow agent" is
+  **off by default** (`A.followAgent`), so an agent's runs don't yank the human's screen and
+  many agents can work at once; only a `focus` event from `show_function` (or the human
+  opting into follow) navigates the view. *Also here:* the Notebook/control-panel tab
+  (`renderNotebook` — run history, review buttons, notes, target queue), a **busy indicator**
+  (`setBusy`, instrumented `api()`), the **check-detail** view (`openCheckDetail`), and the
+  **per-line value** overlay (reads/loads/stores from `path_values`). *Pitfall:* the GUI is
+  loaded once per tab, so JS changes need a reload; server changes need a restart.
 
 ---
 
@@ -195,7 +223,12 @@ instructions, which blocks real iOS/macOS binaries. `angr_arm_patch` fixes this 
 (no edits to the installed angr, so it survives reinstalls and is portable):
 
 - **`apply()`** registers handlers for the missing NEON ops (NarrowUn/`xtn`, saturating
-  QNarrowUn, ZeroHI*ofV128, byte/element Reverse, Sqrt). Idempotent; call before any lifting.
+  QNarrowUn, ZeroHI*ofV128, byte/element Reverse, and vector `Sqrt` — the scalar handler
+  accepts angr's per-lane `_auto_vectorize` calls so `Sqrt64Fx2`/`Sqrt32Fx4` work; `Mul64Fx2`
+  and the f16↔f32 conversions were already covered). Idempotent; call before any lifting. It
+  also calls **`patch_lmdb_max_dbs()`**, which raises the `max_dbs` angr's `RuntimeDb` opens
+  its LMDB with (hardcoded to 10 — a big binary with many analyses hits `MDB_DBS_FULL`) by
+  intercepting `lmdb.open`; version-proof, as SEAL doesn't use lmdb itself.
 - **`patch_pac(project, start, end)`** hooks PAC instructions over a range: `retaa/retab`→`ret`,
   `braa/blraa/…`→branch/call to the target register, `paci*/auti*/xpac*`→nop.
 - **Deliberate gaps:** some saturating/rounding-shift ops, LSE atomics, and `udf` are *not*
@@ -226,7 +259,10 @@ End-to-end:
    the snapshot is slid *down* by the slide — pc, registers, memory-region bases, and in-image
    pointer slots; heap/stack are left alone. `runner._build_state_from_snapshot` does this
    automatically when the snapshot carries `image.slide` (it derives the file range from the
-   loaded object).
+   loaded object). Registers are set at their real width, and the condition flags (CPSR/
+   NZCV on arm64, eflags on x86) are restored through the VEX flag thunk — not as a plain
+   register, which angr doesn't expose — so a snapshot seeded right before a flag-dependent
+   branch takes the correct edge.
 3. **Seed**: put the (raw, runtime) snapshot in the scenario's `initial_state`
    (`{kind:"snapshot", pc, regs, mem, symbolic:[{reg|addr, name, size}], image:{slide,...}}`),
    mark the attacker-controlled fields symbolic, add checks, run. `pc` may be *mid-function*.
