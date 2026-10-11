@@ -13,7 +13,7 @@ CC ?= gcc
 CFLAGS ?= -g -O0 -fno-stack-protector -no-pie -fno-omit-frame-pointer -Wno-unused-result
 PYTHON ?= $(if $(wildcard ../.venv/bin/python),../.venv/bin/python,python3)
 
-all: vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample
+all: vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample struct_sample
 
 vuln: vuln.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -29,7 +29,7 @@ vuln.angrgui.json: vuln make_workspace.py
 	$(PYTHON) make_workspace.py vuln
 
 clean:
-	rm -f vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample
+	rm -f vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample struct_sample
 
 .PHONY: all clean
 
@@ -39,4 +39,8 @@ checks_sample: checks_sample.c
 
 # planted floating-point anomalies (NaN / +-Inf) for the float_anomaly check
 float_sample: float_sample.c
+	$(CC) $(CFLAGS) -fno-inline -o $@ $<
+
+# nested-pointer struct sample for the struct-layout buffer support
+struct_sample: struct_sample.c
 	$(CC) $(CFLAGS) -fno-inline -o $@ $<

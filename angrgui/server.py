@@ -1158,6 +1158,16 @@ pointer itself is a concrete scratch address). {"arg","size","layout"}.
          {"offset":12,"size":4,"mode":"sym","name":"p_size"},   # named symbolic member
          {"offset":8, "size":4,"mode":"fixed","value":0}]}]}    # pinned member
     Named symbolic members show up in witnesses by name — much more readable.
+  • POINTER members (a member that is itself a pointer to a buffer/sub-struct — e.g.
+    struct {char *data; int len;}): give the member mode:"pointer" and a target. SEAL
+    allocates a REAL sub-region and points the member at it, recursively (depth-capped),
+    so deref'ing p->data[i] / p->next->val actually works — without this the pointer is
+    a wild symbolic address and analysis is bogus. The member NAME resolves to the
+    sub-region's address, so you can anchor an oob check to it (base:"data"):
+      {"buffers":[{"arg":"p","size":16,"layout":[
+         {"offset":0,"size":8,"mode":"pointer","name":"data","target":{"size":64}},
+         {"offset":0,"size":8,"mode":"pointer","name":"next","target":{"size":16,"layout":[
+            {"offset":8,"size":4,"mode":"sym","name":"val"}]}}]}]}  # nested sub-struct
 
 STDIN / FILES — for programs that read input:
   • Symbolic stdin: {"stdin":{"mode":"symbolic","size":32}}.

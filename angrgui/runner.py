@@ -268,13 +268,12 @@ class Run:
             named[a.get("name") or f"arg{i}"] = bv
 
         # Point the requested pointer arguments at fresh symbolic buffers (optionally
-        # with a struct layout: specific members set to symbolic names or fixed values).
+        # with a struct layout: specific members set to symbolic names, fixed values,
+        # or POINTERS to their own sub-region — see _fill_region).
         buffers = {}
         for b in self.spec.get("buffers", []):
             argname = b["arg"]
-            size = int(b.get("size", 64))
-            buf = claripy.BVS(f"{argname}_buf", size * 8)
-            buffers[argname] = (buf, size, b.get("layout") or [])
+            buffers[argname] = (int(b.get("size", 64)), b.get("layout") or [])
 
         # stdin has to be handed to call_state: swapping state.posix.stdin afterwards
         # leaves the file uninitialised and the first state copy crashes
@@ -305,28 +304,16 @@ class Run:
             file_syms[fname] = fb
         state.globals["angrgui_files"] = file_syms
 
-        # Allocate + fill buffers, repoint the pointer args.
-        base = self.binary.scratch_base()
-        for argname, (buf, size, layout) in buffers.items():
-            addr = base
-            base += (size + 0xfff) & ~0xfff
-            state.memory.store(addr, buf, endness="Iend_BE")   # the whole region starts symbolic
-            named[f"{argname}_buf"] = buf
+        # Allocate + fill buffers, repoint the pointer args. A bump allocator over the
+        # scratch region hands out a page-aligned block per buffer AND per pointer-member
+        # sub-region (see _fill_region), so a struct with pointer members actually has
+        # real memory behind each pointer instead of a wild symbolic address.
+        self._scratch_next = self.binary.scratch_base()
+        self._member_maps = {}                      # region-name -> [[off,size,name],...] for display
+        for argname, (size, layout) in buffers.items():
+            addr = self._alloc_region(size)
+            self._fill_region(state, addr, size, layout, named, argname, 0)
             named[argname] = claripy.BVV(addr, self.arch.bits)   # the pointer itself is concrete
-            # a struct layout overwrites specific members (fixed value or named symbolic),
-            # leaving unlisted bytes symbolic; stored little-endian so integers read right.
-            for mb in layout:
-                try:
-                    moff = int(mb.get("offset", 0)); msz = int(mb.get("size") or self.arch.bytes)
-                    bits = max(8, msz * 8)
-                    if mb.get("mode") == "fixed":
-                        mv = claripy.BVV(int(mb.get("value", 0)) & ((1 << bits) - 1), bits)
-                    else:
-                        mnm = mb.get("name") or f"{argname}.{moff:x}"
-                        mv = claripy.BVS(mnm, bits); named[mnm] = mv
-                    state.memory.store(addr + moff, mv, endness=self.arch.memory_endness)
-                except Exception as e:
-                    log.warning("buffer %s member at +%s: %s", argname, mb.get("offset"), e)
             # overwrite the corresponding register/stack slot with the pointer
             idx = next((i for i, a in enumerate(args) if a.get("name") == argname), None)
             if idx is not None:
@@ -336,17 +323,14 @@ class Run:
         state.globals["angrgui_argv"] = arg_asts    # ordered, for the a1.. / arg0.. aliases
         state.globals["angrgui_locals"] = self._locals_map()
 
-        # map buffer byte offsets to struct member names, so conditions read
-        # e.g. `tif->tif_mode` instead of `tif_buf[16]`
-        bufmembers = {}
+        # map buffer byte offsets to struct member names (incl. nested sub-regions),
+        # so conditions read e.g. `tif->tif_mode` instead of `tif_buf[16]`. _fill_region
+        # collected these recursively; honour any explicit member_map override too.
+        bufmembers = dict(self._member_maps)
         for b in self.spec.get("buffers", []):
-            arg = b.get("arg")
             mm = b.get("member_map")
-            if not mm:
-                mm = [[int(m.get("offset", 0)), int(m.get("size") or 1),
-                       m.get("name") or f"{arg}.m{int(m.get('offset', 0))}"] for m in (b.get("layout") or [])]
             if mm:
-                bufmembers[f"{arg}_buf"] = sorted(mm, key=lambda x: x[0])
+                bufmembers[f"{b.get('arg')}_buf"] = sorted(mm, key=lambda x: x[0])
         state.globals["angrgui_bufmembers"] = bufmembers
 
         # assumptions
@@ -534,6 +518,59 @@ class Run:
                               8: "unsigned long long"}.get(sz, "unsigned long long"))
         proto = f"long long f({', '.join(parts) or 'void'})"
         return proto
+
+    # ------------------------------------------------------------------ buffers / structs
+    PTR_MAX_DEPTH = 5                        # cap recursive pointer expansion (cycles/blowup)
+
+    def _alloc_region(self, size: int) -> int:
+        """Hand out the next page-aligned scratch block of at least `size` bytes."""
+        addr = self._scratch_next
+        self._scratch_next += (max(int(size), 1) + 0xfff) & ~0xfff
+        return addr
+
+    def _fill_region(self, state, addr, size, layout, named, prefix, depth):
+        """Lay out a buffer/struct at `addr`: start the whole region symbolic, then apply
+        each member. A member is a fixed value, a fresh symbolic field, OR a POINTER —
+        in which case a sub-region is allocated, its concrete address stored into the
+        member, and this recurses into the sub-region's own layout (depth-capped). That
+        is what makes `struct {char *buf; int len;}` / linked structs actually analysable:
+        the pointer has real memory behind it instead of a wild symbolic address."""
+        pbits = self.arch.bits
+        blob = claripy.BVS(prefix, max(8, int(size)) * 8)
+        state.memory.store(addr, blob, endness="Iend_BE")   # whole region starts symbolic
+        named[f"{prefix}_buf"] = blob
+        mmap = []
+        for mb in (layout or []):
+            try:
+                moff = int(mb.get("offset", 0))
+                msz = int(mb.get("size") or self.arch.bytes)
+                bits = max(8, msz * 8)
+                mode = mb.get("mode")
+                mnm = mb.get("name") or f"{prefix}.{moff:x}"
+                if mode == "pointer":
+                    tgt = mb.get("target") or {}
+                    if depth < self.PTR_MAX_DEPTH and (tgt.get("size") or tgt.get("layout")):
+                        tsize = int(tgt.get("size") or 64)
+                        sub = self._alloc_region(tsize)
+                        state.memory.store(addr + moff, claripy.BVV(sub, pbits),
+                                           endness=self.arch.memory_endness)
+                        named[mnm] = claripy.BVV(sub, pbits)        # the member pointer value
+                        self._fill_region(state, sub, tsize, tgt.get("layout") or [],
+                                          named, mnm, depth + 1)     # recurse into *member
+                    else:                                           # depth cap / no target: leave symbolic
+                        mv = claripy.BVS(mnm, pbits); named[mnm] = mv
+                        state.memory.store(addr + moff, mv, endness=self.arch.memory_endness)
+                elif mode == "fixed":
+                    mv = claripy.BVV(int(mb.get("value", 0)) & ((1 << bits) - 1), bits)
+                    state.memory.store(addr + moff, mv, endness=self.arch.memory_endness)
+                else:
+                    mv = claripy.BVS(mnm, bits); named[mnm] = mv
+                    state.memory.store(addr + moff, mv, endness=self.arch.memory_endness)
+                mmap.append([moff, msz, mnm])
+            except Exception as e:
+                log.warning("region %s member at +%s: %s", prefix, mb.get("offset"), e)
+        if mmap:
+            self._member_maps[f"{prefix}_buf"] = sorted(mmap, key=lambda x: x[0])
 
     def _set_arg(self, state, index, value, prototype):
         cc = self.project.factory.cc()

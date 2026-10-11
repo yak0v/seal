@@ -52,3 +52,7 @@ samples/checks_sample
 # built float-anomaly sample (rebuild: make -C samples float_sample)
 samples/float_sample
 samples/float_sample.angrgui.json
+
+# built nested-pointer struct sample (rebuild: make -C samples struct_sample)
+samples/struct_sample
+samples/struct_sample.angrgui.json
