@@ -168,8 +168,14 @@ def _op_reverse(self, args):
 
 
 def _op_fgeneric_Sqrt(self, args):
-    """Scalar/vector FP square root (SqrtF64/F32)."""
-    return claripy.fpSqrt(claripy.fp.RM.RM_NearestTiesEven, args[0])
+    """FP square root. Handles BOTH call shapes: angr calls a scalar op as
+    _calculate([x]) (args is a list), and _auto_vectorize calls the per-lane function as
+    f(lane) (args is a single FP). This makes vector FSQRT — Iop_Sqrt64Fx2 / Sqrt32Fx4 /
+    Sqrt32Fx2 — work too: angr lane-splits them and sqrt's each lane through here."""
+    x = args[0] if isinstance(args, (list, tuple)) else args
+    if not isinstance(x, claripy.ast.FP):
+        x = x.raw_to_fp()
+    return claripy.fpSqrt(claripy.fp.RM.RM_NearestTiesEven, x)
 
 
 # op name / generic-name -> handler

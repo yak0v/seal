@@ -69,3 +69,24 @@ def test_f32_to_f16_x4_lanes():
     for i, v in enumerate(lanes):
         exp |= int.from_bytes(np.float16(np.float32(v)).tobytes(), "little") << (16 * i)
     assert got == exp
+
+
+def test_vector_fp_sqrt():
+    """NEON vector FSQRT (Iop_Sqrt64Fx2 / Sqrt32Fx4) — angr lane-splits to the scalar
+    sqrt handler, which must accept a per-lane FP. Was broken (args[0] on an FP)."""
+    import struct
+    import claripy
+    from angrgui import angr_arm_patch
+    from angr.engines.vex.claripy.irop import vexop_to_simop
+    angr_arm_patch.apply()
+
+    def vsqrt(name, vals, fmt, lb):
+        b = b"".join(struct.pack(fmt, x) for x in vals)
+        v = claripy.BVV(int.from_bytes(b, "little"), 128)
+        rv = claripy.backends.concrete.eval(vexop_to_simop(name).calculate(v), 1)[0].to_bytes(16, "little")
+        return [struct.unpack(fmt, rv[i * lb:i * lb + lb])[0] for i in range(len(vals))]
+
+    assert vsqrt("Iop_Sqrt64Fx2", [4.0, 9.0], "<d", 8) == [2.0, 3.0]
+    assert vsqrt("Iop_Sqrt32Fx4", [4.0, 9.0, 16.0, 25.0], "<f", 4) == [2.0, 3.0, 4.0, 5.0]
+    # symbolic doesn't crash
+    assert vexop_to_simop("Iop_Sqrt64Fx2").calculate(claripy.BVS("a", 128)).size() == 128
