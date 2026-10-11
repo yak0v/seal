@@ -120,6 +120,8 @@ select{font-family:var(--sans)}
 .busyspin{width:12px;height:12px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:busyspin .7s linear infinite}
 @keyframes busyspin{to{transform:rotate(360deg)}}
 body.busy{cursor:progress}
+.check .desc.clickable{cursor:pointer}
+.check .desc.clickable:hover{color:var(--text)}
 .notebook{padding:10px 12px;overflow:auto;height:100%}
 .nbsec{margin-bottom:16px}
 .nbhead{display:flex;gap:10px;align-items:center;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--line)}

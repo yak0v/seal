@@ -1341,11 +1341,49 @@ function renderCheck(c, i) {
     el("span", { class: "pill " + kindPill }, c.kind.replace("_", " ")),
     el("input", { class: "kind grow ckname", value: c.name || "", placeholder: "name…", title: "rename this check",
       oninput: e => { c.name = e.target.value; scheduleSave(); } }),
-    c.addr ? btn("↧", () => showAddr(c.addr), "tiny ghost") : null,
-    btn("✕", () => { A.config.checks.splice(i, 1); saveConfig(); renderRight(); }, "tiny ghost")));
+    c.addr ? btn("↧", (e) => { e.stopPropagation(); showAddr(c.addr); }, "tiny ghost", "jump to its address") : null,
+    btn("⋯", (e) => { e.stopPropagation(); openCheckDetail(c, i); }, "tiny ghost", "view / edit this check"),
+    btn("✕", (e) => { e.stopPropagation(); A.config.checks.splice(i, 1); saveConfig(); renderRight(); }, "tiny ghost")));
   const desc = describeCheck(c);
-  if (desc) box.append(el("div", { class: "desc" }, desc));
+  if (desc) box.append(el("div", { class: "desc clickable", title: "click to view / edit", onclick: () => openCheckDetail(c, i) }, desc));
   return box;
+}
+
+// #3: view/edit a check's full content after creation (clicking a check did nothing before)
+function openCheckDetail(c, i) {
+  const rows = [];
+  const line = (label, node) => rows.push(field(label, node));
+  line("Kind", el("div", { class: "mono" }, c.kind));
+  line("Name", el("input", { value: c.name || "", placeholder: "(unnamed)", oninput: e => c.name = e.target.value }));
+  if (["int_overflow", "narrowing_cast", "float_anomaly", "div_by_zero", "null_deref", "assert", "reach", "avoid", "custom", "oob_read", "oob_write"].includes(c.kind) && c.kind !== "assert") {
+    if (c.kind === "reach" || c.kind === "avoid" || !("at_return" in c))
+      line("Address", el("input", { class: "mono", value: c.addr != null ? hx64(c.addr) : "", placeholder: c.kind === "reach" || c.kind === "avoid" ? "0x… (required)" : "0x… (optional — whole function if blank)", oninput: e => { const v = e.target.value.trim(); c.addr = v ? parseIntLoose(v) : undefined; } }));
+  }
+  if (c.kind === "int_overflow") {
+    const sel = el("select", {}, ...["either", "unsigned", "signed"].map(o => el("option", { value: o, selected: (c.signed || "either") === o ? "" : null }, o)));
+    sel.onchange = e => c.signed = e.target.value; line("Signedness", sel);
+  }
+  if (c.kind === "assert") {
+    line("Expression", el("input", { class: "mono", value: c.expr || "", placeholder: "e.g. s32(ret) s>= 0", oninput: e => c.expr = e.target.value }));
+    const cb = el("input", { type: "checkbox", checked: c.at_return ? "" : null, style: "width:auto" });
+    cb.onchange = e => { c.at_return = e.target.checked; }; line("At return", cb);
+    line("Address", el("input", { class: "mono", value: c.addr != null ? hx64(c.addr) : "", placeholder: "0x… (blank = every block / at return)", oninput: e => { const v = e.target.value.trim(); c.addr = v ? parseIntLoose(v) : undefined; } }));
+  }
+  if (c.kind === "oob_read" || c.kind === "oob_write") {
+    line("Base", el("input", { class: "mono", value: c.base || "", placeholder: "arg/member name or expression (blank = declared buffer / modeled)", oninput: e => c.base = e.target.value.trim() || undefined }));
+    line("Size", el("input", { class: "mono", value: c.size ?? "", placeholder: "bytes", oninput: e => { const v = e.target.value.trim(); c.size = v ? parseIntLoose(v) : undefined; } }));
+  }
+  let codeTa = null;
+  if (c.kind === "custom") {
+    codeTa = el("textarea", { class: "mono", style: "width:100%;height:220px", spellcheck: "false" }, c.code || "");
+    rows.push(field("Python check(state, api)", codeTa));
+  }
+  const body = el("div", { class: "col", style: "gap:4px;min-width:420px" }, ...rows);
+  const m = modal("Check · " + (c.name || c.kind.replace("_", " ")), body, [
+    btn("Delete", () => { A.config.checks.splice(i, 1); saveConfig(); renderRight(); m.remove(); }, ""),
+    el("span", { class: "grow" }),
+    el("button", { class: "primary", onclick: () => { if (codeTa) c.code = codeTa.value; saveConfig(); renderRight(); m.remove(); toast("check saved"); } }, "Save")]);
+  $("#modalHost").append(m);
 }
 function describeCheck(c) {
   if (c.kind === "int_overflow") return (c.addr ? hx64(c.addr) + "  " : "whole function  ") + "· " + (c.signed || "either") + (c.note ? "  · " + c.note : "");
