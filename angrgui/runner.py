@@ -1140,8 +1140,28 @@ class Run:
                 node.end = {"reason": "unfinished",
                             "text": "not finished: stopped by the step / time limit (or cancelled)"}
                 node.example = witness_of(s) or None
+        # an explicit reason the run STOPPED (not just status), so a retrieved run says
+        # whether it finished exploring or was cut off by a limit (#8).
+        lim = self.spec.get("limits", {}) or {}
+        max_steps = int(lim.get("steps", 200)); max_seconds = float(lim.get("seconds", 30))
+        find = lim.get("find")
+        if self.status == "cancelled":
+            stopped = "cancelled"
+        elif self.status == "error":
+            stopped = "errored: " + (self.error or "unknown")[:120]
+        elif find and getattr(simgr, "found", []):
+            stopped = "reached the find target"
+        elif not simgr.active:
+            stopped = "explored all reachable paths (complete)"
+        elif self.progress["step"] >= max_steps:
+            stopped = f"hit the step limit ({max_steps}) — raise 'steps' to explore deeper"
+        elif self.progress["elapsed"] >= max_seconds * 0.9:
+            stopped = f"hit the time budget ({max_seconds:g}s) — raise 'seconds'"
+        else:
+            stopped = "stopped"
         self.summary.update({
             "status": self.status,
+            "stopped": stopped,
             "steps": self.progress["step"],
             "active": len(simgr.active),
             "deadended": len(simgr.deadended),

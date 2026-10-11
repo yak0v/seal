@@ -473,7 +473,7 @@ def _persist_run_record(run_id: str, spec: dict, source: str):
         "status": summary.get("status") or (snap or {}).get("status"),
         "summary": {k: summary.get(k) for k in
                     ("hits", "steps", "active", "deadended", "unconstrained", "errored",
-                     "nodes", "elapsed", "found", "notes") if k in summary},
+                     "nodes", "elapsed", "found", "notes", "stopped") if k in summary},
         "findings": findings,
         "checks": [c.get("name") or c.get("kind") for c in spec.get("checks", []) if c.get("enabled", True)],
         "review": None,                     # user verdict: good | bad | refine (#9)
@@ -1163,37 +1163,39 @@ def _mcp_ida_refresh():
 def _mcp_remove_assumption(addr, index=None, expr=None):
     _need_binary()
     a = _addr(addr)
-    cfg = S.workspace.get_function(a)
-    sc = cfg["scenarios"][cfg["active"]]
-    asm = sc.get("assumptions", [])
-    if expr is not None:
-        sc["assumptions"] = [x for x in asm if x != expr]
-    elif index is not None and 0 <= int(index) < len(asm):
-        asm.pop(int(index))
-    else:
-        raise HTTPException(400, "give an assumption index or exact expr to remove")
-    _store_config(a, cfg, source="agent")
+    def mutate(cfg):
+        sc = cfg["scenarios"][cfg["active"]]
+        asm = sc.get("assumptions", [])
+        if expr is not None:
+            sc["assumptions"] = [x for x in asm if x != expr]
+        elif index is not None and 0 <= int(index) < len(asm):
+            asm.pop(int(index))
+        else:
+            raise HTTPException(400, "give an assumption index or exact expr to remove")
+    _mutate_config(a, mutate)
     return _mcp_get_function(a)["config"]
 
 
 def _mcp_remove_check(addr, check):
     _need_binary()
     a = _addr(addr)
-    cfg = S.workspace.get_function(a)
-    checks = cfg.get("checks", [])
-    idx = None
-    try:                                              # by index
-        i = int(check)
-        if 0 <= i < len(checks):
-            idx = i
-    except (TypeError, ValueError):
-        pass
-    if idx is None:                                   # by id or name
-        idx = next((i for i, c in enumerate(checks) if c.get("id") == check or c.get("name") == check), None)
-    if idx is None:
-        raise HTTPException(404, f"no check {check!r}; have {[c.get('name') or c.get('id') for c in checks]}")
-    checks.pop(idx)
-    _store_config(a, cfg, source="agent")
+    def mutate(cfg):
+        checks = cfg.get("checks", [])
+        idx = None
+        try:                                          # by index
+            i = int(check)
+            if 0 <= i < len(checks):
+                idx = i
+        except (TypeError, ValueError):
+            pass
+        if idx is None:                               # by id, name, OR kind (remove the first of that kind)
+            idx = next((i for i, c in enumerate(checks)
+                        if c.get("id") == check or c.get("name") == check or c.get("kind") == check), None)
+        if idx is None:
+            raise HTTPException(404, f"no check {check!r}; have "
+                                f"{[c.get('name') or c.get('id') or c.get('kind') for c in checks]}")
+        checks.pop(idx)
+    _mutate_config(a, mutate)
     return _mcp_get_function(a)["config"]
 
 
