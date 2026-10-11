@@ -828,6 +828,11 @@ function toggleBuffer(argName, on) {
 function openStructEditor(argName) {
   const bufr = A.config.buffers.find(x => x.arg === argName);
   if (!bufr) return;
+  editStructLayout(argName, bufr);
+}
+// Edit the layout of a buffer OR a pointer member's target ({size, layout, struct_type?}),
+// so nested pointer members can be set up recursively.
+function editStructLayout(argName, bufr) {
   bufr.layout = bufr.layout || [];
   // A real combobox: a text field + a dropdown LIST of every struct IDA knows.
   // Click the caret (or focus) to open the whole list; typing filters it live;
@@ -908,17 +913,35 @@ function openStructEditor(argName) {
     bufr.layout.forEach((m, i) => tbl.append(memberRow(m, i)));
   };
   const memberRow = (m, i) => {
-    const sym = m.mode !== "fixed";
-    return el("div", { class: "strow" + (m.is_struct ? " nest" : "") },
+    const isPtr = m.mode === "pointer";
+    const isFixed = m.mode === "fixed";
+    // value column depends on the mode: symbolic / fixed value / pointer-to-sub-region
+    let valCol;
+    if (isPtr) {
+      m.target = m.target || { size: 64, layout: [] };
+      valCol = el("span", { class: "row", style: "gap:4px;align-items:center" },
+        el("input", { class: "stval mono", style: "width:56px", value: m.target.size || 64,
+          title: "target region size (bytes) the pointer points at",
+          oninput: e => { m.target.size = parseIntLoose(e.target.value) || 64; scheduleSave(); } }),
+        btn("⤷ target" + ((m.target.layout && m.target.layout.length) ? ` (${m.target.layout.length})` : ""),
+          () => editStructLayout((m.name || argName) + "→", m.target),
+          "tiny ghost", "edit the pointed-to region: its size + nested members (incl. deeper pointers)"));
+    } else if (isFixed) {
+      valCol = el("input", { class: "stval mono", value: m.value ?? 0, oninput: e => { m.value = parseIntLoose(e.target.value); scheduleSave(); } });
+    } else {
+      valCol = el("span", { class: "faint stvalph" }, "symbolic");
+    }
+    return el("div", { class: "strow" + (m.is_struct ? " nest" : "") + (isPtr ? " ptr" : "") },
       el("input", { class: "stoff mono", value: m.offset, title: "byte offset", oninput: e => { m.offset = parseIntLoose(e.target.value); scheduleSave(); } }),
       el("input", { class: "stname grow", value: m.name || "", oninput: e => { m.name = e.target.value; scheduleSave(); } }),
-      el("input", { class: "stsz mono", value: m.size || 1, title: "size (bytes)", oninput: e => { m.size = parseIntLoose(e.target.value) || 1; scheduleSave(); } }),
+      el("input", { class: "stsz mono", value: m.size || 1, title: "member size (bytes); a pointer is " + (A.binary && A.binary.bits === 32 ? 4 : 8), oninput: e => { m.size = parseIntLoose(e.target.value) || 1; scheduleSave(); } }),
       el("span", { class: "sttype mono faint", title: m.type || "" }, (m.type || "").slice(0, 16) + (m.is_ptr ? " *" : "")),
-      el("div", { class: "seg stseg" },
-        el("div", { class: "segbtn" + (sym ? " on" : ""), onclick: () => { m.mode = "sym"; scheduleSave(); render(); } }, "sym"),
-        el("div", { class: "segbtn" + (!sym ? " on" : ""), onclick: () => { m.mode = "fixed"; scheduleSave(); render(); } }, "fix")),
-      sym ? el("span", { class: "faint stvalph" }, "symbolic")
-          : el("input", { class: "stval mono", value: m.value ?? 0, oninput: e => { m.value = parseIntLoose(e.target.value); scheduleSave(); } }),
+      el("div", { class: "seg stseg", title: "sym = fresh symbolic field · fix = pinned value · ptr = points at a real sub-region" },
+        el("div", { class: "segbtn" + (!isFixed && !isPtr ? " on" : ""), onclick: () => { m.mode = "sym"; scheduleSave(); render(); } }, "sym"),
+        el("div", { class: "segbtn" + (isFixed ? " on" : ""), onclick: () => { m.mode = "fixed"; scheduleSave(); render(); } }, "fix"),
+        el("div", { class: "segbtn" + (isPtr ? " on" : ""), title: "pointer to a sub-buffer / sub-struct",
+          onclick: () => { m.mode = "pointer"; m.size = (A.binary && A.binary.bits === 32) ? 4 : 8; m.target = m.target || { size: 64, layout: [] }; scheduleSave(); render(); } }, "ptr")),
+      valCol,
       (m.is_struct && m.type_name) ? btn("⤷", () => expandMember(m, i), "tiny ghost", "expand nested struct into its fields") : null,
       btn("✕", () => { bufr.layout.splice(i, 1); scheduleSave(); render(); }, "tiny ghost"));
   };
