@@ -202,15 +202,29 @@ class Run:
             except Exception as e:
                 log.warning("snapshot rebase failed: %s", e)
 
-        pc = int(snap.get("pc", self.func_addr))
+        _regs = snap.get("regs") or {}
+        # pc: top-level `pc` is authoritative (a caller can seed mid-function); if it's
+        # absent, fall back to the CAPTURED pc in regs (a raw lldb dump has no top-level
+        # pc) rather than silently restarting at the function entry.
+        _IP = ("pc", "ip", "rip", "eip")
+        _pc = snap.get("pc")
+        if _pc is None:
+            _pc = next((_regs[k] for k in _regs if k.lower() in _IP), None)
+        pc = int(_pc) if _pc is not None else self.func_addr
         state = self.project.factory.blank_state(addr=pc, add_options=opts)
-        # Set the captured registers, but never let a saved pc/ip in `regs` clobber the
-        # start address: `pc` (above) is authoritative so a caller can seed mid-function.
-        for r, v in (snap.get("regs") or {}).items():
-            if r.lower() in ("pc", "ip"):
+        # Set the captured registers. Map common capture names to angr's (lldb calls
+        # x29/x30 fp/lr), and size each value by the register's REAL width so a 128-bit
+        # NEON reg (v0..v31) isn't truncated to 64 bits.
+        _ALIAS = {"fp": "x29", "lr": "x30", "w0": None}   # (sub-regs handled below)
+        regmap = getattr(self.arch, "registers", {}) or {}
+        for r, v in _regs.items():
+            rl = r.lower()
+            if rl in _IP:
                 continue
+            name = _ALIAS.get(rl, rl) or rl
             try:
-                setattr(state.regs, r, claripy.BVV(int(v), self.arch.bits))
+                bits = regmap[name][1] * 8 if name in regmap else self.arch.bits
+                setattr(state.regs, name, claripy.BVV(int(v) & ((1 << bits) - 1), bits))
             except Exception as e:
                 log.warning("snapshot reg %s: %s", r, e)
         state.regs.pc = claripy.BVV(pc, self.arch.bits)

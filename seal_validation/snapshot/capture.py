@@ -20,14 +20,27 @@ def dump(frame, loc, extra, d):
     regs = {}
     for rset in frame.GetRegisters():
         for r in rset:
-            try: regs[r.GetName()] = r.GetValueAsUnsigned()
-            except Exception: pass
+            try:
+                u = r.GetValueAsUnsigned()
+                # GetValueAsUnsigned truncates / fails for 128-bit NEON regs (v0..v31) —
+                # read the raw bytes instead so vector state is captured, not dropped.
+                data = r.GetData()
+                nbytes = data.GetByteSize() if data else 0
+                if nbytes > 8:
+                    e2 = lldb.SBError()
+                    raw = data.ReadRawData(e2, 0, nbytes)
+                    regs[r.GetName()] = int.from_bytes(bytes(raw), "little") if e2.Success() else u
+                else:
+                    regs[r.GetName()] = u
+            except Exception:
+                pass
     err = lldb.SBError()
     def rd(a, n):
         b = p.ReadMemory(a, n, err); return b.hex() if (err.Success() and b) else None
     gv = lambda n: frame.FindRegister(n).GetValueAsUnsigned()
     x0, sp = gv("x0"), gv("sp")
     snap = {"arch": "AARCH64", "func": "aa_lineto", "cg_text_base": base, "aa_offset": OFF,
+            "pc": gv("pc"),                          # top-level pc (SEAL's restore prefers this)
             "regs": regs,
             "mem": {hex(x0): rd(x0, 8192), hex(sp): rd(sp, 8192)}}
     open("/tmp/snap.json", "w").write(json.dumps(snap))
