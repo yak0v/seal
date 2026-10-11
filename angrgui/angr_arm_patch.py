@@ -328,12 +328,35 @@ def _op_f16_convert(self, args):
     raise UnsupportedIROpError(nm)
 
 
+def patch_lmdb_max_dbs(n: int = 512) -> None:
+    """angr's RuntimeDb (CFG edge spilling for big binaries) opens its LMDB with
+    max_dbs=10 — too few named sub-DBs for a large binary with many functions/analyses,
+    which fails with 'MDB_DBS_FULL'. SEAL doesn't use lmdb itself, so raise the limit on
+    every lmdb.open (version-proof: works however angr builds its kwargs). Idempotent."""
+    try:
+        import lmdb
+    except Exception:
+        return
+    if getattr(lmdb, "_seal_maxdbs_patched", False):
+        return
+    _orig_open = lmdb.open
+
+    def _open(path, *a, **kw):
+        if kw.get("max_dbs", 0) < n:
+            kw["max_dbs"] = n
+        return _orig_open(path, *a, **kw)
+
+    lmdb.open = _open
+    lmdb._seal_maxdbs_patched = True
+
+
 def apply() -> dict:
     """Install the handlers. Idempotent. Returns {op_name: 'ok'|error} for logging."""
     global _applied
     import angr.engines.vex.claripy.irop as irop
     from angr.errors import UnsupportedIROpError
 
+    patch_lmdb_max_dbs()                              # raise angr RuntimeDb's LMDB max_dbs
     if _applied:
         return {}
 
