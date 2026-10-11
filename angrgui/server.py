@@ -842,6 +842,18 @@ def _mcp_run(addr):
     return {"run_id": _start_run(_scenario_spec(a), source="agent")}
 
 
+def _mcp_show_function(addr, run_id=None, message=None):
+    """Explicitly ask the GUI to jump to this function (and optionally show a run),
+    overriding the user's 'follow agent' preference. The ONLY thing that moves the
+    user's view — ordinary configure/run do NOT, so concurrent agents don't thrash it."""
+    b = _need_binary()
+    a = _addr(addr)
+    name = _fname(a)
+    BUS.publish("focus", message or f"agent asks you to look at {name}",
+                func=a, run_id=run_id)
+    return {"ok": True, "addr": hex(a), "name": name, "run_id": run_id}
+
+
 def _mcp_script(addr):
     """The standalone angr script equivalent to this function's active scenario —
     a runnable .py an agent can hand to the user to reproduce the run outside SEAL."""
@@ -1497,6 +1509,10 @@ TOOL_DEFS = [
     {"name": "export_scenario", "description": "Bundle the active scenario's setup, the shared checks, and the latest run's "
      "findings + paths — the same data the GUI's Export produces.",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
+    {"name": "show_function", "description": "Ask the user's GUI to jump to this function (and optionally show a run_id's results). "
+     "Use this ONLY when you want the user to look at something specific — ordinary run/configure do NOT move the user's "
+     "view (so many agents can work at once without thrashing it). Pass a short `message` to say why.",
+     "inputSchema": {"type": "object", "properties": {**_A, "run_id": {"type": "string"}, "message": {"type": "string"}}, "required": ["addr"]}},
     {"name": "generate_script", "description": "The standalone, runnable angr Python script equivalent to this function's active "
      "scenario (same initial state, assumptions, limits). Hand it to the user to reproduce the run outside SEAL. It emits the "
      "int_overflow/assert/reach/avoid/custom checks; the breakpoint-driven bug-class checks (oob_read/oob_write/div_by_zero/"
@@ -1582,6 +1598,7 @@ _MCP_TOOLS = {
     "remove_check": lambda a: _mcp_remove_check(a["addr"], a["check"]),
     "export_scenario": lambda a: _mcp_export_scenario(a["addr"]),
     "generate_script": lambda a: _mcp_script(a["addr"]),
+    "show_function": lambda a: _mcp_show_function(a["addr"], a.get("run_id"), a.get("message")),
     "ida_connect": lambda a: _mcp_ida_connect(a.get("url"), a.get("host_header")),
     "ida_disconnect": lambda a: _mcp_ida_disconnect(),
     "ida_refresh": lambda a: _mcp_ida_refresh(),

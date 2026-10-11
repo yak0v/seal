@@ -58,7 +58,10 @@ const A = {
   _assume: null,
   activity: [],
   actOpen: false,
-  followAgent: true,
+  // Default OFF: don't auto-jump to an agent's runs — many agents work concurrently, so
+  // the view would thrash. An agent that WANTS to show you a function calls show_function
+  // (a "focus" event), which overrides this. Remembered per browser.
+  followAgent: (() => { try { return localStorage.getItem("followAgent") === "1"; } catch (e) { return false; } })(),
   models: { by_name: {}, by_site: {} },   // global function-return models (apply to every run)
 };
 
@@ -112,7 +115,9 @@ async function init() {
   $("#fsUp").addEventListener("click", () => { A.codeFs = Math.min(28, A.codeFs + 1); applyCodeFs(); });
   applyCodeFs();
   try { setPathsDock(localStorage.getItem("pathsDock") === "1", true); } catch (e) { setPathsDock(false, true); }
-  $("#followChk").addEventListener("change", e => { A.followAgent = e.target.checked; });
+  { const fc = $("#followChk"); if (fc) { fc.checked = A.followAgent;
+    fc.addEventListener("change", e => { A.followAgent = e.target.checked;
+      try { localStorage.setItem("followAgent", e.target.checked ? "1" : "0"); } catch (err) {} }); } }
   $("#bottomClose").addEventListener("click", () => {
     const bp = $("#bottomPanel"); bp.classList.toggle("collapsed");
     $("#bottomClose").textContent = bp.classList.contains("collapsed") ? "▴" : "▾";
@@ -2954,10 +2959,26 @@ function handleEvent(ev) {
   if (A.activity.length > 120) A.activity.pop();
   if (!A.actOpen) { A._actUnseen = (A._actUnseen || 0) + 1; }
   renderActivity();
-  if (ev.type === "config" && ev.func != null) onAgentConfig(ev.func);
+  if (ev.type === "focus" && ev.func != null) onAgentFocus(ev);   // agent explicitly asked to show this (#7)
+  else if (ev.type === "config" && ev.func != null) onAgentConfig(ev.func);
   else if (ev.type === "run" && ev.func != null) onAgentRun(ev);
   else if (ev.type === "ida") refreshIdaStatus();
   else if (ev.type === "load") refreshState();
+}
+
+// An agent called show_function(addr): jump to it REGARDLESS of followAgent, and if a
+// run_id came along, show that run's results.
+async function onAgentFocus(ev) {
+  await loadFunctions();
+  const f = A.functions.find(x => x.addr === ev.func);
+  if (!f) return;
+  if (!A.fn || A.fn.addr !== ev.func) await selectFunction(f);
+  if (ev.message) toast(ev.message);
+  if (ev.run_id) {
+    A.run = { id: ev.run_id, snapshot: { status: "pending", progress: { message: "agent run" } } };
+    A.selNode = null; A.pathHighlight = null;
+    renderRight(); startPolling(); selectTab("paths");
+  }
 }
 
 async function onAgentConfig(addr) {
