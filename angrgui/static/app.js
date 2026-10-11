@@ -17,14 +17,27 @@ const el = (tag, attrs = {}, ...kids) => {
 const hx = (n) => "0x" + (n >>> 0).toString(16);
 const hx64 = (n) => "0x" + BigInt(n).toString(16);
 
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  if (!r.ok) {
-    let msg = r.statusText;
-    try { msg = (await r.json()).detail || msg; } catch (e) {}
-    throw new Error(msg);
-  }
-  return r.json();
+// Global busy indicator (#5): any non-"quiet" request in flight > 250ms flashes a spinner
+// and a progress cursor, so a slow op (e.g. lazy function analysis) doesn't look stuck.
+let _busyN = 0, _busyTimer = null;
+function setBusy(on) {
+  const ind = document.getElementById("busyInd");
+  if (ind) ind.classList.toggle("on", on);
+  document.body.classList.toggle("busy", on);
+}
+function _busyStart() { if (++_busyN === 1 && !_busyTimer) _busyTimer = setTimeout(() => setBusy(true), 250); }
+function _busyEnd() { if (--_busyN <= 0) { _busyN = 0; clearTimeout(_busyTimer); _busyTimer = null; setBusy(false); } }
+async function api(path, opts, quiet) {
+  if (!quiet) _busyStart();
+  try {
+    const r = await fetch(path, opts);
+    if (!r.ok) {
+      let msg = r.statusText;
+      try { msg = (await r.json()).detail || msg; } catch (e) {}
+      throw new Error(msg);
+    }
+    return r.json();
+  } finally { if (!quiet) _busyEnd(); }
 }
 const jpost = (p, body) => api(p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 const jput = (p, body) => api(p, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -1416,7 +1429,7 @@ function stopPolling() { if (A.pollTimer) { clearInterval(A.pollTimer); A.pollTi
 async function pollRun() {
   if (!A.run) return;
   let snap;
-  try { snap = await api("/api/run/" + A.run.id); } catch (e) { stopPolling(); return; }
+  try { snap = await api("/api/run/" + A.run.id, undefined, true); } catch (e) { stopPolling(); return; }
   A.run.snapshot = snap;
   renderRight();
   renderTree();

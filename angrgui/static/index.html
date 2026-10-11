@@ -115,6 +115,11 @@ select{font-family:var(--sans)}
 .pill.bad{background:rgba(248,81,73,.15);color:var(--bad)}
 .pill.warn{background:rgba(227,179,65,.15);color:var(--warn)}
 .pill.info{background:rgba(88,166,255,.15);color:var(--info)}
+#busyInd{display:none;align-items:center;gap:6px;font-size:12px;color:var(--accent);margin-left:4px}
+#busyInd.on{display:inline-flex}
+.busyspin{width:12px;height:12px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:busyspin .7s linear infinite}
+@keyframes busyspin{to{transform:rotate(360deg)}}
+body.busy{cursor:progress}
 .notebook{padding:10px 12px;overflow:auto;height:100%}
 .nbsec{margin-bottom:16px}
 .nbhead{display:flex;gap:10px;align-items:center;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--line)}
@@ -641,6 +646,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
   <button id="openBtn" class="tiny">Open binary…</button>
   <button id="idaBtn" class="tiny" title="Connect to an IDA MCP server for real names + decompilation">IDA: off</button>
   <button id="actBtn" class="tiny" title="Live activity — actions from you and from agents (MCP)">Activity <span id="actBadge" class="actbadge"></span></button>
+  <span id="busyInd" title="working…"><span class="busyspin"></span>working…</span>
   <div class="binfo" id="binfo">no binary loaded</div>
   <div class="grow"></div>
   <div class="seg viewmode" id="viewMode" title="Setup = configure (both side panels shown) · Explore = read paths (both side panels hidden)">
