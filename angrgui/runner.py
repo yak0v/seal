@@ -150,6 +150,7 @@ class Run:
         self.checks = []
         self._state_checks = []
         self._setup_notes: list[str] = []       # diagnostics gathered while installing checks
+        self._wild_deref: dict = {}              # arg name -> count of reads through an un-set-up pointer
         self.hits: list[Hit] = []
         self.nodes: dict[int, PathNode] = {}
         self._node_counter = 0
@@ -346,6 +347,41 @@ class Run:
             except ExprError as e:
                 raise ValueError(f"assumption {src!r}: {e}")
         self.summary["assumptions_applied"] = applied
+
+        # AUTONOMIC VALIDATION CHECK: if the function dereferences a pointer-width
+        # symbolic arg that has NO buffer set up, the reads go to unmapped/zero memory
+        # and the whole analysis is meaningless (the exact "can't validate this function"
+        # trap). Record which arg variables are such un-set-up pointers, watch for reads
+        # through them, and surface it in the diagnostics.
+        self._wild_deref = {}
+        self._deref_candidates = {}            # claripy var name -> arg name
+        buffer_args = set(buffers.keys())
+        for i, a in enumerate(args):
+            nm = a.get("name") or f"arg{i}"
+            if (a.get("mode", "symbolic") == "symbolic" and not a.get("float")
+                    and int(a.get("size") or self.arch.bytes) == self.arch.bytes
+                    and nm not in buffer_args):
+                bv = named.get(nm)
+                if isinstance(bv, claripy.ast.BV) and bv.symbolic:
+                    for v in bv.variables:
+                        self._deref_candidates[v] = nm
+        if self._deref_candidates:
+            cand = set(self._deref_candidates)
+            lo, hi = self.func_addr, self.func_addr + self.func_size
+
+            def _on_wild_read(st):
+                try:
+                    ia = st.scratch.ins_addr
+                    if ia is None or not (lo <= ia < hi):
+                        return
+                    wa = st.inspect.mem_read_address
+                    if isinstance(wa, claripy.ast.BV) and wa.symbolic:
+                        for v in (wa.variables & cand):
+                            nm = self._deref_candidates[v]
+                            self._wild_deref[nm] = self._wild_deref.get(nm, 0) + 1
+                except Exception:
+                    pass
+            state.inspect.b("mem_read", when=angr.BP_BEFORE, action=_on_wild_read)
         return state
 
     # ----------------------------------------------------------- call models (hooks)
@@ -1124,6 +1160,16 @@ class Run:
         """Human-readable hints about why a run turned out the way it did — so a
         run that finds nothing explains itself instead of leaving the agent guessing."""
         notes = list(self._setup_notes)
+        # The big "can't actually validate this function" signal: it dereferenced a
+        # pointer arg that has no buffer behind it, so reads hit unmapped/zero memory.
+        if self._wild_deref:
+            who = ", ".join(f"{a} ({n} read{'s' if n != 1 else ''})"
+                            for a, n in sorted(self._wild_deref.items(), key=lambda kv: -kv[1]))
+            notes.append(
+                f"the function dereferenced pointer arg(s) with NO buffer set up — {who}. "
+                f"Those reads go to unmapped/zero memory, so this run is NOT a meaningful "
+                f"validation: declare a buffer for each such arg (configure buffers:[{{arg,size}}]), "
+                f"and for a struct arg give pointer members their own target (nested buffers).")
         enabled_checks = [c for c in self.spec.get("checks", []) if c.get("enabled", True)]
         unconstrained = len(getattr(simgr, "unconstrained", []))
         errored = len(getattr(simgr, "errored", []))
