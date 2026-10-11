@@ -270,6 +270,37 @@ result = json.dumps({"path": p, "name": os.path.basename(p),
                      "readable": bool(p and os.path.isfile(p))})
 """
 
+# Full Hex-Rays pseudocode, line COUNT then a [start,end) slice — so a long function
+# can be fetched in chunks under the server's per-call output cap (#2).
+_PSEUDO_COUNT_BODY = r"""import json, ida_hexrays, ida_funcs
+ida_hexrays.init_hexrays_plugin()
+f = ida_funcs.get_func(%d)
+cf = ida_hexrays.decompile(f.start_ea)
+result = json.dumps({"total": cf.get_pseudocode().size(), "start": int(f.start_ea)})
+"""
+
+_PSEUDO_LINES_BODY = r"""import json, ida_hexrays, ida_funcs, ida_lines
+ida_hexrays.init_hexrays_plugin()
+f = ida_funcs.get_func(%d)
+cf = ida_hexrays.decompile(f.start_ea)
+sl = cf.get_pseudocode()
+n = sl.size()
+out = [ida_lines.tag_remove(sl[i].line) for i in range(%d, min(%d, n))]
+result = json.dumps({"lines": out})
+"""
+
+
+def _looks_truncated(code: str) -> bool:
+    """A complete Hex-Rays function ends with '}' and has balanced braces. If not, the
+    server almost certainly capped its output mid-function."""
+    if not code:
+        return False
+    stripped = code.rstrip()
+    if stripped.endswith("}"):
+        return code.count("{") > code.count("}")
+    return True
+
+
 # Read a [off, off+len) slice of IDA's input file as base64. Chunked by the caller.
 _READ_FILE_BODY = r"""import json, base64, ida_nalt
 p = ida_nalt.get_input_file_path()
@@ -400,7 +431,25 @@ class IdaSession:
                 if isinstance(res, dict) and isinstance(res.get("result"), dict):
                     res = res["result"]
                 if isinstance(res, dict) and res.get("code"):
-                    out = {"requested": ea, "kind": "pseudocode", "code": res["code"]}
+                    code = res["code"]
+                    out = {"requested": ea, "kind": "pseudocode", "code": code}
+                    # The community server caps its tool output (~32 KB), so a LONG
+                    # function comes back truncated (only the start). If the code looks
+                    # cut off and the server has py_eval, re-fetch the FULL pseudocode in
+                    # chunks so the whole function shows instead of just the start (#2).
+                    if _looks_truncated(code) and self._eval_tool() is not None:
+                        try:
+                            full = self._full_pseudocode(ea)
+                            if full and full.get("code"):
+                                out["code"] = full["code"]
+                                out["full_via"] = "py_eval"
+                        except MCPError as e:
+                            out["truncated"] = True
+                            out["note"] = f"IDA returned a truncated decompilation and the full re-fetch failed: {e}"
+                    elif _looks_truncated(code):
+                        out["truncated"] = True
+                        out["note"] = ("IDA returned a truncated decompilation (the IDA server capped its "
+                                       "output) and this server has no py_eval to re-fetch the rest.")
                 else:
                     out = {"requested": ea, "kind": "error", "code": "", "note": str(res)[:200]}
             else:
@@ -528,6 +577,25 @@ class IdaSession:
         if not isinstance(out, dict):
             raise MCPError(f"unexpected IDAPython result: {str(out)[:200]}")
         return out
+
+    def _full_pseudocode(self, ea: int) -> dict:
+        """The COMPLETE Hex-Rays pseudocode, fetched in line-chunks so a long function
+        isn't cut off by the server's per-call output cap (#2). Runs via the server's
+        python-eval tool (execute_python / py_eval)."""
+        info = self._eval_json(_PSEUDO_COUNT_BODY % int(ea))
+        total = int(info.get("total", 0) or 0)
+        lines: list[str] = []
+        CH, off = 120, 0
+        while off < total and len(lines) < 100000:
+            part = self._eval_json(_PSEUDO_LINES_BODY % (int(ea), off, off + CH))
+            got = part.get("lines") or []
+            if not got:
+                break
+            lines.extend(got)
+            off += len(got)
+            if len(got) < CH:
+                break
+        return {"start": info.get("start"), "kind": "pseudocode", "code": "\n".join(lines)}
 
     def input_file_info(self) -> dict:
         """What IDA knows about the original input file: name, path (on the IDA

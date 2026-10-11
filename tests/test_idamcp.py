@@ -25,6 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from angrgui.idamcp import IdaSession, MCPClient, MCPError   # noqa: E402
 
 FUNCS = [[0x400650, "validate"], [0x4006f0, "dispatch"], [0x400230, "main"]]
+# a long, COMPLETE pseudocode function (300 body lines + braces) to exercise chunked
+# re-fetch: the fake `decompile` tool returns only the first 3 lines (truncated).
+FULL_PSEUDO = ["int __fastcall validate(int a)", "{", "  int v = a;"] + \
+              [f"  v += {i};" for i in range(300)] + ["  return v;", "}"]
 INPUT_BYTES = bytes(range(256)) * 37 + b"\xde\xad\xbe\xef"   # the fake IDA's "input file"
 INPUT_PATH = "/ida-host/only/target.bin"                     # not reachable on this machine
 PSEUDOCODE = "int __fastcall validate(unsigned int user, unsigned int code)\n{\n  return 0;\n}"
@@ -134,9 +138,16 @@ class FakeCommunityEval(_Base):
             data = [{"addr": hex(ea), "name": nm, "size": "0x10"} for ea, nm in FUNCS]
             return {"result": [{"data": data}]}
         if name == "decompile":
-            return {"addr": args.get("addr"), "code": PSEUDOCODE, "line_count": 3}
+            # simulate the server capping output: return a TRUNCATED function (no close)
+            return {"addr": args.get("addr"), "code": "\n".join(FULL_PSEUDO[:3]), "line_count": 3}
         if name == "py_eval":
             code = args.get("code", "")
+            if "get_pseudocode().size()" in code:          # _PSEUDO_COUNT_BODY
+                return {"result": json.dumps({"total": len(FULL_PSEUDO), "start": 0x400650})}
+            if "ida_lines.tag_remove" in code:             # _PSEUDO_LINES_BODY chunk
+                a = int(re.search(r"range\((\d+),", code).group(1))
+                b = int(re.search(r"min\((\d+),", code).group(1))
+                return {"result": json.dumps({"lines": FULL_PSEUDO[a:b]})}
             if "base64.b64encode" in code:                 # read_input_file chunk
                 off = int(re.search(r"seek\((\d+)\)", code).group(1))
                 ln = int(re.search(r"read\((\d+)\)", code).group(1))
@@ -257,6 +268,27 @@ def test_community_py_eval_stream_fetch(community_eval, tmp_path):
     res = s.fetch_input_file(str(dest))
     assert res["via"] == "mcp-stream"
     assert dest.read_bytes() == INPUT_BYTES
+
+
+def test_truncated_decompilation_refetched_full(community_eval):
+    # the community server caps `decompile` output (truncated, no closing brace); when it
+    # has py_eval, decompile() re-fetches the COMPLETE pseudocode in chunks (#2).
+    s = IdaSession(community_eval)
+    s.connect()
+    d = s.decompile(0x400650)
+    assert d["kind"] == "pseudocode"
+    assert d.get("full_via") == "py_eval"
+    assert d["code"].rstrip().endswith("}")          # complete, not cut off
+    assert d["code"].count("\n") + 1 == len(FULL_PSEUDO)   # all 305 lines reassembled
+    assert "v += 299;" in d["code"]                  # the last body line survived
+
+
+def test_short_decompilation_not_refetched(community):
+    # a complete (short) decompilation is used as-is — no needless re-fetch.
+    s = IdaSession(community)
+    s.connect()
+    d = s.decompile(0x400650)
+    assert d["kind"] == "pseudocode" and "full_via" not in d
 
 
 def test_unreachable_server_raises_cleanly():
