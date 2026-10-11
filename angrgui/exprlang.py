@@ -21,7 +21,9 @@ Identifiers resolve, in this order, to
      narrower returns to width — `s32(ret)` / `u32(ret)` — or a signed test like
      `ret s>= 0` is always true.
 
-Comparisons are unsigned by default; prefix the operator with `s` for signed (s<, s<=, s>, s>=).
+Comparisons are unsigned by default; prefix with `s` for signed (s<, s<=, s>, s>=) or with
+`f` for FLOATING-POINT (f<, f<=, f>, f>=, f==, f!=). A float compare reinterprets each
+operand's bits as a 32/64-bit IEEE float; float literals like `1.0`/`3.14` are supported.
 Widths are matched automatically by zero-extending the narrower side.
 
 ROLE
@@ -77,12 +79,16 @@ import claripy
 # tried BEFORE the identifier rule, and they require a following <,>,= so a name
 # like `size` or `s` is never mistaken for an operator.
 TOKEN_RE = re.compile(
-    r"\s*(?:(?P<num>0x[0-9a-fA-F]+|0b[01]+|\d+)"
-    r"|(?P<op>s<=|s>=|s<|s>|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^~!<>()\[\]:,?])"
+    r"\s*(?:(?P<fnum>\d+\.\d+)"                       # float literal (1.0, 3.14) — before int
+    r"|(?P<num>0x[0-9a-fA-F]+|0b[01]+|\d+)"
+    # signed (s..) and FLOAT (f..) comparison operators, before the identifier rule
+    r"|(?P<op>s<=|s>=|s<|s>|f<=|f>=|f<|f>|f==|f!=|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^~!<>()\[\]:,?])"
     r"|(?P<id>[A-Za-z_][A-Za-z0-9_.]*))"
 )
 
-CMP_OPS = {"<", "<=", ">", ">=", "==", "!=", "s<", "s<=", "s>", "s>="}
+CMP_OPS = {"<", "<=", ">", ">=", "==", "!=", "s<", "s<=", "s>", "s>=",
+           "f<", "f<=", "f>", "f>=", "f==", "f!="}
+FCMP_OPS = {"f<", "f<=", "f>", "f>=", "f==", "f!="}
 
 
 class ExprError(ValueError):
@@ -99,7 +105,9 @@ def tokenize(src: str):
         if not m:
             raise ExprError(f"unexpected character {src[pos]!r} at {pos}")
         pos = m.end()
-        if m.group("num") is not None:
+        if m.group("fnum") is not None:
+            out.append(("fnum", float(m.group("fnum"))))
+        elif m.group("num") is not None:
             out.append(("num", int(m.group("num"), 0)))
         elif m.group("id") is not None:
             out.append(("id", m.group("id")))
@@ -107,6 +115,24 @@ def tokenize(src: str):
             out.append(("op", m.group("op")))
     out.append(("eof", None))
     return out
+
+
+_FRNE = claripy.fp.RM.RM_NearestTiesEven
+
+
+def _as_double(x):
+    """Coerce an operand to a 64-bit float for a float comparison: an int/float literal
+    becomes that value; a BV is REINTERPRETED (its IEEE bits) as a 32- or 64-bit float
+    and widened to double; an FP is widened if needed."""
+    if isinstance(x, (int, float)):
+        return claripy.FPV(float(x), claripy.FSORT_DOUBLE)
+    if isinstance(x, claripy.ast.FP):
+        return x if x.sort == claripy.FSORT_DOUBLE else claripy.fpToFP(_FRNE, x, claripy.FSORT_DOUBLE)
+    if x.size() == 64:
+        return x.raw_to_fp()
+    if x.size() == 32:
+        return claripy.fpToFP(_FRNE, x.raw_to_fp(), claripy.FSORT_DOUBLE)
+    raise ExprError(f"cannot compare a {x.size()}-bit value as a float (need 32 or 64 bits)")
 
 
 def _bv(x, bits=64):
@@ -180,7 +206,15 @@ class ClaripyOps:
             b = _bv(b, a.size())
         return claripy.If(_truth(c), a, b)
 
+    def fconst(self, v):
+        return claripy.FPV(float(v), claripy.FSORT_DOUBLE)
+
     def cmp(self, op, a, b):
+        if op in FCMP_OPS:                           # FLOAT comparison: reinterpret bits as fp
+            fa, fb = _as_double(a), _as_double(b)
+            return {"f<": claripy.fpLT, "f<=": claripy.fpLEQ, "f>": claripy.fpGT,
+                    "f>=": claripy.fpGEQ, "f==": claripy.fpEQ,
+                    "f!=": lambda x, y: claripy.Not(claripy.fpEQ(x, y))}[op](fa, fb)
         signed = op.startswith("s")
         a, b = _match(a, b, signed)
         if isinstance(a, int):
@@ -314,6 +348,9 @@ class Parser:
 
     def p_atom(self):
         t = self.peek()
+        if t[0] == "fnum":
+            self.take()
+            return self.ops.fconst(t[1])
         if t[0] == "num":
             self.take()
             return t[1]

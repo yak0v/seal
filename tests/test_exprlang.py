@@ -91,3 +91,24 @@ def test_errors():
             assert False, bad
         except ExprError:
             pass
+
+
+def test_float_comparisons():
+    """f</f<=/f>/f>=/f==/f!= reinterpret operand bits as IEEE floats; float literals parse."""
+    import struct
+    import claripy
+    from angrgui.exprlang import Parser, validate_expr
+
+    def dbits(v): return claripy.BVV(struct.unpack("<Q", struct.pack("<d", v))[0], 64)
+    def fbits(v): return claripy.BVV(struct.unpack("<I", struct.pack("<f", v))[0], 32)
+    env = {"x": dbits(2.0), "y": fbits(0.5)}
+
+    def ev(expr):
+        e = Parser(expr, lambda n: env[n], {}).parse()
+        return bool(claripy.backends.concrete.eval(e, 1)[0])
+
+    assert validate_expr("x f> 1.0")                 # syntax ok
+    assert ev("x f> 1.0") and not ev("x f< 1.0")
+    assert ev("x f== 2.0") and ev("x f>= 2.0")
+    assert ev("y f< 1.0")                            # 32-bit float widened to double
+    assert ev("x f> 1")                              # integer literal treated as 1.0
