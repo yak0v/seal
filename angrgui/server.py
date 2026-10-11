@@ -942,6 +942,68 @@ def _mcp_list_runs(func=None, limit=50):
             for r in recs]
 
 
+def _mcp_review_run(run_id, verdict, note=None):
+    """User verdict on a run: good (keep) | bad (discard/wrong) | refine (needs work).
+    The agent reads these via list_reviews to redo the refine/bad ones."""
+    if S.workspace is None:
+        raise HTTPException(400, "no workspace")
+    v = str(verdict).lower()
+    if v not in ("good", "bad", "refine"):
+        raise HTTPException(400, "verdict must be good | bad | refine")
+    rec = S.workspace.update_run(run_id, review=v, **({"note": note} if note is not None else {}))
+    if rec is None:
+        raise HTTPException(404, "no such run")
+    BUS.publish("review", f"run {run_id[:8]} reviewed: {v}" + (f" — {note}" if note else ""),
+                run_id=run_id, verdict=v, func=rec.get("func"))
+    return {"ok": True, "id": run_id, "review": v, "note": rec.get("note")}
+
+
+def _mcp_list_reviews(func=None, verdict=None):
+    """Run records the USER has reviewed — the agent's feedback inbox. Filter by verdict
+    (good|bad|refine): the agent typically redoes `refine`/`bad` ones."""
+    recs = S.workspace.runs(_addr(func) if func is not None else None) if S.workspace else []
+    recs = [r for r in recs if r.get("review")]
+    if verdict:
+        recs = [r for r in recs if r.get("review") == str(verdict).lower()]
+    recs = sorted(recs, key=lambda r: r.get("when", 0), reverse=True)
+    return [{"id": r["id"], "func": hex(r["func"]), "func_name": r.get("func_name"),
+             "review": r.get("review"), "note": r.get("note"), "scenario": r.get("scenario"),
+             "when": r.get("when"), "findings": (r.get("summary") or {}).get("hits", len(r.get("findings") or []))}
+            for r in recs]
+
+
+def _mcp_note_run(run_id, note):
+    """Attach a free-text comment to a run (what you/the agent think of it)."""
+    rec = S.workspace.update_run(run_id, note=note) if S.workspace else None
+    if rec is None:
+        raise HTTPException(404, "no such run")
+    return {"ok": True, "id": run_id, "note": note}
+
+
+def _mcp_add_target(func, note=None):
+    """Queue a function for the agent to test next (shared TODO)."""
+    _need_binary()
+    a = _addr(func)
+    S.workspace.add_target(a, note)
+    BUS.publish("target", f"queued {_fname(a)} for testing" + (f" — {note}" if note else ""), func=a)
+    return {"ok": True, "func": hex(a), "name": _fname(a), "note": note}
+
+
+def _mcp_list_targets(status="open"):
+    """The TODO queue of functions to test. status: open (default) | done | all."""
+    ts = S.workspace.targets(None if status == "all" else status) if S.workspace else []
+    return [{"func": hex(t["func"]), "name": _fname(t["func"]), "note": t.get("note"),
+             "status": t.get("status"), "by": t.get("by")} for t in ts]
+
+
+def _mcp_resolve_target(func, status="done"):
+    a = _addr(func)
+    rec = S.workspace.update_target(a, status=status) if S.workspace else None
+    if rec is None:
+        raise HTTPException(404, "no such target")
+    return {"ok": True, "func": hex(a), "status": status}
+
+
 def _mcp_get_run(run_id):
     r = S.runs.get(run_id)
     if r is None:
@@ -1566,6 +1628,25 @@ TOOL_DEFS = [
      "shared, so you can see the user's and other agents' results. `func` (addr/name) limits to one function. Get full "
      "findings for one via get_run(run_id). Each row has review (good/bad/refine, set by the user) and note.",
      "inputSchema": {"type": "object", "properties": {"func": {"type": "string"}, "limit": {"type": "integer", "default": 50}}}},
+    {"name": "list_reviews", "description": "The USER's feedback inbox: run records the user reviewed. Filter by verdict "
+     "(good|bad|refine). Check this to find results the user wants redone — typically re-run the 'refine' and 'bad' ones "
+     "with a better setup — and to see what they confirmed as real ('good').",
+     "inputSchema": {"type": "object", "properties": {"func": {"type": "string"},
+                     "verdict": {"type": "string", "enum": ["good", "bad", "refine"]}}}},
+    {"name": "review_run", "description": "Record a verdict on a run: good (real/keep) | bad (wrong/discard) | refine (needs a "
+     "better setup). Optional note. Normally the USER does this in the GUI; the agent reads them via list_reviews.",
+     "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"},
+                     "verdict": {"type": "string", "enum": ["good", "bad", "refine"]}, "note": {"type": "string"}},
+                     "required": ["run_id", "verdict"]}},
+    {"name": "note_run", "description": "Attach a free-text comment to a run (what you think of the result).",
+     "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}, "note": {"type": "string"}}, "required": ["run_id", "note"]}},
+    {"name": "add_target", "description": "Queue a function for testing next (shared TODO). Use to record functions worth a look.",
+     "inputSchema": {"type": "object", "properties": {"func": {"type": "string"}, "note": {"type": "string"}}, "required": ["func"]}},
+    {"name": "list_targets", "description": "The TODO queue of functions to test (status: open | done | all) — the user's "
+     "requests for what to analyze next. Work through the open ones, then resolve_target them.",
+     "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["open", "done", "all"]}}}},
+    {"name": "resolve_target", "description": "Mark a queued target done (or status=open to re-open).",
+     "inputSchema": {"type": "object", "properties": {"func": {"type": "string"}, "status": {"type": "string", "enum": ["done", "open"]}}, "required": ["func"]}},
     {"name": "load_binary", "description": "Load an ELF binary by absolute path (replaces the current one). Analyses before returning.",
      "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "add_scenario", "description": "Add a scenario (a separate initial-state setup) to a function and make it active. "
@@ -1682,6 +1763,12 @@ _MCP_TOOLS = {
     "generate_script": lambda a: _mcp_script(a["addr"]),
     "show_function": lambda a: _mcp_show_function(a["addr"], a.get("run_id"), a.get("message")),
     "list_runs": lambda a: _mcp_list_runs(a.get("func"), a.get("limit", 50)),
+    "list_reviews": lambda a: _mcp_list_reviews(a.get("func"), a.get("verdict")),
+    "review_run": lambda a: _mcp_review_run(a["run_id"], a["verdict"], a.get("note")),
+    "note_run": lambda a: _mcp_note_run(a["run_id"], a["note"]),
+    "add_target": lambda a: _mcp_add_target(a["func"], a.get("note")),
+    "list_targets": lambda a: _mcp_list_targets(a.get("status", "open")),
+    "resolve_target": lambda a: _mcp_resolve_target(a["func"], a.get("status", "done")),
     "ida_connect": lambda a: _mcp_ida_connect(a.get("url"), a.get("host_header")),
     "ida_disconnect": lambda a: _mcp_ida_disconnect(),
     "ida_refresh": lambda a: _mcp_ida_refresh(),

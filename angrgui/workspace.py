@@ -169,6 +169,36 @@ class Workspace:
                     return dict(r)
         return None
 
+    # ------------------------------------------------------------- targets / TODO (#9)
+    # Functions the user wants tested next, as a shared work queue for the agents.
+    def add_target(self, func: int, note: str | None = None, by: str = "user") -> dict:
+        with self._lock:
+            targets = self.data.setdefault("targets", [])
+            rec = next((t for t in targets if t.get("func") == int(func)), None)
+            if rec is None:
+                rec = {"func": int(func), "note": note, "by": by, "status": "open"}
+                targets.append(rec)
+            else:                            # re-opening / updating an existing one
+                if note is not None:
+                    rec["note"] = note
+                rec["status"] = "open"
+            self._save_locked()
+            return dict(rec)
+
+    def targets(self, status: str | None = None) -> list:
+        with self._lock:
+            out = [dict(t) for t in self.data.get("targets", [])]
+        return [t for t in out if status is None or t.get("status") == status]
+
+    def update_target(self, func: int, **fields) -> dict | None:
+        with self._lock:
+            for t in self.data.get("targets", []):
+                if t.get("func") == int(func):
+                    t.update(fields)
+                    self._save_locked()
+                    return dict(t)
+        return None
+
     # ------------------------------------------------------------- shape helpers
     @staticmethod
     def _default_scenario(name: str = "Default") -> dict:
