@@ -1642,6 +1642,7 @@ const END_STYLE = {
   returned: ["ok", "returned"], exit: ["warn", "exit"], ended: ["", "ended"],
   loop_bound: ["", "loop bound"], dropped: ["", "dropped"], unconstrained: ["bad", "hijackable"],
   unknown_call: ["warn", "unknown call"], error: ["warn", "error"], unfinished: ["info", "unfinished"], running: ["info", "running"],
+  left_image: ["", "left the image"],
 };
 let treeKey = "";
 
@@ -1982,7 +1983,7 @@ function pathsSummary(T, snap) {
   const counts = {};
   leaves.forEach(n => { const r = leafReason(n, snap); counts[r] = (counts[r] || 0) + 1; });
   const names = { returned: "returned", exit: "exited the program", ended: "ended", loop_bound: "stopped by the loop bound",
-    dropped: "dropped (max active)", unconstrained: "hijackable jump", unknown_call: "unknown call target", error: "errored", unfinished: "unfinished", running: "still running" };
+    dropped: "dropped (max active)", unconstrained: "hijackable jump", unknown_call: "unknown call target", error: "errored", unfinished: "unfinished", running: "still running", left_image: "tail-called out of the image" };
   const parts = Object.entries(counts).map(([r, c]) => el("span", { class: "pill " + (END_STYLE[r]?.[0] || "") }, `${c} ${names[r] || r}`));
   const hits = snap.hits.length;
   return el("div", { class: "psum" },

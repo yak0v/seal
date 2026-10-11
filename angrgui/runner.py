@@ -774,6 +774,22 @@ class Run:
             pass
         return None
 
+    def _is_hooked(self, addr) -> bool:
+        try:
+            return self.project.is_hooked(int(addr))
+        except Exception:
+            return False
+
+    def _addr_mapped(self, addr) -> bool:
+        """Is `addr` inside some loaded object? A concrete IP that isn't means execution
+        branched into a module we don't have (an unloaded dyld-cache dylib)."""
+        if not isinstance(addr, int):
+            return True
+        try:
+            return self.project.loader.find_object_containing(addr) is not None
+        except Exception:
+            return True                              # unsure -> don't treat as unmapped
+
     def _symbolic_ip_fate(self, s) -> str:
         """A symbolic IP from a call through a function pointer is an *unknown call
         target* (we just don't know which function to run — model it), not a
@@ -822,6 +838,14 @@ class Run:
             node.end = {"reason": "exit", "text": f"called {name}(), the program stops"}
         elif fate == "deadended":
             node.end = {"reason": "ended", "text": "execution ended"}
+        elif fate == "left_image":
+            nm = self.binary.name_at(last)
+            node.end = {"reason": "left_image",
+                        "text": ("tail-called out of the loaded image"
+                                 + (f" from {nm}" if nm else "")
+                                 + " — the branch target is in a module not loaded here (e.g. an "
+                                 "unloaded dyld-cache dylib). The path ends cleanly instead of "
+                                 "erroring on unmapped code.")}
         elif fate == "pruned":
             node.end = {"reason": "loop_bound",
                         "text": f"stopped: a loop ran more than {self._loop_bound} times (loop bound)"}
@@ -1099,6 +1123,15 @@ class Run:
             # letting it crash or spin, and take it out of the active search.
             if sym_ip and fate == "active":
                 fate = self._symbolic_ip_fate(s)
+                hijacked.append(s)
+            elif (fate == "active" and isinstance(addr, int) and addr != self._return_addr
+                  and not self._is_hooked(addr) and not self._addr_mapped(addr)):
+                # concrete IP in NO loaded object (and not our return sentinel / a hook):
+                # a tail-call / branch into code we don't have (an unloaded dyld-cache
+                # dylib, a PLT stub's target in another image). skip_calls only skips
+                # CALLs, not tail branches, so without this the path errors on unmapped
+                # bytes. End it cleanly as "left the image" instead.
+                fate = "left_image"
                 hijacked.append(s)
             pn = s.globals.get("angrgui_node")
             recent = list(s.history.recent_bbl_addrs)
