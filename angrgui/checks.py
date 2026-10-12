@@ -537,9 +537,43 @@ class NarrowingCastCheck(BaseCheck):
     def install(self, state):
         state.inspect.b("expr", when=angr.BP_AFTER, action=self._on_expr)
 
+    # Instructions that genuinely narrow a value. The VECTOR (Concat) shape only ever
+    # comes from these NEON ops, so it is allow-listed; anything else producing a
+    # Concat-of-low-halves (logical masks, byte shuffles) is not a narrowing cast.
+    _NARROW_VEC = {
+        "xtn", "xtn2", "uqxtn", "uqxtn2", "sqxtn", "sqxtn2", "sqxtun", "sqxtun2",
+        "shrn", "shrn2", "rshrn", "rshrn2", "sqshrn", "uqshrn", "sqrshrn", "uqrshrn",
+        "addhn", "addhn2", "subhn", "subhn2", "raddhn", "raddhn2", "rsubhn", "rsubhn2",
+        "fcvtn", "fcvtn2", "fcvtxn", "fcvtxn2",
+        "fcvtzs", "fcvtzu", "fcvtns", "fcvtnu", "fcvtms", "fcvtmu",
+        "fcvtps", "fcvtpu", "fcvtas", "fcvtau",
+    }
+    # Scalar bit-reshuffles that are NOT narrowing casts even though a truncated
+    # sub-expression of theirs can look like one.
+    _NOT_NARROW_SCALAR = {
+        "and", "ands", "orr", "orn", "eor", "eon", "bic", "bics", "mvn",
+        "bfi", "bfc", "bfxil", "bfm", "sbfm", "ubfm", "sbfiz", "ubfiz", "sbfx", "ubfx",
+        "movk", "movn", "movz", "mov", "mvni", "lsl", "lslv", "lsr", "lsrv",
+        "asr", "asrv", "ror", "rorv", "extr", "rev", "rev16", "rev32", "rbit",
+        "clz", "cls", "dup", "ins", "umov", "smov",
+        # compares / conditionals / branches only CONSUME a (possibly narrowed) value —
+        # the narrowing, if any, is at the instruction that produced it, not here.
+        "cmp", "cmn", "tst", "ccmp", "ccmn", "cbz", "cbnz", "tbz", "tbnz",
+        "csel", "cset", "csetm", "csinc", "csinv", "csneg", "cinc", "cinv", "cneg",
+        "b", "br", "blr", "bl", "ret", "beq", "bne",
+    }
+
+    def _is_narrowing_insn(self, mn, shape):
+        if not mn:
+            return False
+        mn = mn.lower()
+        if shape == "vector":
+            return mn in self._NARROW_VEC
+        return mn not in self._NOT_NARROW_SCALAR
+
     @staticmethod
     def _narrowing(r):
-        """Recognise a truncating narrow and return (small, big, dropped_bits) or None.
+        """Recognise a truncating narrow and return (small, big, dropped_bits, shape) or None.
 
         Two shapes:
           * scalar C cast  -> Extract(small-1:0, inner)          [inner wider, same value]
@@ -557,7 +591,7 @@ class NarrowingCastCheck(BaseCheck):
                 return None
             if not inner.symbolic:
                 return None
-            return small, big, inner[big - 1:small]
+            return small, big, inner[big - 1:small], "scalar"
         if r.op == "Concat":
             # NEON lane-narrowing (xtn/vmovn/…): the result is a Concat of per-lane low
             # halves. The shape VARIES after claripy simplification — a lane may be a bare
@@ -587,7 +621,7 @@ class NarrowingCastCheck(BaseCheck):
                     return None                 # Extract -> not a recognizable lane-narrowing
             if not dropped:
                 return None
-            return small, 2 * small, claripy.Concat(*dropped) if len(dropped) > 1 else dropped[0]
+            return small, 2 * small, (claripy.Concat(*dropped) if len(dropped) > 1 else dropped[0]), "vector"
         return None
 
     def _on_expr(self, state):
@@ -596,7 +630,7 @@ class NarrowingCastCheck(BaseCheck):
         nar = self._narrowing(r)
         if nar is None:
             return
-        small, big, dropped = nar
+        small, big, dropped, shape = nar
         ins_addr = state.scratch.ins_addr
         if ins_addr is None:
             return
@@ -604,6 +638,19 @@ class NarrowingCastCheck(BaseCheck):
             if ins_addr != self.addr:
                 return
         elif not self.ctx.in_target_function(ins_addr):
+            return
+        # Gate by the actual INSTRUCTION. The expr breakpoint fires on every VEX
+        # sub-expression, so bit-manipulation (and/orr/bic/bfxil/lsr…) and byte
+        # reassembly produce Concat/Extract shapes that LOOK like a narrow but aren't —
+        # that is how `and w8, w8, #0xffff0000` was being reported as a 16->8 narrowing.
+        # A real narrowing cast is one of a known set of instructions; require it.
+        mn = text = None
+        try:
+            insn = state.project.factory.block(ins_addr, num_inst=1).capstone.insns[0]
+            mn, text = insn.mnemonic, f"{insn.mnemonic} {insn.op_str}".strip()
+        except Exception:
+            pass
+        if not self._is_narrowing_insn(mn, shape):
             return
         # a finding only if the bits we drop can actually be non-zero
         cond = dropped != 0
@@ -613,12 +660,6 @@ class NarrowingCastCheck(BaseCheck):
         except Exception:
             return
         witness = self._witness_with(state, [cond])
-        mn = text = None
-        try:
-            insn = state.project.factory.block(ins_addr, num_inst=1).capstone.insns[0]
-            mn, text = insn.mnemonic, f"{insn.mnemonic} {insn.op_str}".strip()
-        except Exception:
-            pass
         loc = self.ctx.line_for(ins_addr)
         if isinstance(loc, dict) and loc.get("line"):
             where = f" [{loc.get('file')}:{loc['line']}]"

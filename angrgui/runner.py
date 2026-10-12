@@ -318,9 +318,23 @@ class Run:
         # Point the requested pointer arguments at fresh symbolic buffers (optionally
         # with a struct layout: specific members set to symbolic names, fixed values,
         # or POINTERS to their own sub-region — see _fill_region).
+        # Resolve a buffer's `arg` to an actual declared argument — accept the arg NAME or
+        # a positional alias (a0/a1… or arg0/arg1…). Without this, a buffer written as
+        # {arg:"a0"} against an argument named "p" silently fails to anchor: the pointer
+        # stays a wild symbolic address, the struct reads as unconstrained, and the run
+        # explores a single bogus path. (A mismatch is left as-is so it's still visible.)
+        def _resolve_argname(ref):
+            for a in args:
+                if a.get("name") == ref:
+                    return ref
+            m = re.fullmatch(r"(?:a|arg)(\d+)", str(ref))
+            if m and 0 <= int(m.group(1)) < len(args):
+                i = int(m.group(1))
+                return args[i].get("name") or f"arg{i}"
+            return ref
         buffers = {}
         for b in self.spec.get("buffers", []):
-            argname = b["arg"]
+            argname = _resolve_argname(b["arg"])
             buffers[argname] = (int(b.get("size", 64)), b.get("layout") or [])
 
         # stdin has to be handed to call_state: swapping state.posix.stdin afterwards
