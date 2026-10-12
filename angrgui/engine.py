@@ -157,8 +157,10 @@ class Binary:
         auto_lazy = nfunc_syms > 2000 or code_span > 3_000_000
         self.lazy = auto_lazy if lazy is None else lazy
         self._cfgs: dict[int, object] = {}       # func addr -> its scoped CFGFast
+        self._kbs: dict[int, object] = {}        # func addr -> its ISOLATED KnowledgeBase (see analyze_function)
         self._analyzed: set[int] = set()
-        self._regions: list[tuple] = []          # accumulated CFG regions (see analyze_function)
+        import threading
+        self._analysis_lock = threading.RLock()  # serialize CFG analysis (shared project/hooks)
         self._index: list[dict] = []             # all functions (lazy): {addr,name,size}
         self._index_addrs: list[int] = []
         self._name_by_addr: dict[int, str] = {}
@@ -218,44 +220,44 @@ class Binary:
         return self._index_addrs[i] if i >= 0 else None
 
     def analyze_function(self, fa: int):
-        """Build (and cache) the CFG for one function, then make it the current CFG.
-        Idempotent; cheap on a cache hit."""
-        if fa in self._analyzed:
-            self.cfg = self._cfgs.get(fa, self.cfg)
-            return self.cfg
-        ent = next((e for e in self._index if e["addr"] == fa), None)
-        size = ent["size"] if ent else 0x8000
-        self._progress(f"analysing function @ {hex(fa)}")
-        # ACCUMULATE regions: a fresh CFGFast rebuilds kb.functions for only the regions
-        # it is given, EVICTING every previously-analysed function (so a second analyse
-        # made the first "no such function"). Re-run over the union of all analysed
-        # regions so the knowledge base keeps every function we've looked at.
-        region = (fa, fa + size)
-        if region not in self._regions:
-            self._regions.append(region)
-        cfg = self.project.analyses.CFGFast(
-            regions=list(self._regions), normalize=True, data_references=False)
-        try:
-            self.project.analyses.CompleteCallingConventions(recover_variables=False)
-        except Exception as e:
-            log.warning("calling convention analysis failed @ %s: %s", hex(fa), e)
-        try:
-            from . import angr_arm_patch
-            angr_arm_patch.patch_pac(self.project, fa, fa + size)
-        except Exception as e:
-            log.warning("PAC hooking skipped @ %s: %s", hex(fa), e)
-        self._cfgs[fa] = cfg
-        self._analyzed.add(fa)
-        self.cfg = cfg
-        return cfg
+        """Build (and cache) the CFG for one function in ITS OWN KnowledgeBase, then make
+        it the current CFG. Idempotent; cheap on a cache hit.
 
-    def _ensure(self, addr: int):
-        """Lazily analyse the function containing `addr` and make it current."""
-        if not self.lazy:
-            return
-        fa = self._containing(addr)
-        if fa is not None:
-            self.analyze_function(fa)
+        WHY an isolated kb per function (and never a shared, re-run CFGFast): we hook this
+        function's arm64e PAC instructions (pacibsp/retab/braa…) after recovering it, so the
+        runner can execute them. If a *later* function's analysis re-ran CFGFast over the
+        shared knowledge base, that re-run would hit this function's now-hooked ENTRY
+        (pacibsp) as a SimProcedure stub and collapse it to a single block — which is exactly
+        why previously-good functions showed one CFG node once another function was opened.
+        Building each function once into its own kb means an already-recovered function is
+        immutable: later hooks and analyses can't retro-corrupt it."""
+        with self._analysis_lock:
+            if fa in self._analyzed:
+                self.cfg = self._cfgs.get(fa, self.cfg)
+                return self.cfg
+            from angr.knowledge_base import KnowledgeBase
+            ent = next((e for e in self._index if e["addr"] == fa), None)
+            size = ent["size"] if ent else 0x8000
+            self._progress(f"analysing function @ {hex(fa)}")
+            kb = KnowledgeBase(self.project)
+            cfg = self.project.analyses.CFGFast(
+                kb=kb, regions=[(fa, fa + size)], normalize=True, data_references=False)
+            try:
+                self.project.analyses.CompleteCallingConventions(kb=kb, recover_variables=False)
+            except Exception as e:
+                log.warning("calling convention analysis failed @ %s: %s", hex(fa), e)
+            # Hook PAC only AFTER this function's own CFG is materialised (a hooked entry
+            # would otherwise collapse its CFG) — the kb is now frozen, so it's safe.
+            try:
+                from . import angr_arm_patch
+                angr_arm_patch.patch_pac(self.project, fa, fa + size)
+            except Exception as e:
+                log.warning("PAC hooking skipped @ %s: %s", hex(fa), e)
+            self._cfgs[fa] = cfg
+            self._kbs[fa] = kb
+            self._analyzed.add(fa)
+            self.cfg = cfg
+            return cfg
 
     # ------------------------------------------------------------------ meta
     @property
@@ -283,11 +285,34 @@ class Binary:
         return (top + 0xfffff) & ~0xfffff
 
     # ------------------------------------------------------------- functions
+    def _owner_addr(self, addr: int) -> int | None:
+        """Entry address of the (symbol-indexed) function containing addr."""
+        if not self.lazy:
+            return None
+        return addr if addr in self._name_by_addr else self._containing(addr)
+
+    def _kb_for(self, addr: int, analyze: bool = True):
+        """The ISOLATED KnowledgeBase holding the function that contains addr
+        (see analyze_function for why each function has its own kb). Analyses on demand."""
+        if not self.lazy:
+            return self.project.kb
+        fa = self._owner_addr(addr)
+        if fa is None:
+            return None
+        if fa not in self._analyzed:
+            if not analyze:
+                return None
+            self.analyze_function(fa)
+        return self._kbs.get(fa)
+
     def user_functions(self):
         if self.lazy:
-            # only the functions analysed so far have a Function object
-            out = [self.project.kb.functions.get_by_addr(fa)
-                   for fa in sorted(self._analyzed) if self.project.kb.functions.contains_addr(fa)]
+            # one Function per analysed function, each from ITS OWN kb
+            out = []
+            for fa in sorted(self._analyzed):
+                kb = self._kbs.get(fa)
+                if kb is not None and kb.functions.contains_addr(fa):
+                    out.append(kb.functions.get_by_addr(fa))
             return out
         out = []
         for f in self.cfg.kb.functions.values():
@@ -348,27 +373,57 @@ class Binary:
         return []
 
     def get_function(self, addr: int):
-        # Lazily analyse the function at `addr` (not just the one containing it) so a
-        # cold run on a never-selected function works. Return None if it still can't be
-        # found — angr's get_by_addr raises KeyError, but callers expect None.
-        if self.lazy and addr not in self._analyzed and self._name_by_addr.get(addr) is not None:
-            self.analyze_function(addr)
-        else:
-            self._ensure(addr)
-        kb = self.project.kb.functions
-        if kb.contains_addr(addr):
-            return kb.get_by_addr(addr)
-        try:
-            return kb.get_by_addr(addr)
-        except KeyError:
+        # Return the (containing) function from ITS OWN kb, analysing on demand. Returns
+        # None if it can't be found — angr's get_by_addr raises KeyError; callers want None.
+        if not self.lazy:
+            kb = self.project.kb.functions
+            if kb.contains_addr(addr):
+                return kb.get_by_addr(addr)
+            try:
+                return kb.floor_func(addr)
+            except Exception:
+                return None
+        fa = self._owner_addr(addr)
+        if fa is None:
             return None
+        if fa not in self._analyzed:
+            self.analyze_function(fa)
+        kb = self._kbs.get(fa)
+        if kb is None:
+            return None
+        try:
+            return kb.functions.get_by_addr(fa)
+        except KeyError:
+            try:
+                return kb.functions.floor_func(addr)
+            except Exception:
+                return None
+
+    def cfg_for(self, func_addr: int):
+        """The scoped CFG object for one function (its own, not whichever was analysed
+        last) — use this rather than `self.cfg` wherever a specific function's CFG is meant."""
+        if not self.lazy:
+            return self.cfg
+        fa = self._owner_addr(func_addr)
+        if fa is None:
+            return self.cfg
+        if fa not in self._analyzed:
+            self.analyze_function(fa)
+        return self._cfgs.get(fa, self.cfg)
 
     def block_head(self, addr: int) -> int:
         """The start address of the basic block containing `addr` (or addr itself)."""
-        self._ensure(addr)
-        node = self.cfg.model.get_any_node(addr, anyaddr=True)
-        if node is not None:
-            return node.addr
+        cfg = self.cfg
+        if self.lazy:
+            fa = self._owner_addr(addr)
+            if fa is not None:
+                if fa not in self._analyzed:
+                    self.analyze_function(fa)
+                cfg = self._cfgs.get(fa, cfg)
+        if cfg is not None:
+            node = cfg.model.get_any_node(addr, anyaddr=True)
+            if node is not None:
+                return node.addr
         return addr
 
     def return_block_heads(self, func_addr: int) -> list[int]:
@@ -453,7 +508,7 @@ class Binary:
         if i < 0:
             return None
         prev = self._line_addrs[i]
-        f = self.project.kb.functions.floor_func(addr)
+        f = self.get_function(addr)
         if f is None or not (f.addr <= prev <= addr):
             return None
         return self.line_for(prev)
@@ -473,8 +528,7 @@ class Binary:
         if block_addr not in cache:
             lines = []
             try:
-                self._ensure(block_addr)
-                f = self.project.kb.functions.floor_func(block_addr)
+                f = self.get_function(block_addr)
                 leaders = sorted(f.block_addrs_set) if f is not None else [block_addr]
                 addrs = ([ins.address for ins in self._owned_capstone(block_addr, leaders)]
                          if block_addr in leaders
@@ -505,8 +559,9 @@ class Binary:
         if self.project.is_hooked(addr):
             return self.project.hooked_by(addr).display_name
         if self.lazy:
-            if self.project.kb.functions.contains_addr(addr):
-                return self.project.kb.functions.get(addr).name
+            kb = self._kb_for(addr, analyze=False)
+            if kb is not None and kb.functions.contains_addr(addr):
+                return kb.functions.get(addr).name
             return None
         f = self.cfg.kb.functions.get(addr)
         return f.name if f is not None else None
@@ -610,13 +665,9 @@ class Binary:
         stub reads as `abort`, not a bare address)."""
         if tgt is None:
             return None
-        name = None
-        try:
-            tf = self.project.kb.functions.get(tgt)
-            if tf is not None:
-                name = tf.name
-        except Exception:
-            name = None
+        # Prefer the symbol index (authoritative, and independent of which function's kb
+        # happens to be analysed) over a per-function kb lookup.
+        name = self._name_by_addr.get(tgt)
         if name and not name.startswith("sub_"):
             return name
         lo = self.project.loader
@@ -652,4 +703,4 @@ class Binary:
                 continue
             edges.append({"src": sa, "dst": da, "kind": etype.get(data.get("type"), "flow"),
                           "jumpkind": data.get("jumpkind")})
-        return {"addr": f.addr, "name": f.name, "nodes": nodes, "edges": edges}
+        return {"addr": f.addr, "name": self.name_at(f.addr) or f.name, "nodes": nodes, "edges": edges}

@@ -298,9 +298,11 @@ class Run:
             angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
             angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
         }
-        if self.spec.get("limits", {}).get("skip_calls"):
-            # don't descend into called functions: a call returns a fresh unconstrained
-            # value, so exploration stays in the target function and its branches show.
+        if self.spec.get("limits", {}).get("skip_calls", True):
+            # DEFAULT ON: don't descend into called functions — a call returns a fresh
+            # unconstrained value, so exploration stays in the target function and its
+            # branches show (and a run can't hang stepping into a huge callee). A
+            # model-based run that needs real calls sets skip_calls:false explicitly.
             opts.add(angr.options.CALLLESS)
         snap = self.spec.get("initial_state")
         if snap and snap.get("kind") == "snapshot":
@@ -751,6 +753,7 @@ class Run:
             nid = state.globals.get("angrgui_node") if state is not None else None
             hit.extra["node"] = nid
             self.hits.append(hit)
+            hit.id = f"f{len(self.hits)}"     # stable per-run finding id (#7): reference as (run_id, id)
             if nid in self.nodes:
                 self.nodes[nid].hit_ids.append(len(self.hits) - 1)
             self.progress["hits"] = len(self.hits)
@@ -927,6 +930,13 @@ class Run:
             self.status = "running"
             self.progress["message"] = "building initial state"
             state = self._build_state()
+            # Per-query solver timeout so a single pathological Z3 solve can't hang a
+            # step forever — otherwise the cancel/time checks between steps never run and
+            # the run looks "stuck" and unkillable (#3). Child states inherit this.
+            try:
+                state.solver._solver.timeout = 60_000   # ms
+            except Exception as e:
+                log.warning("could not set solver timeout: %s", e)
             self._install_models(state)
 
             ctx = self._make_context()
@@ -977,7 +987,7 @@ class Run:
                 try:
                     from angr.exploration_techniques import LoopSeer
                     simgr.use_technique(LoopSeer(
-                        cfg=self.binary.cfg, functions=[self.func],
+                        cfg=self.binary.cfg_for(self.func_addr), functions=[self.func],
                         bound=loop_bound, limit_concrete_loops=False))
                 except Exception as e:  # best effort
                     log.warning("loop bounding unavailable: %s", e)
@@ -1104,7 +1114,7 @@ class Run:
         conditions. Give each a name derived from its callee instead. The value is
         still freshly unconstrained (same semantics) — only the label changes, and
         it is renamed before the next block consumes it (e.g. `cmp eax, 4`)."""
-        if not self.spec.get("limits", {}).get("skip_calls"):
+        if not self.spec.get("limits", {}).get("skip_calls", True):
             return
         ro = self.arch.ret_offset
         for s in states:

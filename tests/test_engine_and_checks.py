@@ -164,7 +164,8 @@ def test_reach_abort(binary):
         "args": [{"name": "cmd", "mode": "symbolic", "size": 4, "signed": True},
                  {"name": "x", "mode": "symbolic", "size": 4, "signed": True}],
         "checks": [{"id": "r", "kind": "reach", "addr": abort, "enabled": True}],
-        "limits": {"steps": 60, "active": 300, "seconds": 30, "loop_bound": 8},
+        # reaching INTO a called function (abort) needs calls stepped, not skipped
+        "limits": {"steps": 60, "active": 300, "seconds": 30, "loop_bound": 8, "skip_calls": False},
     })
     assert snap["status"] == "done"
     reach = [h for h in snap["hits"] if h["kind"] == "reach"]

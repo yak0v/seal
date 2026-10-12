@@ -114,9 +114,11 @@ class Hit:
     message: str
     witness: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
+    id: str | None = None          # stable per-run finding id (e.g. "f1"), set when recorded
 
     def to_json(self):
         return {
+            "id": self.id,
             "check_id": self.check_id, "kind": self.kind, "addr": self.addr,
             "message": self.message, "witness": self.witness, "extra": self.extra,
         }

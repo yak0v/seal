@@ -130,11 +130,17 @@ BUS = EventBus()
 
 
 def _fname(addr) -> str:
-    """A display name for a function address (IDA name if known, else angr's)."""
+    """A display name for a function address (IDA name if known, else the binary's
+    symbol, else angr's). Prefer the symbol over a Function object's name: we PAC-hook
+    function entries, so angr's name there can be the hook's '_Nop' — which is how run
+    records were showing up as '_nop' instead of the real function name."""
     if S.binary is None:
         return hex(addr)
     if S.ida is not None and S.ida._names and addr in S.ida._names:
         return S.ida._names[addr]
+    nm = S.binary.name_at(addr)
+    if nm:
+        return nm
     f = S.binary.get_function(addr)
     return f.name if f is not None else hex(addr)
 

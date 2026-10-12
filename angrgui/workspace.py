@@ -203,7 +203,10 @@ class Workspace:
     @staticmethod
     def _default_scenario(name: str = "Default") -> dict:
         return {"name": name, "args": [], "buffers": [], "assumptions": [],
-                "stdin": None, "files": [], "limits": {}, "models": []}
+                "stdin": None, "files": [],
+                # skip_calls ON by default — stay inside the target function (see runner);
+                # a model-based run flips it off explicitly.
+                "limits": {"skip_calls": True}, "models": []}
 
     @staticmethod
     def _default_func() -> dict:

@@ -46,7 +46,9 @@ def _run(binary, spec, timeout=60):
 
 
 ROUTE = {"args": [_sym("cmd"), _sym("x")],
-         "limits": {"steps": 60, "active": 300, "seconds": 30, "loop_bound": 8}}
+         # route() calls abort()/scale() — these tests reach into / model those calls,
+         # so calls must be stepped, not skipped (the new default)
+         "limits": {"steps": 60, "active": 300, "seconds": 30, "loop_bound": 8, "skip_calls": False}}
 
 
 # ------------------------------------------------------------------ path tree
@@ -161,7 +163,8 @@ def test_symbolic_stdin(binary):
     snap = _run(binary, {"func_addr": _addr(binary, "main"), "args": [],
                          "stdin": {"mode": "symbolic", "size": 8},
                          "checks": [{"id": "r", "kind": "reach", "addr": _addr(binary, "route"), "enabled": True}],
-                         "limits": {"steps": 40, "seconds": 30, "loop_bound": 4}})
+                         # main() calls route(); stepping into it is what carries stdin through
+                         "limits": {"steps": 40, "seconds": 30, "loop_bound": 4, "skip_calls": False}})
     assert snap["status"] == "done", snap["error"]
     assert any(n["cond"] == "stdin[0] == 2" for n in snap["tree"])
     assert "stdin" in snap["hits"][0]["witness"]

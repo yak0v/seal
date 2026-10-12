@@ -74,7 +74,8 @@ def test_agent_flow_reaches_abort(loaded):
         "args": [{"name": "cmd", "mode": "symbolic", "size": 4, "signed": True},
                  {"name": "x", "mode": "symbolic", "size": 4, "signed": True}],
         "checks": [{"kind": "reach", "addr": hex(abort)}],
-        "limits": {"steps": 60, "active": 300, "seconds": 30, "loop_bound": 8}}})
+        # reaching into the called abort() needs calls stepped, not skipped (new default)
+        "limits": {"steps": 60, "active": 300, "seconds": 30, "loop_bound": 8, "skip_calls": False}}})
     assert cfg["checks"][0]["addr"] == abort          # hex string coerced to int
 
     _call("add_assumption", {"addr": hex(fa), "expr": "cmd s>= 0"})
