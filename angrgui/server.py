@@ -316,11 +316,24 @@ def function(addr: int):
     # seed default args from DWARF / calling convention into the active scenario
     sc = cfg["scenarios"][cfg["active"]]
     if not sc.get("args"):
-        for a in [f for f in b.function_list() if f["addr"] == addr][0]["args"]:
-            sc.setdefault("args", []).append({
-                "name": a["name"], "mode": "symbolic",
-                "size": a["size"] or b.word_bytes, "signed": a.get("signed", True),
-            })
+        # Prefer IDA's parameters (names the user sees in the decompilation, and float/
+        # vector args pre-marked) so setting up a buffer uses the SAME name as the code
+        # (#2); fall back to DWARF / calling-convention args.
+        ida_params = _ida_params(addr)
+        cc_args = [f for f in b.function_list() if f["addr"] == addr][0]["args"]
+        if ida_params and len(ida_params) >= len(cc_args):
+            for p in ida_params:
+                a = {"name": p["name"], "mode": "symbolic",
+                     "size": p["size"] or b.word_bytes, "signed": True}
+                if p.get("float"):
+                    a["float"] = True
+                sc.setdefault("args", []).append(a)
+        else:
+            for a in cc_args:
+                sc.setdefault("args", []).append({
+                    "name": a["name"], "mode": "symbolic",
+                    "size": a["size"] or b.word_bytes, "signed": a.get("signed", True),
+                })
     return {"disasm": disasm, "dwarf": dwarf, "config": cfg,
             "return_heads": [hex(h) for h in b.return_block_heads(addr)],
             "last_run": S.last_run.get(addr)}
@@ -431,6 +444,47 @@ def _arg_struct_type(func_addr: int, argname: str) -> str | None:
             typ = typ.replace("*", "").strip()
             return typ or None
     return None
+
+
+def _ida_params(func_addr) -> list[dict]:
+    """Ordered parameters from IDA's decompiled signature as [{name,size,float}], so the
+    setup panel can use the SAME names the user sees in the decompilation (#2) and pre-mark
+    float/vector args. Empty if IDA is unavailable or the signature can't be parsed."""
+    if S.ida is None:
+        return []
+    try:
+        code = S.ida.decompile(func_addr).get("code", "")
+    except Exception:
+        return []
+    m = re.search(r"\(([^)]*)\)", code or "")
+    if not m:
+        return []
+    out = []
+    for i, param in enumerate(m.group(1).split(",")):
+        p = param.strip()
+        if not p or p == "void":
+            continue
+        pm = re.match(r"\s*(.+?)[\s*]+([A-Za-z_]\w*)\s*$", p)
+        name = pm.group(2) if pm else f"a{i + 1}"
+        typ = (pm.group(1) if pm else p).lower()
+        is_ptr = "*" in p
+        is_float = (not is_ptr) and (("float" in typ) or ("double" in typ) or ("x2_t" in typ) or ("x4_t" in typ))
+        if is_ptr:
+            size = 8
+        elif "double" in typ or "int64" in typ or "long" in typ or "x2_t" in typ:
+            size = 8
+        elif "x4_t" in typ or "x16_t" in typ:
+            size = 16
+        elif "float" in typ or "int" in typ or "f32" in typ:
+            size = 4
+        elif "short" in typ or "int16" in typ:
+            size = 2
+        elif "char" in typ or "int8" in typ or "bool" in typ:
+            size = 1
+        else:
+            size = 8
+        out.append({"name": name, "size": size, "float": is_float})
+    return out
 
 
 def _enrich_buffer_members(spec: dict) -> dict:

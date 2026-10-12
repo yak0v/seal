@@ -2492,27 +2492,36 @@ function setPanelCollapsed(side, collapsed) {
   regraph();   // the dock/graph width changed
 }
 
-function showAddr(addr) {
-  // jump to an address and flash it — prefer the decompilation when IDA is connected
-  if (A.ida && A.ida.connected) {
-    selectTab("decomp");
-    setTimeout(() => {
-      // exact line for this address, else the nearest decompiled line at or before it
-      // (a finding's instruction may sit between pseudocode lines) — so the right line
-      // always highlights, not "something nearby".
-      let line = $(`#pane-decomp .cline[data-addr="${addr}"]`);
-      if (!line) {
-        let best = null, bestA = -1;
-        $$(`#pane-decomp .cline[data-addr]`).forEach(el => {
-          const a = +el.dataset.addr;
-          if (a <= addr && a > bestA) { bestA = a; best = el; }
-        });
-        line = best;
-      }
-      if (line) { line.scrollIntoView({ block: "center", behavior: "smooth" }); line.classList.add("flash"); setTimeout(() => line.classList.remove("flash"), 1400); }
-      else { selectTab("code"); scrollToAddr(addr); }
-    }, 350);
-  } else { selectTab("code"); scrollToAddr(addr); }
+async function showAddr(addr) {
+  // jump to an address and flash it — prefer the decompilation when IDA is connected.
+  if (!(A.ida && A.ida.connected)) { selectTab("code"); scrollToAddr(addr); return; }
+  selectTab("decomp");
+  // AWAIT the decompilation actually rendering. Previously a fixed 350ms timeout raced
+  // the IDA fetch: on a cold/slow decompile the .cline rows didn't exist yet, so the
+  // code fell through to the disassembly — that was clicking a finding "sometimes"
+  // dumping to disassembly (#1). Now we wait for the render and only fall back if IDA
+  // genuinely produced no decompilation for this function.
+  try { await renderDecomp(); } catch (e) {}
+  // exact line for this address, else the nearest decompiled line at or before it
+  // (a finding's instruction may sit between pseudocode lines).
+  let line = $(`#pane-decomp .cline[data-addr="${addr}"]`);
+  if (!line) {
+    let best = null, bestA = -1;
+    $$(`#pane-decomp .cline[data-addr]`).forEach(el => {
+      const a = +el.dataset.addr;
+      if (a <= addr && a > bestA) { bestA = a; best = el; }
+    });
+    line = best;
+  }
+  if (line) {
+    line.scrollIntoView({ block: "center", behavior: "smooth" });
+    line.classList.add("flash"); setTimeout(() => line.classList.remove("flash"), 1400);
+  } else if (!$(`#pane-decomp .cline[data-addr]`)) {
+    // the decompilation really has no addressed lines — only then use the disassembly
+    selectTab("code"); scrollToAddr(addr);
+  }
+  // else: decompilation is shown but this exact addr isn't on a line — stay here,
+  // don't yank the user to disassembly.
 }
 
 function openAddrMenu(addr) {
@@ -2693,9 +2702,14 @@ async function renderDecomp(force) {
   let d = A.decompCache[A.fn.addr];
   if (!d || force) {
     pane.innerHTML = '<div class="empty">Decompiling ' + esc(A.fn.name) + '…</div>';
-    try { d = await api("/api/ida/decompile/" + A.fn.addr + (force ? "?force=1" : "")); }
-    catch (e) { pane.innerHTML = '<div class="empty">Decompile failed: ' + esc(e.message) + '</div>'; return; }
-    A.decompCache[A.fn.addr] = d;
+    // Dedupe concurrent decompiles of the same function (showAddr awaits renderDecomp
+    // while selectTab may also have kicked one off) so IDA isn't hit twice.
+    A._decompInflight = A._decompInflight || {};
+    const fa = A.fn.addr;
+    try { d = await (A._decompInflight[fa] ||= api("/api/ida/decompile/" + fa + (force ? "?force=1" : ""))); }
+    catch (e) { delete A._decompInflight[fa]; pane.innerHTML = '<div class="empty">Decompile failed: ' + esc(e.message) + '</div>'; return; }
+    delete A._decompInflight[fa];
+    A.decompCache[fa] = d;
   }
   A._assume = assumeModel(); A._vars = varModel();
   // IDA decompiles the function containing the address; show the function IDA
