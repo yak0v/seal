@@ -36,7 +36,21 @@ def dump(frame, loc, extra, d):
                 pass
     err = lldb.SBError()
     def rd(a, n):
-        b = p.ReadMemory(a, n, err); return b.hex() if (err.Success() and b) else None
+        # Read page by page and keep whatever is mapped: a fixed-size read that runs off
+        # the end of a region (e.g. 8 KiB up from sp overruns the top of the stack into
+        # the guard page) makes ReadMemory fail the WHOLE request and drops the valid
+        # bytes. Stop at the first unreadable page instead and return what we got.
+        PAGE = 0x1000
+        out = bytearray()
+        off = 0
+        while off < n:
+            e = lldb.SBError()
+            chunk = p.ReadMemory(a + off, min(PAGE, n - off), e)
+            if not (e.Success() and chunk):
+                break
+            out += chunk
+            off += len(chunk)
+        return out.hex() if out else None
     gv = lambda n: frame.FindRegister(n).GetValueAsUnsigned()
     x0, sp = gv("x0"), gv("sp")
     snap = {"arch": "AARCH64", "func": "aa_lineto", "cg_text_base": base, "aa_offset": OFF,
