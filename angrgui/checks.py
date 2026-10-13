@@ -192,9 +192,6 @@ def witness_of(state) -> dict:
         return out
     w = state.copy()                     # pin into a throwaway copy; never touch the run's state
     names = state.globals.get("angrgui_vars", {})
-    # buffers whose fields we name below ({prefix}_buf); don't ALSO dump the whole raw
-    # blob — the named members replace it, and showing both is redundant/confusing.
-    named_bufs = set((state.globals.get("angrgui_bufmembers") or {}).keys())
 
     def take(ast, bits):
         """Eval `ast` in the working model, pin it, and return the concrete int."""
@@ -205,17 +202,10 @@ def witness_of(state) -> dict:
             pass
         return v
 
-    for nm, ast in names.items():
-        if nm in named_bufs:             # raw buffer blob -> shown as named members instead
-            continue
-        if isinstance(ast, claripy.ast.Base) and ast.symbolic:
-            try:
-                out[nm] = _fmt(take(ast, ast.size()), ast.size())
-            except Exception:
-                pass
-    # per-struct-member values for buffers that carry a member map, so the code view
-    # and path detail can show e.g. `tif->tif_diroff = 0x...` (scalar members only;
-    # little-endian, read from the initial symbolic buffer)
+    # Named struct members FIRST, so we know which buffers actually got named fields —
+    # a buffer is only hidden as a raw blob below if its fields genuinely replaced it
+    # (otherwise suppressing the blob would leave the state invisible entirely).
+    covered = set()
     for bufname, members in (state.globals.get("angrgui_bufmembers") or {}).items():
         buf = names.get(bufname)
         if not (isinstance(buf, claripy.ast.Base) and buf.op == "BVS"):
@@ -229,6 +219,16 @@ def witness_of(state) -> dict:
                 bv = parts[0] if size == 1 else claripy.Concat(*reversed(parts))
                 if bv.symbolic:                       # only report fields the inputs actually fix
                     out[mname] = _fmt(take(bv, size * 8), size * 8)
+                    covered.add(bufname)
+            except Exception:
+                pass
+
+    for nm, ast in names.items():
+        if nm in covered:                # raw buffer blob -> shown as its named members instead
+            continue
+        if isinstance(ast, claripy.ast.Base) and ast.symbolic:
+            try:
+                out[nm] = _fmt(take(ast, ast.size()), ast.size())
             except Exception:
                 pass
     # stdin, if any
