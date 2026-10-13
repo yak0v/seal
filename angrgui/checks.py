@@ -179,16 +179,33 @@ class BaseCheck:
 
 
 def witness_of(state) -> dict:
-    """Concrete values for every named input, if the path is satisfiable."""
+    """Concrete values for every named input, if the path is satisfiable.
+
+    All values are drawn from ONE coherent model: after evaluating each input we pin it
+    (on a working copy) before evaluating the next. Without this, each `solver.eval` is an
+    independent query that minimises that one variable while the others stay free — so with
+    several symbolic inputs (e.g. named struct members) the reported values need not satisfy
+    the finding JOINTLY, and you get a witness of all-zeros that doesn't actually trigger
+    the bug. Pinning makes the witness a single assignment the solver guarantees is real."""
     out = {}
-    names = state.globals.get("angrgui_vars", {})
     if not state.solver.satisfiable():
         return out
+    w = state.copy()                     # pin into a throwaway copy; never touch the run's state
+    names = state.globals.get("angrgui_vars", {})
+
+    def take(ast, bits):
+        """Eval `ast` in the working model, pin it, and return the concrete int."""
+        v = w.solver.eval(ast)
+        try:
+            w.add_constraints(ast == v)
+        except Exception:
+            pass
+        return v
+
     for nm, ast in names.items():
         if isinstance(ast, claripy.ast.Base) and ast.symbolic:
             try:
-                v = state.solver.eval(ast)
-                out[nm] = _fmt(v, ast.size())
+                out[nm] = _fmt(take(ast, ast.size()), ast.size())
             except Exception:
                 pass
     # per-struct-member values for buffers that carry a member map, so the code view
@@ -206,28 +223,33 @@ def witness_of(state) -> dict:
                 parts = [buf[n - 1 - 8 * (off + i):n - 8 * (off + i) - 8] for i in range(size)]
                 bv = parts[0] if size == 1 else claripy.Concat(*reversed(parts))
                 if bv.symbolic:                       # only report fields the inputs actually fix
-                    out[mname] = _fmt(state.solver.eval(bv), size * 8)
+                    out[mname] = _fmt(take(bv, size * 8), size * 8)
             except Exception:
                 pass
     # stdin, if any
     so = state.globals.get("angrgui_stdin")
     if so is not None:
         try:
-            data = state.solver.eval(so, cast_to=bytes)
+            data = w.solver.eval(so, cast_to=bytes)
+            try: w.add_constraints(so == claripy.BVV(data))
+            except Exception: pass
             out["stdin"] = data.hex()
         except Exception:
             pass
     else:
         # stdin wasn't set up explicitly, but the code may still have read angr's default one
         try:
-            data = state.posix.dumps(0)
+            data = w.posix.dumps(0)
             if data:
                 out["stdin"] = data.hex()
         except Exception:
             pass
     for fname, fb in (state.globals.get("angrgui_files") or {}).items():
         try:
-            out["file:" + fname] = state.solver.eval(fb, cast_to=bytes).hex()
+            data = w.solver.eval(fb, cast_to=bytes)
+            try: w.add_constraints(fb == claripy.BVV(data))
+            except Exception: pass
+            out["file:" + fname] = data.hex()
         except Exception:
             pass
     return out
