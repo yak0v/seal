@@ -115,6 +115,20 @@ class PathNode:
     hit_ids: list = field(default_factory=list)
 
 
+class CorePages(angr.SimStatePlugin):
+    """Per-state record of which pages we've already faulted in from the process core, so
+    demand-paging fills each page at most once per state and never clobbers a later write.
+    Deep-copied on fork (each path tracks its own fills) — a global set would wrongly mark a
+    page 'present' for a sibling that branched before it was faulted in."""
+    def __init__(self, filled=None):
+        super().__init__()
+        self.filled = set(filled) if filled else set()
+
+    @angr.SimStatePlugin.memo
+    def copy(self, memo):
+        return CorePages(self.filled)
+
+
 class Run:
     """One exploration job. Runs on a background thread; progress-pollable."""
 
@@ -276,6 +290,7 @@ class Run:
             except Exception as e:
                 log.warning("snapshot mem @%s: %s", m.get("addr"), e)
         named = {}
+        mem_overlays = []                             # (addr, bv) symbolic fields in memory
         floatvars = {}                                # name -> float layout ("f32","f64","f32x2",…)
         for s in (snap.get("symbolic") or []):       # attacker-controlled -> symbolic overlay
             nm = s.get("name") or "sym"
@@ -290,6 +305,7 @@ class Run:
                     setattr(state.regs, s["reg"], bv)
                 elif s.get("addr") is not None:
                     state.memory.store(int(s["addr"]), bv, endness=self.arch.memory_endness)
+                    mem_overlays.append((int(s["addr"]), bv))   # re-applied over faulted core pages
             except Exception as e:
                 log.warning("snapshot symbolic %s: %s", nm, e)
         state.globals["angrgui_floatvars"] = floatvars
@@ -297,7 +313,63 @@ class Run:
         state.globals["angrgui_argv"] = list(named.values())
         state.globals["angrgui_locals"] = {}
         state.globals["angrgui_bufmembers"] = {}
+        # Lazy page-in from a process core (if this snapshot has one): nothing is pre-loaded;
+        # pages fault in from the core on first access. Installed AFTER the symbolic overlays
+        # so it can re-apply them on top of a faulted page (else reading a struct field would
+        # pull its concrete core value back over the field we just made symbolic).
+        if snap.get("core"):
+            try:
+                self._install_core_paging(state, snap["core"], mem_overlays)
+            except Exception as e:
+                log.warning("core paging unavailable: %s", e)
         return state
+
+    def _install_core_paging(self, state, core_path, mem_overlays):
+        """Fault pages in from a process core on demand (see CorePages / snapshot/core.py).
+
+        On every memory access to a CONCRETE address that isn't part of the loaded image,
+        read that page from the core and store it before the access completes — so the real
+        bytes are there wherever execution goes, with nothing pre-loaded. The loaded image's
+        own addresses are served by cle (we skip them). A symbolic address is left alone."""
+        from .snapshot.core import MachOCore
+        core = MachOCore(core_path)
+        self._core = core                          # keep the mmap alive for the run
+        loader = self.project.loader
+        endn = self.arch.memory_endness
+        overlays = list(mem_overlays or [])        # (addr, bv) to keep symbolic over faulted pages
+        state.register_plugin("core_pages", CorePages())
+
+        def fill(s, which):
+            insp = s.inspect
+            addr_bv = getattr(insp, which + "_address", None)
+            len_bv = getattr(insp, which + "_length", None)
+            if addr_bv is None or getattr(addr_bv, "symbolic", False):
+                return                             # only page concrete addresses
+            try:
+                a = s.solver.eval(addr_bv)
+                n = int(s.solver.eval(len_bv)) if len_bv is not None else 8
+            except Exception:
+                return
+            n = max(1, min(int(n), 0x2000))
+            filled = s.core_pages.filled
+            pg, last = a & ~0xFFF, (a + n - 1) & ~0xFFF
+            while pg <= last:
+                if pg not in filled:
+                    filled.add(pg)
+                    if loader.find_object_containing(pg) is None:   # not in the loaded image
+                        data = core.read_page(pg)
+                        if data:
+                            try:
+                                s.memory.store(pg, data)
+                                for oa, obv in overlays:            # keep symbolic fields symbolic
+                                    if pg <= oa < pg + 0x1000:
+                                        s.memory.store(oa, obv, endness=endn)
+                            except Exception:
+                                pass
+                pg += 0x1000
+
+        state.inspect.b("mem_read", when=angr.BP_BEFORE, action=lambda s: fill(s, "mem_read"))
+        state.inspect.b("mem_write", when=angr.BP_BEFORE, action=lambda s: fill(s, "mem_write"))
 
     def _build_state(self):
         opts = {

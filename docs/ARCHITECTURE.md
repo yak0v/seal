@@ -255,8 +255,11 @@ End-to-end:
    whole data image (every writable/anonymous readable region) — complete but large (hundreds
    of MB on a real process). It also records each module's live __TEXT base so SEAL can compute
    the slide. NOTE: the reachable graph on a complex process is dense; the depth-bounded default
-   captures the arguments' structures and nearby pointers, not a guaranteed-complete closure —
-   for that use `full`, or (future) lazy page-in from a core. **Break at the true
+   captures the arguments' structures and nearby pointers, not a guaranteed-complete closure.
+   For completeness, `seal_snapshot <out> core` saves a process **core** instead: SEAL then
+   faults pages in from it on demand during symbolic execution (angrgui/snapshot/core.py +
+   runner `_install_core_paging`), so every address has its real bytes with nothing pre-loaded
+   — the complete-and-efficient option. **Break at the true
    function entry** (`--skip-prologue false`) or the argument registers are already spilled and
    dead. For a dyld-shared-cache image, set the breakpoint by **address** using
    `seal_validation/snapshot/live_bp.py` (`seal_setbp <Module> <file_addr>`), because breaking

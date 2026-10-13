@@ -37,6 +37,19 @@ def __lldb_init_module(debugger, d):
     debugger.HandleCommand("command script add -f capture.seal_snapshot seal_snapshot")
     # kept for backwards compat with the old aa_lineto workflow:
     debugger.HandleCommand("command script add -f capture.setup aa_setup")
+    debugger.HandleCommand("command script add -f capture.aa_break aa_break")
+
+
+def aa_break(debugger, command, result, internal_dict):
+    """Set a plain (stopping) breakpoint at aa_lineto — so a script can stop there and then
+    choose how to snapshot (e.g. `seal_snapshot /tmp/snap.json core`)."""
+    t = debugger.GetSelectedTarget()
+    base = next((m.FindSection("__TEXT").GetLoadAddress(t) for m in t.module_iter()
+                 if m.GetFileSpec().GetFilename() == "CoreGraphics"), None)
+    if base is None:
+        print("CoreGraphics not loaded yet"); return
+    bp = t.BreakpointCreateByAddress(base + OFF)
+    print("AA_BP @ %#x  locations=%d" % (base + OFF, bp.GetNumLocations()))
 
 
 # ----------------------------------------------------------------- registers
@@ -199,9 +212,10 @@ def _modules(target):
 
 # --------------------------------------------------------------------- command
 def seal_snapshot(debugger, command, result, internal_dict):
+    # seal_snapshot [outfile] [full|core]
     args = command.split()
-    out_path = next((a for a in args if a != "full"), "/tmp/snap.json")
-    want_full = "full" in args
+    mode = "core" if "core" in args else ("full" if "full" in args else "reachable")
+    out_path = next((a for a in args if a not in ("full", "core")), "/tmp/snap.json")
     t = debugger.GetSelectedTarget()
     proc = t.GetProcess()
     frame = proc.GetSelectedThread().GetFrameAtIndex(0)
@@ -209,11 +223,24 @@ def seal_snapshot(debugger, command, result, internal_dict):
     regs = _dump_regs(frame)
     gv = lambda n: frame.FindRegister(n).GetValueAsUnsigned()
     pc = gv("pc")
-    mode = "full" if want_full else "reachable"
+    snap = {"arch": "AARCH64", "pc": pc, "regs": regs, "modules": _modules(t)}
+
+    if mode == "core":
+        # COMPLETE + lazy: save a process core; SEAL faults pages in from it on demand,
+        # so nothing is pre-captured and every address has its real bytes (see
+        # angrgui/snapshot/core.py).
+        core_path = (out_path[:-5] if out_path.endswith(".json") else out_path) + ".core"
+        debugger.HandleCommand("process save-core " + core_path)
+        snap["core"] = core_path
+        snap["capture"] = {"mode": "core", "core": core_path}
+        with open(out_path, "w") as fh:
+            json.dump(snap, fh)
+        print("SNAPSHOT %s  pc=%#x regs=%d  core=%s" % (out_path, pc, len(regs), core_path))
+        return False
+
     mem, total, skipped = _capture_memory(proc, t, frame, mode)
-    snap = {"arch": "AARCH64", "pc": pc, "regs": regs, "mem": mem,
-            "modules": _modules(t),
-            "capture": {"mode": mode, "regions": len(mem), "bytes": total, "skipped": skipped}}
+    snap["mem"] = mem
+    snap["capture"] = {"mode": mode, "regions": len(mem), "bytes": total, "skipped": skipped}
     with open(out_path, "w") as fh:
         json.dump(snap, fh)
     print("SNAPSHOT %s  pc=%#x regs=%d  mem: %d regions, %.2f MB (%s)  (skipped %d)"
