@@ -192,6 +192,9 @@ def witness_of(state) -> dict:
         return out
     w = state.copy()                     # pin into a throwaway copy; never touch the run's state
     names = state.globals.get("angrgui_vars", {})
+    # buffers whose fields we name below ({prefix}_buf); don't ALSO dump the whole raw
+    # blob — the named members replace it, and showing both is redundant/confusing.
+    named_bufs = set((state.globals.get("angrgui_bufmembers") or {}).keys())
 
     def take(ast, bits):
         """Eval `ast` in the working model, pin it, and return the concrete int."""
@@ -203,6 +206,8 @@ def witness_of(state) -> dict:
         return v
 
     for nm, ast in names.items():
+        if nm in named_bufs:             # raw buffer blob -> shown as named members instead
+            continue
         if isinstance(ast, claripy.ast.Base) and ast.symbolic:
             try:
                 out[nm] = _fmt(take(ast, ast.size()), ast.size())
