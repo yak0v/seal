@@ -2201,6 +2201,28 @@ function fmtFloat(x) {
   const a = Math.abs(x);
   return (a !== 0 && (a < 1e-4 || a >= 1e16)) ? x.toExponential(6) : String(x);
 }
+// width/bank aliases of an arm64 register name, so IDA's `// w8`/`// d2` declaration
+// matches the trace's x8 / v2 etc. (same physical register, different view).
+function _regAliases(reg) {
+  const m = String(reg || "").toLowerCase().match(/^([a-z]+)(\d+)$/);
+  if (!m) return [String(reg || "").toLowerCase()];
+  const fam = ({ w: ["w", "x"], x: ["x", "w"], s: ["s", "d", "q", "v"],
+    d: ["d", "s", "q", "v"], q: ["q", "v", "d", "s"], v: ["v", "q", "d", "s"] })[m[1]] || [m[1]];
+  return fam.map(p => p + m[2]);
+}
+// decode a NEON/float register's raw hex value as a readable number (null if not a float reg)
+function _regFloatFmt(reg, hex) {
+  const p = String(reg || "").toLowerCase()[0];
+  if (!/[dsqv]/.test(p || "")) return null;
+  try {
+    const bi = BigInt(hex), M = (1n << 64n) - 1n;
+    const dv = new DataView(new ArrayBuffer(16));
+    dv.setBigUint64(0, bi & M, true); dv.setBigUint64(8, (bi >> 64n) & M, true);
+    if (p === "d") return fmtFloat(dv.getFloat64(0, true));
+    if (p === "s") return fmtFloat(dv.getFloat32(0, true));
+    return "(" + fmtFloat(dv.getFloat64(0, true)) + ", " + fmtFloat(dv.getFloat64(8, true)) + ")";
+  } catch (e) { return null; }
+}
 function fmtOne(name, v) {
   if (typeof v === "string") return bytesPretty(v);            // stdin, hex-encoded bytes
   if (!v || !v.hex) return String(v);
@@ -2298,6 +2320,15 @@ function renderDecompLines(code, into) {
   // annotate inputs: scalar args/locals (whole-word), and struct fields like tif->tif_diroff
   // (substring). Skip the raw buffer blob and stdin/file byte strings.
   const pvKeys = pv ? Object.keys(pv).filter(k => !/_buf$/.test(k) && !/^(stdin|file:)/.test(k)) : [];
+  // map each pseudocode variable to the register IDA put it in, from the declaration
+  // comments (e.g. `float64x2_t clamped_pt; // q17`). Lets us label the per-instruction
+  // trace values (which are keyed by register) with the VARIABLE name on each line.
+  const regToVar = {};
+  for (const r of rows) {
+    const dm = (r.text || "").match(/\b([A-Za-z_]\w*)\s*;\s*\/\/\s*([a-z]\w*)\s*$/i);
+    if (dm) for (const al of _regAliases(dm[2])) if (!(al in regToVar)) regToVar[al] = dm[1];
+  }
+  const varFor = (reg) => { for (const al of _regAliases(reg)) if (regToVar[al]) return regToVar[al]; return null; };
   const valAnnot = (line, onPath) => {
     if (!pv || !onPath) return null;
     const parts = [];
@@ -2349,12 +2380,28 @@ function renderDecompLines(code, into) {
       if (litH && litH.extra && litH.extra.write_addr)  // offending line: the value it writes to
         content.append(el("span", { class: "exannot" },
           `  ; dest = ${litH.extra.write_addr} (outside ${litH.extra.buffer_base || "buf"} + ${litH.extra.buffer_size ?? "?"})`));
-      // value of the variable assigned on this line, on the selected path
+      // EVERY concrete value on this line, on the selected path: the destination write,
+      // each operand register read, and any memory load/store — each labelled with its
+      // pseudocode variable name (via regToVar) and float-decoded where it's a float reg.
       const av = A.pathAsgn && A.pathAsgn["0x" + r.addr.toString(16)];
       if (av && !litH) {
-        const m = r.text.match(/^\s*(\*?[A-Za-z_]\w*(?:\[[^\]]*\])?)\s*(?:[|&^+\-*/<>%]*=)(?!=)/);
-        const val = av.store ? av.store.val : av.val;
-        if (m && val != null) content.append(el("span", { class: "cvals asgn" }, `  ${m[1]} = ${val}`));
+        const parts = [], seen = new Set();
+        const show = (reg, hex) => {
+          if (hex == null) return;
+          const nm = varFor(reg) || reg;
+          const key = nm + "=" + hex; if (seen.has(key)) return; seen.add(key);
+          const f = _regFloatFmt(reg, hex);
+          parts.push(nm + " = " + (f != null ? f : hex));
+        };
+        if (av.store && av.store.val != null) parts.push("[" + av.store.addr + "] = " + av.store.val);
+        else if (av.reg && av.val != null) show(av.reg, av.val);
+        if (av.reads) for (const [rg, v] of Object.entries(av.reads)) if (rg !== av.reg) show(rg, v);
+        if (av.load && av.load.val != null) {
+          const f = _regFloatFmt(av.reg, av.load.val);
+          parts.push((varFor(av.reg) || "[" + av.load.addr + "]") + " = " + (f != null ? f : av.load.val));
+        }
+        if (parts.length) content.append(el("span", { class: "cvals asgn",
+          title: "concrete values on this line (selected path)" }, "  " + parts.slice(0, 8).join("   ")));
       }
       const vals = valAnnot(r.text, onPath);
       if (vals) content.append(vals);
