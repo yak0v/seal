@@ -752,6 +752,7 @@ class Run:
             target_func_lo=lo, target_func_hi=hi, return_addrs=rets,
             line_for=line_for, path_of=path_of, on_hit=self._on_hit,
             block_head=self.binary.block_head,
+            cancelled=self._cancel.is_set,     # checks bail immediately once cancel is requested
         )
 
     def _emit(self, kind, **data):
@@ -1218,6 +1219,8 @@ class Run:
                 node.kind = "avoided"
             # state-point checks (assert/reach/avoid/custom) observe states at block
             # boundaries, where register and memory reads are committed and reliable
+            if self._cancel.is_set():          # stop running checks once cancel is requested
+                break
             for chk in self._state_checks:
                 chk.note_state(s)
             # at_return asserts are evaluated once the state has actually returned,

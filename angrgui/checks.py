@@ -181,30 +181,20 @@ class BaseCheck:
 def witness_of(state) -> dict:
     """Concrete values for every named input, if the path is satisfiable.
 
-    All values are drawn from ONE coherent model: after evaluating each input we pin it
-    (on a working copy) before evaluating the next. Without this, each `solver.eval` is an
-    independent query that minimises that one variable while the others stay free — so with
-    several symbolic inputs (e.g. named struct members) the reported values need not satisfy
-    the finding JOINTLY, and you get a witness of all-zeros that doesn't actually trigger
-    the bug. Pinning makes the witness a single assignment the solver guarantees is real."""
+    All scalar/member values come from ONE joint model via a single `batch_eval`, so they
+    are mutually consistent (they satisfy the finding TOGETHER) — but it is still just one
+    solver call. The previous version evaluated each input in its own constrained query on
+    a fresh state copy; with a dozen named struct members that was ~14 solves + a copy PER
+    FINDING, firing on every narrowing check on every path, which made a single step take
+    tens of seconds (the run looked hung and cancel — only checked between steps — couldn't
+    land). batch_eval restores both joint consistency and speed."""
     out = {}
-    if not state.solver.satisfiable():
-        return out
-    w = state.copy()                     # pin into a throwaway copy; never touch the run's state
     names = state.globals.get("angrgui_vars", {})
 
-    def take(ast, bits):
-        """Eval `ast` in the working model, pin it, and return the concrete int."""
-        v = w.solver.eval(ast)
-        try:
-            w.add_constraints(ast == v)
-        except Exception:
-            pass
-        return v
-
-    # Named struct members FIRST, so we know which buffers actually got named fields —
-    # a buffer is only hidden as a raw blob below if its fields genuinely replaced it
-    # (otherwise suppressing the blob would leave the state invisible entirely).
+    # Collect (key, bv, bits, is_float). Named struct members FIRST, so we know which
+    # buffers actually got named fields — a buffer's raw blob is hidden below only if its
+    # fields genuinely replaced it (otherwise suppressing it would hide the state entirely).
+    items = []
     covered = set()
     for bufname, members in (state.globals.get("angrgui_bufmembers") or {}).items():
         buf = names.get(bufname)
@@ -220,52 +210,51 @@ def witness_of(state) -> dict:
                 parts = [buf[n - 1 - 8 * (off + i):n - 8 * (off + i) - 8] for i in range(size)]
                 bv = parts[0] if size == 1 else claripy.Concat(*reversed(parts))
                 if bv.symbolic:                       # only report fields the inputs actually fix
-                    raw = take(bv, size * 8)
-                    cell = _fmt(raw, size * 8)
-                    if is_float and size in (4, 8):   # reinterpret the bits as a float
-                        try:
-                            import struct as _struct
-                            packed = raw.to_bytes(size, "little")
-                            cell["f"] = _struct.unpack("<f" if size == 4 else "<d", packed)[0]
-                        except Exception:
-                            pass
-                    out[mname] = cell
+                    items.append((mname, bv, size * 8, is_float))
                     covered.add(bufname)
             except Exception:
                 pass
-
     for nm, ast in names.items():
         if nm in covered:                # raw buffer blob -> shown as its named members instead
             continue
         if isinstance(ast, claripy.ast.Base) and ast.symbolic:
-            try:
-                out[nm] = _fmt(take(ast, ast.size()), ast.size())
-            except Exception:
-                pass
-    # stdin, if any
+            items.append((nm, ast, ast.size(), False))
+
+    if items:
+        asts = [it[1] for it in items]
+        try:
+            vals = list(state.solver.batch_eval(asts, 1)[0])   # ONE joint model
+        except Exception:
+            vals = [state.solver.eval(a) for a in asts]        # fallback (per-var; may not be joint)
+        for (key, _bv, bits, is_float), v in zip(items, vals):
+            cell = _fmt(int(v), bits)
+            if is_float and bits in (32, 64):
+                try:
+                    import struct as _struct
+                    cell["f"] = _struct.unpack("<f" if bits == 32 else "<d",
+                                               int(v).to_bytes(bits // 8, "little"))[0]
+                except Exception:
+                    pass
+            out[key] = cell
+
+    # byte inputs (stdin / files) — evaluated separately; these are independent of the
+    # scalar overflow constraints in practice, and batch_eval over bytes is awkward.
     so = state.globals.get("angrgui_stdin")
     if so is not None:
         try:
-            data = w.solver.eval(so, cast_to=bytes)
-            try: w.add_constraints(so == claripy.BVV(data))
-            except Exception: pass
-            out["stdin"] = data.hex()
+            out["stdin"] = state.solver.eval(so, cast_to=bytes).hex()
         except Exception:
             pass
     else:
-        # stdin wasn't set up explicitly, but the code may still have read angr's default one
         try:
-            data = w.posix.dumps(0)
+            data = state.posix.dumps(0)
             if data:
                 out["stdin"] = data.hex()
         except Exception:
             pass
     for fname, fb in (state.globals.get("angrgui_files") or {}).items():
         try:
-            data = w.solver.eval(fb, cast_to=bytes)
-            try: w.add_constraints(fb == claripy.BVV(data))
-            except Exception: pass
-            out["file:" + fname] = data.hex()
+            out["file:" + fname] = state.solver.eval(fb, cast_to=bytes).hex()
         except Exception:
             pass
     return out
@@ -308,6 +297,8 @@ class IntOverflowCheck(BaseCheck):
             return None, None
 
     def _on_expr(self, state):
+        if self.ctx.is_cancelled():
+            return
         insp = state.inspect
         r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
         if r is None or not isinstance(r, claripy.ast.BV):
@@ -664,6 +655,8 @@ class NarrowingCastCheck(BaseCheck):
         return None
 
     def _on_expr(self, state):
+        if self.ctx.is_cancelled():            # user cancelled — stop doing solver work NOW
+            return
         insp = state.inspect
         r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
         nar = self._narrowing(r)
@@ -677,6 +670,13 @@ class NarrowingCastCheck(BaseCheck):
             if ins_addr != self.addr:
                 return
         elif not self.ctx.in_target_function(ins_addr):
+            return
+        # Already recorded this narrowing site? Skip everything below — the capstone
+        # decode, the satisfiability solve, and the witness solve would all just be
+        # deduped away. The narrowing breakpoint fires for the SAME xtn on every path, and
+        # on an FP-heavy function those per-path solves are what make a run crawl and look
+        # hung (so cancel, checked only between steps, can't land). Dedup FIRST.
+        if (ins_addr, big, small) in self._seen:
             return
         # Gate by the actual INSTRUCTION. The expr breakpoint fires on every VEX
         # sub-expression, so bit-manipulation (and/orr/bic/bfxil/lsr…) and byte
@@ -757,6 +757,8 @@ class FloatAnomalyCheck(BaseCheck):
         return out
 
     def _on_expr(self, state):
+        if self.ctx.is_cancelled():
+            return
         insp = state.inspect
         r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
         if r is None or not hasattr(r, "op"):
@@ -975,6 +977,8 @@ class DivByZeroCheck(BaseCheck):
         state.inspect.b("expr", when=angr.BP_AFTER, action=self._on_expr)
 
     def _on_expr(self, state):
+        if self.ctx.is_cancelled():
+            return
         insp = state.inspect
         r = insp.attrs.expr_result if hasattr(insp, "attrs") else insp.expr_result
         if not isinstance(r, claripy.ast.BV):
@@ -1079,6 +1083,13 @@ class CheckContext:
     path_of: Callable
     on_hit: Callable[[Hit, Any], None]   # (hit, state it was found on)
     block_head: Callable[[int], int]
+    cancelled: Callable[[], bool] = None  # True once the user asked to cancel the run
 
     def in_target_function(self, addr: int) -> bool:
         return self.target_func_lo <= addr < self.target_func_hi
+
+    def is_cancelled(self) -> bool:
+        try:
+            return bool(self.cancelled and self.cancelled())
+        except Exception:
+            return False

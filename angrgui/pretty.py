@@ -151,21 +151,43 @@ def _sext_concat(e):
     return last
 
 
+class _BudgetExceeded(Exception):
+    pass
+
+
 class Printer:
+    # Max AST nodes to visit when formatting one expression. A readable condition is tiny;
+    # but a symbolic floating-point branch (e.g. aa_lineto's clamp/compare) can be MILLIONS
+    # of nodes, and walking it to text took tens of seconds per step — the run looked hung
+    # and cancel (checked between steps) couldn't land. Past the budget we bail to a short
+    # placeholder instead of traversing (and WITHOUT falling back to str(ast), which would
+    # walk the whole thing again).
+    NODE_BUDGET = 20000
+
     def __init__(self, names: Names, limit=160):
         self.names = names
         self.limit = limit
+        self._budget = 0
 
     def __call__(self, ast, limit=None) -> str:
+        self._budget = self.NODE_BUDGET
         try:
             s, _ = self.p(ast)
+        except _BudgetExceeded:
+            s = f"<complex {getattr(ast, 'op', '?')} expression>"
         except Exception:  # never let pretty-printing break a run
-            s = str(ast)
+            try:
+                s = str(ast)
+            except Exception:
+                s = "<expression>"
         lim = self.limit if limit is None else limit
         return s if len(s) <= lim else s[: lim - 1] + "…"
 
     # returns (text, is_atom)
     def p(self, e, signed_ctx=False):
+        self._budget -= 1
+        if self._budget <= 0:
+            raise _BudgetExceeded()
         op = e.op
         if op == "BoolV":
             return ("true" if e.args[0] else "false"), True
