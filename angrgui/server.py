@@ -502,7 +502,10 @@ def _enrich_buffer_members(spec: dict) -> dict:
             data = S.ida.struct_layout(st)
             arg = b.get("arg")
             b["struct_type"] = st
-            b["member_map"] = [[int(m["offset"]), int(m["size"]) or 1, f"{arg}->{m['name']}"]
+            # 4th element flags float/double members so the witness formats them as numbers
+            # (e.g. dev_offset = 2147483648.0) instead of raw hex bits.
+            b["member_map"] = [[int(m["offset"]), int(m["size"]) or 1, f"{arg}->{m['name']}",
+                                any(t in str(m.get("type", "")).lower() for t in ("float", "double"))]
                                for m in data.get("members", [])]
         except Exception:
             pass

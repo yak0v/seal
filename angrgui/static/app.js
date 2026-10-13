@@ -1503,7 +1503,11 @@ function renderHit(h, i) {
     h.extra?.src_line ? el("span", { class: "faint" }, h.extra.src_line.file + ":" + h.extra.src_line.line) : null));
   box.append(el("div", { class: "msg" }, h.message));
   const wit = h.witness || {};
-  const scalars = Object.entries(wit).filter(([k, v]) => typeof v === "object" && !k.includes("->"));
+  // show the actual arguments first, then any named struct-member fields (e.g.
+  // state->dev_offset) — these ARE part of the witness and used to be hidden, which made
+  // a struct-backed finding look like it only had pt/z.
+  const scalars = Object.entries(wit).filter(([k, v]) => typeof v === "object")
+    .sort((a, b) => (a[0].includes("->") ? 1 : 0) - (b[0].includes("->") ? 1 : 0));
   const byteInputs = Object.entries(wit).filter(([k, v]) => typeof v === "string" && v);
   if (scalars.length) box.append(el("div", { class: "wit" },
     el("span", { class: "faint" }, "inputs: "), ...scalars.map(([k, v]) => valChip(k, fmtOne(k, v)))));
@@ -2171,6 +2175,11 @@ function renderPathDetail(T, snap) {
 function fmtOne(name, v) {
   if (typeof v === "string") return bytesPretty(v);            // stdin, hex-encoded bytes
   if (!v || !v.hex) return String(v);
+  if (typeof v.f === "number") {                               // float/double struct member
+    if (!isFinite(v.f)) return String(v.f);                    // inf / -inf / nan
+    const a = Math.abs(v.f);
+    return (a !== 0 && (a < 1e-4 || a >= 1e16)) ? v.f.toExponential(6) : String(v.f);
+  }
   if (v.bits > 64) return bytesPretty(BigInt(v.hex).toString(16).padStart(v.bits / 4, "0"));
   const arg = A.config?.args.find(a => a.name === name);
   const signed = arg ? arg.signed !== false : false;

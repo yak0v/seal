@@ -211,14 +211,25 @@ def witness_of(state) -> dict:
         if not (isinstance(buf, claripy.ast.Base) and buf.op == "BVS"):
             continue
         n = buf.size()
-        for off, size, mname in members[:96]:
+        for m in members[:96]:
+            off, size, mname = m[0], m[1], m[2]
+            is_float = len(m) > 3 and bool(m[3])
             if not (1 <= size <= 8) or off * 8 + size * 8 > n:
                 continue
             try:
                 parts = [buf[n - 1 - 8 * (off + i):n - 8 * (off + i) - 8] for i in range(size)]
                 bv = parts[0] if size == 1 else claripy.Concat(*reversed(parts))
                 if bv.symbolic:                       # only report fields the inputs actually fix
-                    out[mname] = _fmt(take(bv, size * 8), size * 8)
+                    raw = take(bv, size * 8)
+                    cell = _fmt(raw, size * 8)
+                    if is_float and size in (4, 8):   # reinterpret the bits as a float
+                        try:
+                            import struct as _struct
+                            packed = raw.to_bytes(size, "little")
+                            cell["f"] = _struct.unpack("<f" if size == 4 else "<d", packed)[0]
+                        except Exception:
+                            pass
+                    out[mname] = cell
                     covered.add(bufname)
             except Exception:
                 pass
