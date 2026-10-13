@@ -234,7 +234,12 @@ function renderFunctions() {
   const list = A.functions.filter(f =>
     (!onlyNamed || f.named) && (!q || f.name.toLowerCase().includes(q) || (f.ida_name||"").toLowerCase().includes(q) || hx64(f.addr).includes(q)));
   if (!list.length) { box.append(el("div", { class: "empty" }, "No matching functions.")); return; }
-  for (const f of list) {
+  // Cap the rendered rows. A stripped dylib has thousands of functions; building a DOM
+  // node for every one on each render (and renderFunctions runs on every selectFunction)
+  // made the whole GUI sluggish/unresponsive. Render a window and point to search.
+  const CAP = 600;
+  const shown = list.slice(0, CAP);
+  for (const f of shown) {
     const node = el("div", { class: "fn" + (f.named ? "" : " unnamed") + (A.fn && A.fn.addr === f.addr ? " sel" : "") },
       el("div", { class: "nm" }, f.ida_name ? el("span", { class: "idanm" }, f.ida_name) : f.name),
       el("div", { class: "sub" },
@@ -247,6 +252,8 @@ function renderFunctions() {
     node.addEventListener("click", () => selectFunction(f));
     box.append(node);
   }
+  if (list.length > CAP) box.append(el("div", { class: "faint", style: "padding:8px;font-size:11px" },
+    `showing ${CAP} of ${list.length} — type in the filter to narrow`));
 }
 
 // ==================================================================== select function
@@ -515,7 +522,20 @@ async function nbResolve(func, status) { try { await jpost(`/api/targets/${func}
 async function goToFn(addr, runId) {
   const a = typeof addr === "string" ? parseInt(addr, 16) : addr;
   const f = (A.functions || []).find(x => x.addr === a);
-  if (f) await selectFunction(f);   // jump to the function; its stored config/last run load with it
+  if (!f) { toast("that function isn't in the loaded list", true); return; }
+  await selectFunction(f);          // jump to the function (loads its config + last run)
+  // If a SPECIFIC run was clicked (a run-history row), load THAT run's results, not just
+  // the function's most recent one — otherwise clicking a run in the Notebook looked inert.
+  if (runId && (!A.run || A.run.id !== runId)) {
+    try {
+      const snap = await api("/api/run/" + runId);
+      A.run = { id: runId, snapshot: snap };
+      A.selectedHit = null; A.selNode = null; A.pathHighlight = null;
+      renderCode(); renderDock();
+      selectTab(A.ida && A.ida.connected ? "decomp" : "code");
+      toast(`loaded run ${runId.slice(0, 8)} (${(snap.hits || []).length} findings)`);
+    } catch (e) { toast("couldn't load that run: " + e.message, true); }
+  }
 }
 
 // ===================================================================== State tab
