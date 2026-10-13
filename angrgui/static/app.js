@@ -2645,10 +2645,17 @@ function openIdaModal() {
     try {
       A.ida = await jpost("/api/ida/connect", { url: u });
       updateIdaBtn();
-      await loadFunctions();
-      if (A.fn) renderDecomp();
       toast(`IDA connected: ${A.ida.name_count} names`);
       m.remove();
+      if (A.binary) {
+        // a binary is already loaded — refresh its names/decompilation from IDA
+        await loadFunctions();
+        if (A.fn) renderDecomp();
+      } else {
+        // no binary loaded — the whole point of connecting is to pull it from IDA (#9),
+        // so go straight to import instead of failing on loadFunctions ("no binary loaded")
+        await importFromIda();
+      }
     } catch (e) { toast("connect failed: " + e.message, true); connect.disabled = false; connect.textContent = "Connect"; }
   } }, "Connect");
   const foot = [connect];
