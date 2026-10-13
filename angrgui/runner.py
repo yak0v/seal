@@ -858,8 +858,11 @@ class Run:
                 cons.append(g)
         if not cons:
             return None
-        # show the whole condition (a generous cap guards only pathological cases)
-        fmt = (lambda c: self._printer(c, limit=4000)) if self._printer is not str else str
+        # Cap each condition to a readable length. A branch on symbolic floating-point
+        # (aa_lineto's clamp/compare) stringifies to thousands of chars of fp gibberish
+        # that is unreadable anyway AND froze the GUI when rendered across the path tree.
+        # Short readable conditions (flags & 0x30000, outcodes) are well under this.
+        fmt = (lambda c: self._printer(c, limit=240)) if self._printer is not str else str
         return " && ".join(fmt(c) for c in cons)
 
     def _decision_point(self, parent: PathNode) -> dict | None:

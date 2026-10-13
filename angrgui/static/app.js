@@ -1997,6 +1997,9 @@ function pathsSummary(T, snap) {
 }
 const leafReason = (n, snap) => n.end?.reason || (["running", "pending"].includes(snap.status) ? "running" : "unfinished");
 
+// module-level truncation (drawPathTree has its own local `short`, not in scope here)
+function _trunc(s, n) { return s && s.length > n ? s.slice(0, n - 1) + "…" : (s || ""); }
+
 function renderPathNode(T, n, snap) {
   const kids = T.kids[n.id] || [];
   const collapsed = A.collapsed.has(n.id);
@@ -2016,8 +2019,8 @@ function renderPathNode(T, n, snap) {
     const asm = snap.summary?.assumptions_applied || [];
     if (asm.length) head.append(el("span", { class: "where" }, "assuming " + asm.join(", ")));
   } else {
-    head.append(el("span", { class: "cond", title: (n.cond ? n.cond + "\n\n" : "") + "the inputs must satisfy this to take this side of the branch (full text in Path detail below)" },
-      n.cond || "(no input-dependent condition)"));
+    head.append(el("span", { class: "cond", title: (n.cond ? n.cond.slice(0, 2000) + "\n\n" : "") + "the inputs must satisfy this to take this side of the branch (full text in Path detail below)" },
+      n.cond ? _trunc(n.cond, 240) : "(no input-dependent condition)"));
     if (n.decided_at?.line) head.append(el("span", { class: "where", title: "decided at " + hx64(n.decided_at.addr) },
       `${n.decided_at.file}:${n.decided_at.line}  ${n.decided_at.text || ""}`));
   }
@@ -2131,7 +2134,8 @@ function renderPathDetail(T, snap) {
   const colA = el("div", { class: "pcol" }, el("div", { class: "dlabel" }, "To get here, the inputs satisfy"));
   if (!conds.length && !asm.length) colA.append(el("div", { class: "faint" }, "no conditions — every run starts here"));
   asm.forEach(a => colA.append(el("div", { class: "dcond" }, el("span", { class: "cond" }, a), el("span", { class: "where" }, "assumption"))));
-  conds.forEach(c => colA.append(el("div", { class: "dcond" }, el("span", { class: "cond" }, c.cond || "?"),
+  conds.forEach(c => colA.append(el("div", { class: "dcond" },
+    el("span", { class: "cond", title: (c.cond || "").length > 600 ? c.cond.slice(0, 2000) : "" }, _trunc(c.cond || "?", 600)),
     c.decided_at?.line ? el("span", { class: "where" }, `${c.decided_at.file}:${c.decided_at.line} ${c.decided_at.text || ""}`) : null)));
 
   const colB = el("div", { class: "pcol" });
