@@ -1,63 +1,241 @@
-import json, lldb
-OFF = 0x4ee80          # aa_lineto offset from CoreGraphics __TEXT base (unslid)
+"""General concolic-snapshot capture (lldb). Function-agnostic.
+
+Stop the process wherever you want to seed from, then run `seal_snapshot` (optionally with
+an output path). It dumps:
+
+  * every register (general + the 128-bit NEON/vector regs, read as raw bytes), and
+  * the process's DATA MEMORY IMAGE — every readable region that is writable or anonymous
+    (heap, stack, __DATA, __bss, mmap'd data), plus the regions of the module you're in.
+
+WHY the whole image, not "follow x0"
+------------------------------------
+A snapshot is only sound if the real bytes are present wherever execution OR a symbolic
+value can reach. Chasing concrete pointers out of one argument register misses (a) other
+pointer arguments, (b) anything reachable only after you make a field symbolic, and (c)
+globals/stack. So we record all of the process's own data instead of guessing a reachable
+set. Executable/code regions and other modules' read-only file-backed regions are skipped
+by default — angr loads the target's code itself, and the shared cache is gigabytes; pass
+`full` to include read-only file-backed regions too.
+
+USAGE (lldb)
+    (lldb) command script import seal_validation/snapshot/capture.py
+    (lldb) breakpoint set --address <addr of the function to seed from>
+    (lldb) run                      # or: process continue, until you're stopped there
+    (lldb) seal_snapshot            # -> /tmp/snap.json   (or: seal_snapshot /path out.json full)
+
+Then feed /tmp/snap.json to SEAL: it computes the image slide from the module map and
+rebases (see angrgui/snapshot/rebase.py).
+"""
+import json
+import lldb
+
+PER_REGION_CAP = 256 * 1024 * 1024       # skip a single region bigger than this (report it)
+TOTAL_CAP = 2 * 1024 * 1024 * 1024        # stop once we've captured this much in total
+
+
 def __lldb_init_module(debugger, d):
+    debugger.HandleCommand("command script add -f capture.seal_snapshot seal_snapshot")
+    # kept for backwards compat with the old aa_lineto workflow:
     debugger.HandleCommand("command script add -f capture.setup aa_setup")
-def _cg_text_base(target):
-    for m in target.module_iter():
-        if m.GetFileSpec().GetFilename() == "CoreGraphics":
-            return m.FindSection("__TEXT").GetLoadAddress(target)
-    return None
-def setup(debugger, command, result, internal_dict):
-    t = debugger.GetSelectedTarget()
-    base = _cg_text_base(t)
-    addr = base + OFF
-    bp = t.BreakpointCreateByAddress(addr)
-    bp.SetScriptCallbackFunction("capture.dump")
-    print("AA_BP @ %#x  (CG __TEXT %#x + %#x)  locations=%d" % (addr, base, OFF, bp.GetNumLocations()))
-def dump(frame, loc, extra, d):
-    p = frame.GetThread().GetProcess(); t = p.GetTarget()
-    base = _cg_text_base(t)
+
+
+# ----------------------------------------------------------------- registers
+def _dump_regs(frame):
     regs = {}
     for rset in frame.GetRegisters():
         for r in rset:
             try:
-                u = r.GetValueAsUnsigned()
-                # GetValueAsUnsigned truncates / fails for 128-bit NEON regs (v0..v31) —
-                # read the raw bytes instead so vector state is captured, not dropped.
                 data = r.GetData()
                 nbytes = data.GetByteSize() if data else 0
-                if nbytes > 8:
-                    e2 = lldb.SBError()
-                    raw = data.ReadRawData(e2, 0, nbytes)
-                    regs[r.GetName()] = int.from_bytes(bytes(raw), "little") if e2.Success() else u
+                if nbytes > 8:                    # 128-bit NEON: read raw bytes, don't truncate
+                    e = lldb.SBError()
+                    raw = data.ReadRawData(e, 0, nbytes)
+                    regs[r.GetName()] = int.from_bytes(bytes(raw), "little") if e.Success() else r.GetValueAsUnsigned()
                 else:
-                    regs[r.GetName()] = u
+                    regs[r.GetName()] = r.GetValueAsUnsigned()
             except Exception:
                 pass
-    err = lldb.SBError()
-    def rd(a, n):
-        # Read page by page and keep whatever is mapped: a fixed-size read that runs off
-        # the end of a region (e.g. 8 KiB up from sp overruns the top of the stack into
-        # the guard page) makes ReadMemory fail the WHOLE request and drops the valid
-        # bytes. Stop at the first unreadable page instead and return what we got.
-        PAGE = 0x1000
-        out = bytearray()
-        off = 0
-        while off < n:
-            e = lldb.SBError()
-            chunk = p.ReadMemory(a + off, min(PAGE, n - off), e)
-            if not (e.Success() and chunk):
-                break
-            out += chunk
-            off += len(chunk)
-        return out.hex() if out else None
+    return regs
+
+
+# -------------------------------------------------------------------- memory
+def _read_region(proc, base, size):
+    """Read a region page-by-page, keeping whatever is mapped (a fixed read that runs off
+    the end fails the WHOLE request in lldb)."""
+    PAGE = 0x1000
+    out = bytearray()
+    off = 0
+    while off < size:
+        e = lldb.SBError()
+        chunk = proc.ReadMemory(base + off, min(PAGE, size - off), e)
+        if not (e.Success() and chunk):
+            break
+        out += chunk
+        off += len(chunk)
+    return bytes(out)
+
+
+def _readable_regions(proc):
+    """[(base, end, writable, executable, name), ...] for every readable region."""
+    out = []
+    regions = proc.GetMemoryRegions()
+    info = lldb.SBMemoryRegionInfo()
+    for i in range(regions.GetSize()):
+        if regions.GetMemoryRegionAtIndex(i, info) and info.IsReadable():
+            out.append((info.GetRegionBase(), info.GetRegionEnd(),
+                        info.IsWritable(), info.IsExecutable(), info.GetName() or ""))
+    out.sort()
+    return out
+
+
+PAC_MASK = (1 << 48) - 1          # arm64e: strip the pointer-authentication bits (high bits)
+BFS_BUDGET = 64 * 1024 * 1024     # hard ceiling on reachable-capture total
+BFS_DEPTH = 3                     # hops to follow from the arguments (bounds the global-graph blow-up)
+
+
+def _capture_full(proc, regions):
+    """The whole data image: every readable region that's writable or anonymous (heap,
+    stack, __DATA, __bss, mmap'd data). Skips code and read-only file-backed (shared cache)."""
+    mem, skipped, total = [], [], 0
+    for base, end, writable, executable, name in regions:
+        size = end - base
+        if executable:
+            skipped.append([hex(base), size, "exec"]); continue
+        if name and not writable:
+            skipped.append([hex(base), size, "ro-file"]); continue
+        if size > PER_REGION_CAP:
+            skipped.append([hex(base), size, "too-big"]); continue
+        if total + size > TOTAL_CAP:
+            skipped.append([hex(base), size, "total-cap"]); continue
+        data = _read_region(proc, base, size)
+        if data:
+            mem.append({"addr": base, "hex": data.hex()}); total += len(data)
+    return mem, total, skipped
+
+
+def _capture_reachable(proc, regions, seeds):
+    """BFS the memory reachable from `seeds` (the register values): read a window around
+    each valid pointer and scan the bytes for more pointers, following them (PAC-masked),
+    bounded by BFS_BUDGET. This captures every argument's structs and what they point to —
+    not just x0 — without dumping the whole process."""
+    def region_of(p):
+        lo, hi = 0, len(regions) - 1
+        while lo <= hi:
+            m = (lo + hi) >> 1
+            if regions[m][0] <= p < regions[m][1]:
+                return regions[m]
+            if p < regions[m][0]:
+                hi = m - 1
+            else:
+                lo = m + 1
+        return None
+    def resolve(p):                                  # a valid data pointer, or None
+        for cand in (p, p & PAC_MASK):
+            r = region_of(cand)
+            if r and not r[3]:                       # in a readable, non-executable region
+                return cand
+        return None
+
+    mem, total = [], 0
+    queue = [(resolve(p), 0) for p in seeds if resolve(p) is not None]
+    seen = set()                                     # page addresses already captured
+    while queue and total < BFS_BUDGET:
+        p, depth = queue.pop(0)
+        start = p & ~0xFFF
+        if start in seen:
+            continue
+        seen.add(start)
+        e = lldb.SBError()
+        data = proc.ReadMemory(start, 0x1000, e)     # one page per pointer; BFS follows the rest
+        if not (e.Success() and data):
+            continue
+        data = bytes(data)
+        mem.append({"addr": start, "hex": data.hex()}); total += len(data)
+        if depth >= BFS_DEPTH:
+            continue                                 # captured the page, but don't recurse deeper
+        for off in range(0, len(data) - 7, 8):       # scan the page for more pointers
+            q = int.from_bytes(data[off:off + 8], "little")
+            if q:
+                qr = resolve(q)
+                if qr is not None and (qr & ~0xFFF) not in seen:
+                    queue.append((qr, depth + 1))
+    return mem, total, []
+
+
+def _capture_memory(proc, target, frame, mode):
+    regions = _readable_regions(proc)
+    if mode == "full":
+        return _capture_full(proc, regions)
+    # reachable (default): seed from the ARGUMENT registers (AAPCS64 x0-x7) + the frame/link
+    # regs, and BFS their pointer graph (depth-bounded). Also grab the stack frame directly,
+    # since the pointers don't reach spilled locals.
+    gvr = lambda n: frame.FindRegister(n).GetValueAsUnsigned()
+    seeds = []
+    for n in ("x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x29", "x30"):
+        try: seeds.append(gvr(n))
+        except Exception: pass
+    mem, total, _ = _capture_reachable(proc, regions, seeds)
+    sp = gvr("sp")
+    stack = _read_region(proc, sp & ~0xFFF, 0x8000)   # the current stack frame
+    if stack:
+        mem.append({"addr": sp & ~0xFFF, "hex": stack.hex()}); total += len(stack)
+    return mem, total, []
+
+
+def _modules(target):
+    """Each loaded module's live __TEXT base + name, so SEAL can compute the slide."""
+    out = []
+    for m in target.module_iter():
+        try:
+            fn = m.GetFileSpec().GetFilename()
+            sec = m.FindSection("__TEXT")
+            base = sec.GetLoadAddress(target) if sec else lldb.LLDB_INVALID_ADDRESS
+            if base != lldb.LLDB_INVALID_ADDRESS:
+                out.append({"name": fn, "text": base})
+        except Exception:
+            pass
+    return out
+
+
+# --------------------------------------------------------------------- command
+def seal_snapshot(debugger, command, result, internal_dict):
+    args = command.split()
+    out_path = next((a for a in args if a != "full"), "/tmp/snap.json")
+    want_full = "full" in args
+    t = debugger.GetSelectedTarget()
+    proc = t.GetProcess()
+    frame = proc.GetSelectedThread().GetFrameAtIndex(0)
+
+    regs = _dump_regs(frame)
     gv = lambda n: frame.FindRegister(n).GetValueAsUnsigned()
-    x0, sp = gv("x0"), gv("sp")
-    snap = {"arch": "AARCH64", "func": "aa_lineto", "cg_text_base": base, "aa_offset": OFF,
-            "pc": gv("pc"),                          # top-level pc (SEAL's restore prefers this)
-            "regs": regs,
-            "mem": {hex(x0): rd(x0, 8192), hex(sp): rd(sp, 8192)}}
-    open("/tmp/snap.json", "w").write(json.dumps(snap))
-    print("SNAPSHOT: pc=%#x x0(state)=%#x sp=%#x regs=%d mem_ok=%s" %
-          (gv("pc"), x0, sp, len(regs), all(v for v in snap["mem"].values())))
+    pc = gv("pc")
+    mode = "full" if want_full else "reachable"
+    mem, total, skipped = _capture_memory(proc, t, frame, mode)
+    snap = {"arch": "AARCH64", "pc": pc, "regs": regs, "mem": mem,
+            "modules": _modules(t),
+            "capture": {"mode": mode, "regions": len(mem), "bytes": total, "skipped": skipped}}
+    with open(out_path, "w") as fh:
+        json.dump(snap, fh)
+    print("SNAPSHOT %s  pc=%#x regs=%d  mem: %d regions, %.2f MB (%s)  (skipped %d)"
+          % (out_path, pc, len(regs), len(mem), total / 1e6, mode, len(skipped)))
     return False
+
+
+# ----------------------------------------------- legacy aa_lineto convenience
+OFF = 0x4ee80          # aa_lineto offset from CoreGraphics __TEXT base (unslid)
+
+
+def setup(debugger, command, result, internal_dict):
+    t = debugger.GetSelectedTarget()
+    base = next((m.FindSection("__TEXT").GetLoadAddress(t) for m in t.module_iter()
+                 if m.GetFileSpec().GetFilename() == "CoreGraphics"), None)
+    if base is None:
+        print("CoreGraphics not loaded yet"); return
+    bp = t.BreakpointCreateByAddress(base + OFF)
+    bp.SetScriptCallbackFunction("capture._bp_snapshot")
+    print("AA_BP @ %#x  (CG __TEXT %#x + %#x)  locations=%d" % (base + OFF, base, OFF, bp.GetNumLocations()))
+
+
+def _bp_snapshot(frame, loc, extra, d):
+    seal_snapshot(frame.GetThread().GetProcess().GetTarget().GetDebugger(), "/tmp/snap.json", None, d)
+    return True        # one-shot: stop after the first capture (don't re-capture every hit)

@@ -248,8 +248,15 @@ the bug becomes a *precise* condition instead of "every path."
 End-to-end:
 
 1. **Capture** (`angrgui/snapshot/capture.py`, an lldb script): stop at the function, run
-   `seal_snapshot`. It dumps all general registers plus memory reached by following pointers
-   out of them (BFS, with arm64e PAC masking) and records the image slide. **Break at the true
+   `seal_snapshot`. It is function-agnostic. It dumps every register (incl. the 128-bit NEON
+   regs) and, by default, the memory **reachable from the argument registers** (x0-x7 + frame
+   regs) — BFS over concrete pointers, arm64e PAC-masked, depth-bounded (so a dense global
+   graph doesn't explode), plus the stack frame. `seal_snapshot <out> full` instead dumps the
+   whole data image (every writable/anonymous readable region) — complete but large (hundreds
+   of MB on a real process). It also records each module's live __TEXT base so SEAL can compute
+   the slide. NOTE: the reachable graph on a complex process is dense; the depth-bounded default
+   captures the arguments' structures and nearby pointers, not a guaranteed-complete closure —
+   for that use `full`, or (future) lazy page-in from a core. **Break at the true
    function entry** (`--skip-prologue false`) or the argument registers are already spilled and
    dead. For a dyld-shared-cache image, set the breakpoint by **address** using
    `seal_validation/snapshot/live_bp.py` (`seal_setbp <Module> <file_addr>`), because breaking
