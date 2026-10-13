@@ -573,13 +573,14 @@ class NarrowingCastCheck(BaseCheck):
 
     @staticmethod
     def _narrowing(r):
-        """Recognise a truncating narrow and return (small, big, dropped_bits, shape) or None.
+        """Recognise a truncating narrow and return (small, big, fulls, shape) or None.
 
         Two shapes:
           * scalar C cast  -> Extract(small-1:0, inner)          [inner wider, same value]
           * NEON xtn lane  -> Concat(inner[2k·s+s-1:2k·s] ...)   [low half of each 2s-wide
             lane of one vector] — our angr_arm_patch NarrowUn handler emits exactly this.
-        `dropped` is the bits thrown away (must be able to be non-zero to be a finding)."""
+        `fulls` are the full (pre-narrow) values, one per lane; the caller flags a finding
+        when some lane's value cannot fit the narrow width (truncation changes it)."""
         if not isinstance(r, claripy.ast.BV):
             return None
         if r.op == "Extract":                       # scalar: Extract(small-1 : 0, inner)
@@ -591,7 +592,7 @@ class NarrowingCastCheck(BaseCheck):
                 return None
             if not inner.symbolic:
                 return None
-            return small, big, inner[big - 1:small], "scalar"
+            return small, big, [inner], "scalar"
         if r.op == "Concat":
             # NEON lane-narrowing (xtn/vmovn/…): the result is a Concat of per-lane low
             # halves. The shape VARIES after claripy simplification — a lane may be a bare
@@ -608,20 +609,20 @@ class NarrowingCastCheck(BaseCheck):
             small = args[0].size()
             if small not in _STD_WIDTHS or any(a.size() != small for a in args):
                 return None
-            dropped = []
+            fulls = []
             for a in args:
                 if a.op == "Extract" and isinstance(a.args[2], claripy.ast.BV):
                     hi, lo, X = a.args
                     if hi - lo + 1 == small and X.size() >= lo + 2 * small:
-                        d = X[lo + 2 * small - 1: lo + small]   # bits this lane throws away
-                        if d.symbolic:
-                            dropped.append(d)
+                        full = X[lo + 2 * small - 1: lo]        # the 2*small-bit value this lane narrows
+                        if full.symbolic:
+                            fulls.append(full)
                         continue
                 if a.symbolic:                  # a symbolic lane that isn't a clean low-half
                     return None                 # Extract -> not a recognizable lane-narrowing
-            if not dropped:
+            if not fulls:
                 return None
-            return small, 2 * small, (claripy.Concat(*dropped) if len(dropped) > 1 else dropped[0]), "vector"
+            return small, 2 * small, fulls, "vector"
         return None
 
     def _on_expr(self, state):
@@ -630,7 +631,7 @@ class NarrowingCastCheck(BaseCheck):
         nar = self._narrowing(r)
         if nar is None:
             return
-        small, big, dropped, shape = nar
+        small, big, fulls, shape = nar
         ins_addr = state.scratch.ins_addr
         if ins_addr is None:
             return
@@ -652,8 +653,16 @@ class NarrowingCastCheck(BaseCheck):
             pass
         if not self._is_narrowing_insn(mn, shape):
             return
-        # a finding only if the bits we drop can actually be non-zero
-        cond = dropped != 0
+        # A finding only if the narrowing can ACTUALLY lose data — i.e. the value does not
+        # fit the narrow type, so truncating and sign-extending back changes it. Testing
+        # merely "dropped high bits != 0" over-reports: narrowing -1 (all-ones high bits)
+        # to int32 is still -1 — lossless. We want the inputs that make the value genuinely
+        # out of range (the real CVE-class overflow), not a benign negative.
+        def _lossy(full):
+            kept = full[small - 1:0]
+            return full != claripy.SignExt(full.size() - small, kept)
+        conds = [_lossy(f) for f in fulls]
+        cond = conds[0] if len(conds) == 1 else claripy.Or(*conds)
         try:
             if not state.solver.satisfiable(extra_constraints=[cond]):
                 return
