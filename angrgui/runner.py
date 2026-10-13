@@ -276,10 +276,15 @@ class Run:
             except Exception as e:
                 log.warning("snapshot mem @%s: %s", m.get("addr"), e)
         named = {}
+        floatvars = {}                                # name -> float layout ("f32","f64","f32x2",…)
         for s in (snap.get("symbolic") or []):       # attacker-controlled -> symbolic overlay
             nm = s.get("name") or "sym"
-            bv = claripy.BVS(nm, int(s.get("size", self.arch.bytes)) * 8)
+            sz = int(s.get("size", self.arch.bytes))
+            bv = claripy.BVS(nm, sz * 8)
             named[nm] = bv
+            fl = s.get("float")                       # mark float/vector regs so the witness
+            if fl:                                    # shows a number, not a raw byte blob
+                floatvars[nm] = fl if isinstance(fl, str) else ("f64" if sz >= 8 else "f32")
             try:
                 if s.get("reg"):
                     setattr(state.regs, s["reg"], bv)
@@ -287,6 +292,7 @@ class Run:
                     state.memory.store(int(s["addr"]), bv, endness=self.arch.memory_endness)
             except Exception as e:
                 log.warning("snapshot symbolic %s: %s", nm, e)
+        state.globals["angrgui_floatvars"] = floatvars
         state.globals["angrgui_vars"] = named
         state.globals["angrgui_argv"] = list(named.values())
         state.globals["angrgui_locals"] = {}

@@ -2196,14 +2196,19 @@ function renderPathDetail(T, snap) {
 }
 
 // ---------------------------------------------------------------- value formatting
+function fmtFloat(x) {
+  if (!isFinite(x)) return String(x);                          // inf / -inf / nan
+  const a = Math.abs(x);
+  return (a !== 0 && (a < 1e-4 || a >= 1e16)) ? x.toExponential(6) : String(x);
+}
 function fmtOne(name, v) {
   if (typeof v === "string") return bytesPretty(v);            // stdin, hex-encoded bytes
   if (!v || !v.hex) return String(v);
-  if (typeof v.f === "number") {                               // float/double struct member
-    if (!isFinite(v.f)) return String(v.f);                    // inf / -inf / nan
-    const a = Math.abs(v.f);
-    return (a !== 0 && (a < 1e-4 || a >= 1e16)) ? v.f.toExponential(6) : String(v.f);
+  if (Array.isArray(v.floats)) {                               // float/vector register or member
+    const fs = v.floats.map(fmtFloat);
+    return fs.length === 1 ? fs[0] : "(" + fs.join(", ") + ")";
   }
+  if (typeof v.f === "number") return fmtFloat(v.f);           // legacy single-float field
   if (v.bits > 64) return bytesPretty(BigInt(v.hex).toString(16).padStart(v.bits / 4, "0"));
   const arg = A.config?.args.find(a => a.name === name);
   const signed = arg ? arg.signed !== false : false;

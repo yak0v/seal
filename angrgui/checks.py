@@ -190,8 +190,23 @@ def witness_of(state) -> dict:
     land). batch_eval restores both joint consistency and speed."""
     out = {}
     names = state.globals.get("angrgui_vars", {})
+    floatvars = state.globals.get("angrgui_floatvars", {}) or {}
 
-    # Collect (key, bv, bits, is_float). Named struct members FIRST, so we know which
+    def _decode_floats(v, bits, fs):
+        """Reinterpret an integer value's bits as floats per layout fs."""
+        import struct as _s
+        try:
+            b = int(v).to_bytes(max(bits // 8, 1), "little")
+            if fs in ("f32", "float"):   return [_s.unpack("<f", b[:4])[0]]
+            if fs in ("f64", "double"):  return [_s.unpack("<d", b[:8])[0]]
+            if fs == "f32x2":            return list(_s.unpack("<ff", b[:8]))
+            if fs == "f64x2":            return list(_s.unpack("<dd", b[:16]))
+            if fs == "f32x4":            return list(_s.unpack("<ffff", b[:16]))
+        except Exception:
+            return None
+        return None
+
+    # Collect (key, bv, bits, floatspec). Named struct members FIRST, so we know which
     # buffers actually got named fields — a buffer's raw blob is hidden below only if its
     # fields genuinely replaced it (otherwise suppressing it would hide the state entirely).
     items = []
@@ -210,7 +225,8 @@ def witness_of(state) -> dict:
                 parts = [buf[n - 1 - 8 * (off + i):n - 8 * (off + i) - 8] for i in range(size)]
                 bv = parts[0] if size == 1 else claripy.Concat(*reversed(parts))
                 if bv.symbolic:                       # only report fields the inputs actually fix
-                    items.append((mname, bv, size * 8, is_float))
+                    fspec = ("f64" if size == 8 else "f32") if is_float else None
+                    items.append((mname, bv, size * 8, fspec))
                     covered.add(bufname)
             except Exception:
                 pass
@@ -218,7 +234,7 @@ def witness_of(state) -> dict:
         if nm in covered:                # raw buffer blob -> shown as its named members instead
             continue
         if isinstance(ast, claripy.ast.Base) and ast.symbolic:
-            items.append((nm, ast, ast.size(), False))
+            items.append((nm, ast, ast.size(), floatvars.get(nm)))   # float regs -> decoded below
 
     if items:
         asts = [it[1] for it in items]
@@ -226,15 +242,12 @@ def witness_of(state) -> dict:
             vals = list(state.solver.batch_eval(asts, 1)[0])   # ONE joint model
         except Exception:
             vals = [state.solver.eval(a) for a in asts]        # fallback (per-var; may not be joint)
-        for (key, _bv, bits, is_float), v in zip(items, vals):
+        for (key, _bv, bits, fspec), v in zip(items, vals):
             cell = _fmt(int(v), bits)
-            if is_float and bits in (32, 64):
-                try:
-                    import struct as _struct
-                    cell["f"] = _struct.unpack("<f" if bits == 32 else "<d",
-                                               int(v).to_bytes(bits // 8, "little"))[0]
-                except Exception:
-                    pass
+            if fspec:
+                fl = _decode_floats(int(v), bits, fspec)
+                if fl is not None:
+                    cell["floats"] = fl          # list of float lanes, shown instead of raw bytes
             out[key] = cell
 
     # byte inputs (stdin / files) — evaluated separately; these are independent of the
