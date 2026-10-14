@@ -565,8 +565,11 @@ class Run:
         mask = (1 << bits) - 1
         region = self.MODEL_REGION
         ro = self.arch.ret_offset
-        # SysV AMD64 integer argument registers, in order (this tool targets x86-64)
-        ARG_REGS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
+        # Integer argument registers for THIS arch's ABI (AArch64 AAPCS64 x0..x7,
+        # x86-64 SysV rdi/rsi/...): a model that reads its callee's args (return_arg,
+        # alloc size, an expr/predicate over args) must read the right bank, or it reads
+        # nonexistent x86 registers on arm64 and the model silently breaks.
+        ARG_REGS = tuple(self._int_arg_regs())
 
         def remember(state, name, val):
             vs = dict(state.globals.get("angrgui_vars", {}))
@@ -657,7 +660,17 @@ class Run:
 
     def _install_models(self, state):
         self._hooked = []
-        for m in (self.spec.get("models") or []):
+        models = self.spec.get("models") or []
+        # A call model only fires if the call is actually taken; skip_calls (CALLLESS,
+        # the default) skips every call, so a function/addr-target model is bypassed.
+        # Warn instead of silently ignoring it — this costs real debugging time.
+        if (models and self.spec.get("limits", {}).get("skip_calls", True)
+                and any(m.get("site") is None for m in models)):
+            self._setup_notes.append(
+                "call model(s) are set but skip_calls is ON, which bypasses them (the "
+                "calls are skipped, so the hooks never fire). Set limits.skip_calls=false "
+                "to use the models — note that then OTHER, unmodeled calls are stepped into.")
+        for m in models:
             try:
                 if m.get("site") is not None:
                     self._install_site_model(m)
@@ -776,6 +789,20 @@ class Run:
         if mmap:
             self._member_maps[f"{prefix}_buf"] = sorted(mmap, key=lambda x: x[0])
 
+    def _int_arg_regs(self) -> list:
+        """This arch's integer argument registers in order (AArch64 x0..x7, AMD64
+        rdi/rsi/...). Prefers the calling convention's own ARG_REGS, with a per-family
+        fallback. Shared by argument setup and call models so both read the same bank."""
+        try:
+            regs = list(getattr(self.project.factory.cc(), "ARG_REGS", None) or [])
+        except Exception:
+            regs = []
+        if regs:
+            return regs
+        if self.arch.name.startswith("AARCH64"):
+            return ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        return ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+
     def _set_arg(self, state, index, value, prototype):
         cc = self.project.factory.cc()
         # Proper path: place the value in the Nth argument's real location, honouring
@@ -788,14 +815,8 @@ class Run:
             return
         except Exception:
             pass
-        # Fallback: the arch's integer argument registers (cc.ARG_REGS is x0..x7 on
-        # AArch64, rdi/rsi/... on AMD64), then a hard-coded per-family list.
-        regs = list(getattr(cc, "ARG_REGS", None) or [])
-        if not regs:
-            if self.arch.name.startswith("AMD64"):
-                regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
-            elif self.arch.name.startswith("AARCH64"):
-                regs = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+        # Fallback: the arch's integer argument registers.
+        regs = self._int_arg_regs()
         if index < len(regs):
             setattr(state.regs, regs[index], value)
 
