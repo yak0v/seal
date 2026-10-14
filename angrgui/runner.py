@@ -175,6 +175,7 @@ class Run:
         self._return_addr = None
         self._loop_bound = 0
         self._skip_ret_names: dict = {}        # call-site addr -> readable name for its skipped-call return
+        self._branches: dict = {}              # branch block addr -> {taken:set, sym:bool}: concrete-gate tracking
 
     # ------------------------------------------------------------------ control
     def cancel(self):
@@ -1352,6 +1353,7 @@ class Run:
                 # bytes. End it cleanly as "left the image" instead.
                 fate = "left_image"
                 hijacked.append(s)
+            self._note_branch(s)
             pn = s.globals.get("angrgui_node")
             recent = list(s.history.recent_bbl_addrs)
             if pn is None or pn not in self.nodes:
@@ -1441,6 +1443,12 @@ class Run:
             "elapsed": self.progress["elapsed"],
         })
         self.summary["coverage"] = self._coverage()
+        covered = set()
+        for n in self.nodes.values():
+            covered |= set(n.block_addrs)
+        gates = self._concrete_gates(covered)
+        if gates:
+            self.summary["concrete_gates"] = gates
         # how trustworthy the findings are, at a glance (see _classify_finding)
         conf = {"confirmed": 0, "conditional": 0}
         for h in self.hits:
@@ -1451,6 +1459,167 @@ class Run:
         notes = self._diagnose(simgr)
         if notes:
             self.summary["notes"] = notes
+
+    def _note_branch(self, s):
+        """Record, per branch block, which targets were taken and whether the guard
+        was ever symbolic. A static 2-way branch that was only ever taken one way
+        with a CONCRETE guard is gated by fixed state (a snapshot field / a value the
+        inputs don't reach) — the other side can't be explored until that field is
+        made symbolic. (A branch seen with a symbolic guard is input-dependent; not a gate.)"""
+        try:
+            g = s.history.jump_guard
+            src = s.history.jump_source
+        except Exception:
+            return
+        if g is None or src is None:
+            return
+        try:
+            src = int(src if isinstance(src, int) else s.solver.eval(src))
+        except Exception:
+            return
+        if not (self.func_addr <= src < self.func_addr + self.func_size):
+            return
+        rec = self._branches.setdefault(src, {"taken": set(), "sym": False})
+        try:
+            tgt = s.history.jump_target
+            if tgt is not None:
+                rec["taken"].add(int(tgt if isinstance(tgt, int) else s.solver.eval(tgt)))
+        except Exception:
+            pass
+        try:
+            if g.symbolic:
+                rec["sym"] = True
+        except Exception:
+            pass
+
+    def _static_branch_edges(self, src: int) -> set:
+        """The two static successors of a conditional-branch block: {taken_target,
+        fallthrough}. Empty if the block does not end in a conditional branch."""
+        try:
+            blk = self.project.factory.block(src)
+            last = blk.capstone.insns[-1]
+            mn = last.mnemonic
+            cond = (mn.startswith("b.") or mn in ("cbz", "cbnz", "tbz", "tbnz")
+                    or (mn.startswith("j") and mn != "jmp"))      # arm64 + x86 conditional jumps
+            if not cond:
+                return set()
+            m = re.search(r"(0x[0-9a-fA-F]+)\s*$", last.op_str or "")
+            if not m:
+                return set()
+            return {int(m.group(1), 16), blk.addr + blk.size}       # target + fallthrough
+        except Exception:
+            return set()
+
+    def _reg_num(self, tok: str):
+        """Register number ignoring width: w8/x8 -> '8', so a cbz on w8 matches a load
+        into x8. None for sp/non-GP operands."""
+        m = re.fullmatch(r"[wx](\d{1,2}|zr)", (tok or "").strip().lower())
+        return m.group(1) if m else None
+
+    def _containing_block(self, addr: int) -> int:
+        """Start of the function block that contains `addr` (jump_source is the branch
+        INSTRUCTION, which may sit at the end of a multi-instruction block)."""
+        try:
+            starts = [b for b in self.func.block_addrs_set if b <= addr]
+            return max(starts) if starts else addr
+        except Exception:
+            return addr
+
+    def _gate_field_candidates(self, src: int) -> list:
+        """The field(s) whose concrete value decides this branch, as ready-to-paste
+        symbolic specs {base, offset, size}. We find the register the branch tests
+        (directly for cbz/tbz, via the preceding cmp/tst for b.<cond>) and the load that
+        defines it — so the suggestion is the EXACT gating field, not every load in the block."""
+        _SZ = {"ldrb": 1, "ldrsb": 1, "ldrh": 2, "ldrsh": 2, "ldrsw": 4}
+        try:
+            insns = self.project.factory.block(self._containing_block(src)).capstone.insns
+        except Exception:
+            return []
+        if not insns:
+            return []
+        last = insns[-1]
+        mn = last.mnemonic
+        tested = set()
+        if mn in ("cbz", "cbnz", "tbz", "tbnz"):
+            tested.add(self._reg_num((last.op_str or "").split(",")[0]))
+        elif mn.startswith("b.") or (mn.startswith("j") and mn != "jmp"):
+            for i in reversed(insns[:-1]):                         # the flag-setting compare
+                if i.mnemonic in ("cmp", "cmn", "tst", "ccmp", "subs", "ands", "adds"):
+                    for tok in re.split(r"[,\s]+", i.op_str or ""):
+                        rn = self._reg_num(tok)
+                        if rn:
+                            tested.add(rn)
+                    break
+        tested.discard(None)
+
+        def parse_load(i):
+            dst = (i.op_str or "").split(",")[0].strip()
+            size = _SZ.get(i.mnemonic, 8 if dst.startswith(("x", "d", "q")) else 4)
+            m = re.search(r"\[\s*(\w+)\s*(?:,\s*#(-?0x[0-9a-fA-F]+|-?\d+))?\s*\]", i.op_str or "")
+            if not m or m.group(1) == "sp":                       # skip stack spills
+                return None
+            return {"base": m.group(1), "offset": hex(int(m.group(2) or "0", 0)), "size": size,
+                    "_dst": self._reg_num(dst)}
+
+        # The LIVE definition of each tested register is the LAST load into it before the
+        # branch (earlier writes are overwritten — e.g. the two canary `ldr x8,[x8,..]`
+        # loads are superseded by `ldr w8,[x0,#0xb4]`, which is the real gating field).
+        last_def, allloads, seen = {}, [], set()
+        for i in insns:
+            if not i.mnemonic.startswith("ld"):
+                continue
+            c = parse_load(i)
+            if c is None:
+                continue
+            dst = c.pop("_dst")
+            if dst is not None:
+                last_def[dst] = c
+            key = (c["base"], c["offset"])
+            if key not in seen:
+                seen.add(key)
+                allloads.append(c)
+        precise = [last_def[r] for r in tested if r in last_def]
+        return (precise or allloads)[:6]
+
+    def _gate_test_text(self, src: int) -> str:
+        """The branch's own test, e.g. 'cbz w8' or 'tst w8, #0x30000; b.eq' — so even
+        when the deciding value is computed (not a single load) the agent sees what to
+        read in the decompilation to find the gating field."""
+        try:
+            insns = self.project.factory.block(self._containing_block(src)).capstone.insns
+            last = insns[-1]
+            txt = f"{last.mnemonic} {last.op_str}".strip()
+            if last.mnemonic.startswith("b.") and len(insns) > 1:
+                p = insns[-2]
+                txt = f"{p.mnemonic} {p.op_str}; {txt}".strip()
+            return txt
+        except Exception:
+            return ""
+
+    def _concrete_gates(self, covered: set) -> list:
+        """Static 2-way branches only ever taken one way with a concrete guard, whose
+        other side was never reached: the inputs can't currently steer them. Each entry
+        says where, which side was missed, and which fields to make symbolic to open it."""
+        gates = []
+        for src, rec in self._branches.items():
+            if rec["sym"]:                               # input-dependent branch, not a gate
+                continue
+            edges = self._static_branch_edges(src)
+            if len(edges) < 2:
+                continue
+            missed = [e for e in (edges - rec["taken"])
+                      if e not in covered and self.func_addr <= e < self.func_addr + self.func_size]
+            if not missed:
+                continue
+            gates.append({
+                "at": hex(src),
+                "test": self._gate_test_text(src),
+                "always_went": hex(min(rec["taken"])) if rec["taken"] else None,
+                "never_reached": hex(min(missed)),
+                "make_symbolic": self._gate_field_candidates(src),
+            })
+        gates.sort(key=lambda g: g["at"])
+        return gates[:8]
 
     def _coverage(self) -> dict:
         """How much of the TARGET function the run actually explored. A 0-finding run
@@ -1528,6 +1697,25 @@ class Run:
                 f"({', '.join(calls) or 'an unmodeled call'}), so it only holds IF that call can "
                 f"return the needed value. Confirm or dismiss by modeling the call (add_model) or "
                 f"constraining its return (add_assumption on it), then re-run.")
+        # Concrete gates: branches the inputs can't currently steer — the #1 reason a
+        # snapshot run misses the bug (a fixed field selects the safe side). Name them
+        # and hand over the exact field(s) to make symbolic to open the other side.
+        gates = self.summary.get("concrete_gates") or []
+        if gates and (len(self.hits) == 0 or (self.summary.get("coverage") or {}).get("pct", 100) < 100):
+            g = gates[0]
+            specs = g.get("make_symbolic") or []
+            hint = ""
+            if specs:
+                ex = specs[0]
+                hint = (f" The branch reads e.g. [{ex['base']}, {ex['offset']}]; add it to "
+                        f"load_snapshot symbolic as {{\"base\":\"{ex['base']}\",\"offset\":\"{ex['offset']}\","
+                        f"\"name\":\"gate\",\"size\":{ex['size']}}} (see make_symbolic in summary.concrete_gates "
+                        f"for all candidates) and re-run.")
+            notes.append(
+                f"{len(gates)} branch(es) were decided by CONCRETE state and their other side never "
+                f"explored — e.g. the branch at {g['at']} always went to {g['always_went']} and never "
+                f"reached {g['never_reached']}. That is a fixed value gating the path, not a dead end: "
+                f"make the field that selects it symbolic.{hint}")
         # Coverage: a 0-finding run that only reached part of the function is NOT a clean bill.
         cov = self.summary.get("coverage") or {}
         if cov.get("pct") is not None and cov["pct"] < 100:

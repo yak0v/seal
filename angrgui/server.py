@@ -1664,6 +1664,13 @@ get_run(run_id) returns:
         the bug may be in an unreached block. Raise steps/loop_bound, relax assumptions,
         or make a gating input symbolic to reach the rest.
       confidence {confirmed, conditional} — the finding tally by trust level.
+      concrete_gates[] — branches the inputs could NOT steer: a fixed value (usually a
+        snapshot field) sent every path down one side, so the other side was never
+        explored. Each {at, test, always_went, never_reached, make_symbolic[{base,offset,
+        size}]}: `test` is the branch's comparison (e.g. "cbz w8") and make_symbolic the
+        exact field(s) to add to load_snapshot's `symbolic` to open the unexplored side.
+        When make_symbolic is empty (the deciding value is computed or loaded earlier),
+        read `test` and the decompilation at `at`. The usual reason a snapshot run is empty.
       notes[] — plain-English hints (why a run was empty, which calls to model, etc.).
 
 THE WITNESS maps each input NAME to its value:
