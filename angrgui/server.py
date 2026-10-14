@@ -1008,6 +1008,76 @@ def _mcp_disassemble(addr):
     return {"addr": hex(_addr(addr)), "name": d["name"], "text": "\n".join(line(i) for i in d["instructions"])}
 
 
+# memory-unsafe-looking call targets (by name substring), for the sink scan
+_DANGEROUS_CALLS = ("memcpy", "memmove", "memset", "strcpy", "strcat", "stpcpy",
+                    "sprintf", "vsprintf", "bcopy", "alloca")
+
+def _mcp_scan_sinks(addr):
+    """Static pass over a function's disassembly that proposes WHERE to look — the
+    hardest judgment for someone who doesn't know the code. Flags the sink classes
+    SEAL has checks for (narrowing casts, register-indexed memory accesses, integer
+    division, memory-unsafe calls) and, where a check can be formed mechanically,
+    hands back a ready-to-add `suggested_check`. It reads nothing at run time: it is a
+    starting map, not proof — add the checks that fit and run to confirm."""
+    from .checks import NarrowingCastCheck
+    b = _need_binary()
+    a = _addr(addr)
+    d = b.disassemble(a)
+    narrow = NarrowingCastCheck._NARROW_VEC
+    sinks = []
+    for i in d["instructions"]:
+        mn = (i.get("mnemonic") or "").lower()
+        op = i.get("op_str") or ""
+        at = i["addr"]
+        if mn in narrow:
+            sinks.append({"addr": hex(at), "insn": i["text"], "kind": "narrowing_cast",
+                          "why": "narrows a wider value to fewer bits — the CoreGraphics-style "
+                                 "float/int truncation bug class",
+                          "suggested_check": {"kind": "narrowing_cast", "addr": hex(at)}})
+        elif mn in ("sdiv", "udiv"):
+            parts = [p.strip() for p in op.split(",")]
+            divisor = parts[-1] if parts else None
+            sc = ({"kind": "assert", "addr": hex(at), "expr": f"{divisor} != 0"}
+                  if divisor and re.fullmatch(r"[wx]\d{1,2}", divisor) else None)
+            sinks.append({"addr": hex(at), "insn": i["text"], "kind": "divide_by_zero",
+                          "why": "integer division faults if the divisor can be zero",
+                          "suggested_check": sc})
+        elif mn.startswith(("ldr", "str", "ldp", "stp")) and re.search(r"\[\s*\w+\s*,\s*[wx]\d", op):
+            # [base, index-register ...] — an array access whose index may be OOB
+            sinks.append({"addr": hex(at), "insn": i["text"], "kind": "oob_index",
+                          "why": "memory access indexed by a register — a candidate "
+                                 "out-of-bounds read/write if the index is attacker-influenced",
+                          "suggested_check": None,
+                          "note": "pin an oob_read/oob_write here with the buffer's base+size, "
+                                  "or assert the index register is in range, then run"})
+        elif mn in ("add", "sub") and re.search(r",\s*[wx]\d+,\s*(uxtw|sxtw|uxtx|sxtx|lsl)\b", op):
+            # scaled register index folded into a pointer (add x9, base, w0, uxtw #3) —
+            # the subsequent [x9] load/store is the array access that may be OOB
+            sinks.append({"addr": hex(at), "insn": i["text"], "kind": "oob_index",
+                          "why": "scaled register index into a pointer (array[index]) — the "
+                                 "load/store through the result is a candidate out-of-bounds "
+                                 "access if the index is attacker-influenced",
+                          "suggested_check": None,
+                          "note": "pin an oob_read/oob_write on the load/store that uses this "
+                                  "pointer (with the buffer's base+size), or assert the index "
+                                  "register is in range, then run"})
+        elif i.get("is_call") and any(s in (i.get("call_name") or "").lower() for s in _DANGEROUS_CALLS):
+            sinks.append({"addr": hex(at), "insn": i["text"], "kind": "dangerous_call",
+                          "why": f"calls {i.get('call_name')} — a memory-unsafe primitive; "
+                                 f"a symbolic size/length is an overflow candidate",
+                          "suggested_check": None,
+                          "note": "model the call (add_model) or put an oob_write on the "
+                                  "destination buffer, then run with skip_calls=false"})
+    by = {}
+    for s in sinks:
+        by[s["kind"]] = by.get(s["kind"], 0) + 1
+    return {"func": hex(a), "name": d["name"], "count": len(sinks),
+            "by_kind": by, "sinks": sinks[:60],
+            "hint": "these are STATIC candidates, not findings. Add the suggested_check "
+                    "(or your own) for the ones that look live, make the inputs that reach "
+                    "them symbolic, then run to confirm."}
+
+
 def _coerce_check(c, a):
     c = dict(c)
     if c.get("addr") is not None:                  # agents pass "0x..." strings
@@ -1512,6 +1582,10 @@ PART 3 — THE CORE LOOP (the happy path, in order)
 4. disassemble(addr)   (or decompile(addr) if IDA is connected)
      READ THE CODE. Decide which inputs matter and where the interesting
      operations/branches are. You cannot check well what you have not read.
+     scan_sinks(addr) jump-starts this: a static pass that proposes candidate sink
+     sites (narrowing casts, register-indexed accesses, division, memcpy-like calls)
+     with a ready-to-add suggested_check for each. Candidates, not findings — add the
+     ones that look live and run to confirm.
 5. configure(addr, patch)  /  add_assumption(addr, expr)  /  add_check(addr, check)
      Declare inputs (what is symbolic vs fixed, buffers, structs, stdin, files),
      constrain them to realistic ranges, and declare what to look for.
@@ -1913,6 +1987,13 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
     {"name": "decompile", "description": "IDA Hex-Rays pseudocode of a function (requires IDA connected).",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
+    {"name": "scan_sinks", "description": "Static pass that proposes WHERE to look in a function — the "
+     "hardest call when you don't know the code. Flags the sink classes SEAL checks for (narrowing "
+     "casts, register-indexed memory accesses, integer division, memory-unsafe calls like memcpy) and "
+     "returns a ready-to-add `suggested_check` where one can be formed. These are STATIC candidates, not "
+     "findings: add the checks that look live, make the inputs that reach them symbolic, then run to confirm. "
+     "A good first step after disassemble/decompile on an unfamiliar function.",
+     "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
     {"name": "configure", "description": "Set parts of a function's setup. patch may contain any of: "
      "args, buffers, assumptions (list of expression strings), stdin, checks, limits "
      "(e.g. {\"steps\":80,\"seconds\":30,\"skip_calls\":true}). Replaces the given keys.",
@@ -2064,6 +2145,7 @@ _MCP_TOOLS = {
     "get_function": lambda a: _mcp_get_function(a["addr"]),
     "disassemble": lambda a: _mcp_disassemble(a["addr"]),
     "decompile": lambda a: _mcp_decompile(a["addr"]),
+    "scan_sinks": lambda a: _mcp_scan_sinks(a["addr"]),
     "configure": lambda a: _mcp_configure(a["addr"], a["patch"]),
     "load_snapshot": lambda a: _mcp_load_snapshot(a["addr"], a["path"], a.get("symbolic")),
     "add_assumption": lambda a: _mcp_add(a["addr"], assumption=a["expr"]),
