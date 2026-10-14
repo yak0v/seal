@@ -2016,6 +2016,23 @@ E · Invariant / assertion (prove a property or get a counterexample)
    # 32-bit int leaves the high bits zero, so `ret s>= 0` is ALWAYS true and finds
    # nothing — wrap it to the real width: s32(ret) / u32(ret) (s16/u16, ... likewise).
 
+F · Snapshot → verdict: a CONDITIONAL lead that turns out SAFE (the hardest call)
+   # The full loop on an unfamiliar function seeded from a real snapshot.
+   scan_sinks(a)                       # -> an oob_index candidate at the array store
+   load_snapshot(a, "/path/snap.json", symbolic=[{base:"x0",offset:"0xb4",name:"gate"}])
+   add_check(a, {"kind":"oob_write","base":"sp + 0x18","size":32,"addr":0x<the store>})
+   rid = run(a).run_id ; r = poll get_run(rid)
+   # r.summary.concrete_gates tells you which field to make symbolic to reach the store;
+   # add it to load_snapshot symbolic and re-run. Now the finding appears but:
+   #   finding.extra.confidence == "conditional", depends_on == ["clip_ret"]
+   #   r.summary.notes: "...Resolve it with constrain_return(call=\"clip\", max=.../values=[...])"
+   # RESOLVE by bounding the callee's real return range. Get it by analysing the callee:
+   add_check(clip_addr, {"kind":"assert","expr":"u32(ret) <= 3","at_return":true})
+   # -> 0 findings => the bound holds. (u32(ret)<=2 gives a counterexample at 3 => max is 3.)
+   constrain_return(a, call="clip", max=3) ; re-run
+   # -> 0 findings. VERDICT: not a real bug — the index can't exceed the buffer. Had the
+   # callee been able to return a larger value, the finding would stay = a real OOB.
+
 ════════════════════════════════════════════════════════════════════════
 PART 14 — GOTCHAS (the list of things that will waste your time)
 ════════════════════════════════════════════════════════════════════════
