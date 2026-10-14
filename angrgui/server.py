@@ -995,6 +995,29 @@ def _mcp_get_function(addr):
     return out
 
 
+def _ack_config(a: int) -> dict:
+    """Config echo for a mutation ack, with the bulky snapshot initial state summarized.
+    A seeded scenario's initial_state carries 200+ registers and raw memory regions
+    (~45 KB); echoing that on every configure/add_check/constrain_return call is pure
+    noise. Keep the parts a caller edits (symbolic overlays, pc, slide) and summarize
+    the rest — the full dump is still available via get_function."""
+    out = _mcp_get_function(a)
+    cfg = dict(out["config"])
+    ini = cfg.get("initial_state")
+    if isinstance(ini, dict) and ini.get("kind") == "snapshot":
+        cfg["initial_state"] = {
+            "kind": "snapshot",
+            "pc": ini.get("pc"),
+            "slide": ini.get("slide") or (ini.get("image") or {}).get("slide"),
+            "regs": f"<{len(ini.get('regs') or {})} registers (via get_function for full)>",
+            "mem": f"<{len(ini.get('mem') or [])} region(s)>",
+            "symbolic": ini.get("symbolic") or [],
+        }
+    if out.get("warnings"):
+        cfg["warnings"] = out["warnings"]
+    return cfg
+
+
 def _mcp_disassemble(addr):
     b = _need_binary()
     d = b.disassemble(_addr(addr))
@@ -1153,7 +1176,7 @@ def _mcp_configure(addr, patch: dict):
         if patch.get("checks") is not None:
             cfg["checks"] = [_coerce_check(c, a) for c in patch["checks"]]
     _mutate_config(a, mutate)
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _mcp_add(addr, *, assumption=None, check=None):
@@ -1171,7 +1194,7 @@ def _mcp_add(addr, *, assumption=None, check=None):
         if check is not None:
             cfg["checks"] = list(cfg.get("checks", [])) + [_coerce_check(check, a)]
     _mutate_config(a, mutate)
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _mcp_add_model(addr, model):
@@ -1182,7 +1205,7 @@ def _mcp_add_model(addr, model):
         sc = cfg["scenarios"][cfg["active"]]
         sc["models"] = list(sc.get("models", [])) + [dict(model)]
     _mutate_config(a, mutate)
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _mcp_constrain_return(addr, call, values=None, min=None, max=None):
@@ -1204,9 +1227,13 @@ def _mcp_constrain_return(addr, call, values=None, min=None, max=None):
         raise HTTPException(400, "give at least one of values / min / max")
     def mutate(cfg):
         sc = cfg["scenarios"][cfg["active"]]
-        sc["return_bounds"] = list(sc.get("return_bounds", [])) + [b]
+        # REPLACE any existing bound for the same call rather than appending: stacking
+        # (e.g. max=3 then values=[5]) would silently make the call's return UNSAT and
+        # the finding would vanish for the wrong reason. One bound per call, last wins.
+        kept = [x for x in sc.get("return_bounds", []) if str(x.get("call")) != b["call"]]
+        sc["return_bounds"] = kept + [b]
     _mutate_config(a, mutate)
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _scenario_spec(a: int) -> dict:
@@ -1407,7 +1434,7 @@ def _mcp_add_scenario(addr, name=None, duplicate=False):
     cfg["scenarios"].append(sc)
     cfg["active"] = len(cfg["scenarios"]) - 1        # the new scenario becomes active
     _store_config(a, cfg, source="agent")
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _mcp_select_scenario(addr, scenario):
@@ -1416,7 +1443,7 @@ def _mcp_select_scenario(addr, scenario):
     cfg = S.workspace.get_function(a)
     cfg["active"] = _scenario_index(cfg, scenario)
     _store_config(a, cfg, source="agent")
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _mcp_delete_scenario(addr, scenario):
@@ -1428,7 +1455,7 @@ def _mcp_delete_scenario(addr, scenario):
     cfg["scenarios"].pop(_scenario_index(cfg, scenario))
     cfg["active"] = min(cfg["active"], len(cfg["scenarios"]) - 1)
     _store_config(a, cfg, source="agent")
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _mcp_rename_scenario(addr, scenario, name):
@@ -1437,7 +1464,7 @@ def _mcp_rename_scenario(addr, scenario, name):
     cfg = S.workspace.get_function(a)
     cfg["scenarios"][_scenario_index(cfg, scenario)]["name"] = name
     _store_config(a, cfg, source="agent")
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _mcp_load_binary(path):
@@ -1478,12 +1505,14 @@ def _mcp_remove_assumption(addr, index=None, expr=None):
         else:
             raise HTTPException(400, "give an assumption index or exact expr to remove")
     _mutate_config(a, mutate)
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _mcp_remove_check(addr, check):
     _need_binary()
     a = _addr(addr)
+    if check is None:
+        raise HTTPException(400, "give the check to remove as `check` or `id` (its id/name/index)")
     def mutate(cfg):
         checks = cfg.get("checks", [])
         idx = None
@@ -1501,7 +1530,7 @@ def _mcp_remove_check(addr, check):
                                 f"{[c.get('name') or c.get('id') or c.get('kind') for c in checks]}")
         checks.pop(idx)
     _mutate_config(a, mutate)
-    return _mcp_get_function(a)["config"]
+    return _ack_config(a)
 
 
 def _mcp_export_scenario(addr):
@@ -1611,12 +1640,13 @@ PART 3 — THE CORE LOOP (the happy path, in order)
 3. get_function(addr)
      Read the current setup, which is nested under the "config" key of the result:
      config.{args, buffers, assumptions, stdin, files, limits, models, initial_state,
-     checks, scenarios}. Arguments are symbolic by default. NOTE: checks and
-     assumptions are SHARED and DURABLE — they survive restarts and a load_snapshot
-     reload (which resets args/limits but NOT checks/assumptions). So a check left over
-     from a prior session can still be attached; if get_function returns a top-level
-     "warnings" list, it is flagging checks anchored outside this function — remove them
-     with remove_check before running.
+     checks, scenarios}. Arguments are symbolic by default. NOTE: checks, assumptions
+     AND return_bounds are SHARED and DURABLE — they survive restarts and a load_snapshot
+     reload (which resets args/limits but NOT checks/assumptions/return_bounds). So a
+     check or bound left over from a prior session can still be attached; clear them with
+     remove_check / configure({"return_bounds":[]}). If get_function returns a top-level
+     "warnings" list, it is flagging checks anchored outside this function — remove those
+     before running.
 4. disassemble(addr)   (or decompile(addr) if IDA is connected)
      READ THE CODE. Decide which inputs matter and where the interesting
      operations/branches are. You cannot check well what you have not read.
@@ -2109,8 +2139,12 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
     {"name": "remove_assumption", "description": "Remove one assumption from the active scenario, by index or exact expr.",
      "inputSchema": {"type": "object", "properties": {**_A, "index": {"type": "integer"}, "expr": {"type": "string"}}, "required": ["addr"]}},
-    {"name": "remove_check", "description": "Remove one shared check, by id, name, or index.",
-     "inputSchema": {"type": "object", "properties": {**_A, "check": {"type": "string", "description": "id, name, or index"}}, "required": ["addr", "check"]}},
+    {"name": "remove_check", "description": "Remove one shared check, by id, name, or index. "
+     "Pass it as `check` OR as `id` (the `id` field get_function shows on each check).",
+     "inputSchema": {"type": "object", "properties": {**_A,
+                     "check": {"type": "string", "description": "id, name, or index"},
+                     "id": {"type": "string", "description": "the check's id (alias for check)"}},
+                     "required": ["addr"]}},
     {"name": "export_scenario", "description": "Bundle the active scenario's setup, the shared checks, and the latest run's "
      "findings + paths — the same data the GUI's Export produces.",
      "inputSchema": {"type": "object", "properties": _A, "required": ["addr"]}},
@@ -2211,7 +2245,8 @@ _MCP_TOOLS = {
     "list_files": lambda a: _mcp_list_files(a.get("directory")),
     "cancel_run": lambda a: _mcp_cancel_run(a["run_id"]),
     "remove_assumption": lambda a: _mcp_remove_assumption(a["addr"], a.get("index"), a.get("expr")),
-    "remove_check": lambda a: _mcp_remove_check(a["addr"], a["check"]),
+    "remove_check": lambda a: _mcp_remove_check(a["addr"], a.get("check") if a.get("check") is not None
+                                                else (a.get("id") if a.get("id") is not None else a.get("index"))),
     "export_scenario": lambda a: _mcp_export_scenario(a["addr"]),
     "generate_script": lambda a: _mcp_script(a["addr"]),
     "show_function": lambda a: _mcp_show_function(a["addr"], a.get("run_id"), a.get("message")),
