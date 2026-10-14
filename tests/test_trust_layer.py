@@ -1,0 +1,128 @@
+"""
+Regression tests for the "trust layer" added to a run's summary and findings:
+finding confidence (confirmed vs conditional), coverage, and the arch-aware
+argument-register helper that call models rely on. Uses samples/checks_sample
+(x86-64), mirroring test_new_checks. Skips if the sample can't be built.
+"""
+import logging
+import os
+import subprocess
+import sys
+
+import pytest
+
+logging.disable(logging.WARNING)
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+
+from angrgui.engine import Binary          # noqa: E402
+from angrgui.runner import Run             # noqa: E402
+
+BIN = os.path.join(ROOT, "samples", "checks_sample")
+
+
+@pytest.fixture(scope="module")
+def binary():
+    if not os.path.exists(BIN):
+        try:
+            subprocess.check_call(["make", "-C", os.path.join(ROOT, "samples"), "checks_sample"])
+        except Exception as e:
+            pytest.skip(f"cannot build checks_sample: {e}")
+    return Binary(BIN, progress=lambda m: None)
+
+
+def _addr(binary, name):
+    return [f for f in binary.function_list() if f["name"] == name][0]["addr"]
+
+
+def _run(binary, spec, timeout=45):
+    r = Run(binary, spec)
+    r.start().join(timeout=timeout)
+    return r.snapshot()
+
+
+def _oob_read_spec(binary):
+    return {
+        "func_addr": _addr(binary, "oob_r"),
+        "args": [{"name": "buf", "mode": "symbolic", "size": 8},
+                 {"name": "i", "mode": "symbolic", "size": 4}],
+        "checks": [{"id": "r", "kind": "oob_read", "base": "buf", "size": 16, "enabled": True}],
+        "limits": {"steps": 40, "active": 60, "seconds": 30},
+    }
+
+
+def test_coverage_reported(binary):
+    """Every run reports how much of the target it explored, with sane numbers."""
+    snap = _run(binary, _oob_read_spec(binary))
+    assert snap["status"] == "done"
+    cov = snap["summary"].get("coverage")
+    assert cov is not None, "summary must carry coverage"
+    assert cov["blocks_total"] and cov["blocks_total"] >= 1
+    assert 0 <= cov["blocks_covered"] <= cov["blocks_total"]
+    assert 0 <= cov["pct"] <= 100
+    assert cov["pct"] == round(100 * cov["blocks_covered"] / cov["blocks_total"])
+    assert isinstance(cov.get("unreached", []), list)
+
+
+def test_finding_confidence_confirmed(binary):
+    """A finding driven only by a symbolic input (no skipped-call return) is CONFIRMED,
+    and the summary tallies it under confidence."""
+    snap = _run(binary, _oob_read_spec(binary))
+    hits = [h for h in snap["hits"] if h["kind"] == "oob_read"]
+    assert hits, "expected an oob_read finding"
+    # the index i is a declared symbolic input, so the finding depends on no skipped call
+    assert all(h["extra"].get("confidence") == "confirmed" for h in hits)
+    assert all(not h["extra"].get("depends_on") for h in hits)
+    conf = snap["summary"].get("confidence") or {}
+    assert conf.get("confirmed", 0) >= 1
+    assert conf.get("conditional", 0) == 0
+
+
+def test_int_arg_regs_matches_arch(binary):
+    """The shared argument-register helper (used by both arg setup and call models)
+    returns this arch's ABI integer registers — x86-64 SysV here."""
+    r = Run(binary, {"func_addr": _addr(binary, "div_z"), "args": [], "limits": {}})
+    regs = r._int_arg_regs()
+    assert regs[:4] == ["rdi", "rsi", "rdx", "rcx"]
+
+
+# -- scan_sinks: pure static sink detection (arm64 + x86 mnemonics) -------------
+from angrgui.server import scan_sink_instructions   # noqa: E402
+
+
+def _ins(mn, op, at=0x1000, is_call=False, call_name=None):
+    return {"addr": at, "mnemonic": mn, "op_str": op, "text": f"{mn} {op}".strip(),
+            "is_call": is_call, "call_name": call_name}
+
+
+def test_scan_sinks_synthetic():
+    kinds = lambda s: {x["kind"] for x in s}
+    # arm64 NEON narrowing -> ready-to-add narrowing_cast check
+    s = scan_sink_instructions([_ins("xtn", "v0.2s, v0.2d", 0x10)])
+    assert s and s[0]["kind"] == "narrowing_cast"
+    assert s[0]["suggested_check"] == {"kind": "narrowing_cast", "addr": "0x10"}
+    # arm64 division -> assert divisor != 0 (last operand)
+    s = scan_sink_instructions([_ins("udiv", "w0, w1, w2", 0x20)])
+    assert s[0]["kind"] == "divide_by_zero"
+    assert s[0]["suggested_check"]["expr"] == "w2 != 0"
+    # x86 division -> assert on the single operand
+    s = scan_sink_instructions([_ins("idiv", "ecx", 0x30)])
+    assert s[0]["kind"] == "divide_by_zero" and s[0]["suggested_check"]["expr"] == "ecx != 0"
+    # arm64 scaled-index pointer arithmetic -> oob_index
+    assert kinds(scan_sink_instructions([_ins("add", "x9, x9, w0, uxtw #3", 0x40)])) == {"oob_index"}
+    # x86 [base + index*scale] memory access -> oob_index
+    assert kinds(scan_sink_instructions([_ins("mov", "eax, [rdi + rsi*4]", 0x50)])) == {"oob_index"}
+    # memory-unsafe call -> dangerous_call
+    s = scan_sink_instructions([_ins("bl", "#0x5000", 0x60, is_call=True, call_name="_memcpy")])
+    assert s[0]["kind"] == "dangerous_call"
+    # a plain move is not a sink
+    assert scan_sink_instructions([_ins("mov", "x0, x1", 0x70)]) == []
+
+
+def test_scan_sinks_on_sample(binary):
+    """div_z contains an integer division; the scanner flags it as divide_by_zero."""
+    d = binary.disassemble(_addr(binary, "div_z"))
+    sinks = scan_sink_instructions(d["instructions"])
+    assert any(s["kind"] == "divide_by_zero" for s in sinks), \
+        f"expected a divide_by_zero sink in div_z, got {[s['kind'] for s in sinks]}"

@@ -38,7 +38,7 @@ from .engine import Binary
 from .runner import Run
 from .backend import make_backend, AngrBackend
 from .workspace import Workspace
-from .checks import CUSTOM_TEMPLATE
+from .checks import CUSTOM_TEMPLATE, NarrowingCastCheck
 from .exprlang import validate_expr, ExprError
 from .codegen import generate_script
 from .idamcp import IdaSession, MCPError, DEFAULT_URL
@@ -1011,39 +1011,37 @@ def _mcp_disassemble(addr):
 # memory-unsafe-looking call targets (by name substring), for the sink scan
 _DANGEROUS_CALLS = ("memcpy", "memmove", "memset", "strcpy", "strcat", "stpcpy",
                     "sprintf", "vsprintf", "bcopy", "alloca")
+_REG_TOK = re.compile(r"^(?:[wx]\d{1,2}|[re][a-z]{2}|r\d{1,2}[dwb]?)$")   # arm64 + x86 GP regs
+_NARROW_MNEMONICS = NarrowingCastCheck._NARROW_VEC                        # arm64 NEON narrowing set
 
-def _mcp_scan_sinks(addr):
-    """Static pass over a function's disassembly that proposes WHERE to look — the
-    hardest judgment for someone who doesn't know the code. Flags the sink classes
-    SEAL has checks for (narrowing casts, register-indexed memory accesses, integer
-    division, memory-unsafe calls) and, where a check can be formed mechanically,
-    hands back a ready-to-add `suggested_check`. It reads nothing at run time: it is a
-    starting map, not proof — add the checks that fit and run to confirm."""
-    from .checks import NarrowingCastCheck
-    b = _need_binary()
-    a = _addr(addr)
-    d = b.disassemble(a)
-    narrow = NarrowingCastCheck._NARROW_VEC
+
+def scan_sink_instructions(instructions):
+    """Pure sink scan over a disassembly instruction list (each {addr, mnemonic,
+    op_str, text, is_call, call_name}). Returns the sinks list. Separated from the MCP
+    layer so it is unit-testable without a running server. Handles arm64 (NEON narrowing,
+    scaled-index pointer arith, sdiv/udiv) and x86-64 (idiv/div, [base+index] memory)."""
     sinks = []
-    for i in d["instructions"]:
+    for i in instructions:
         mn = (i.get("mnemonic") or "").lower()
         op = i.get("op_str") or ""
         at = i["addr"]
-        if mn in narrow:
+        if mn in _NARROW_MNEMONICS:
             sinks.append({"addr": hex(at), "insn": i["text"], "kind": "narrowing_cast",
                           "why": "narrows a wider value to fewer bits — the CoreGraphics-style "
                                  "float/int truncation bug class",
                           "suggested_check": {"kind": "narrowing_cast", "addr": hex(at)}})
-        elif mn in ("sdiv", "udiv"):
+        elif mn in ("sdiv", "udiv", "idiv", "div", "idivl", "divl", "idivq", "divq"):
             parts = [p.strip() for p in op.split(",")]
+            # arm64: `sdiv Wd, Wn, Wm` -> divisor is the last operand; x86: `idiv Rm` -> the only one
             divisor = parts[-1] if parts else None
             sc = ({"kind": "assert", "addr": hex(at), "expr": f"{divisor} != 0"}
-                  if divisor and re.fullmatch(r"[wx]\d{1,2}", divisor) else None)
+                  if divisor and _REG_TOK.match(divisor) else None)
             sinks.append({"addr": hex(at), "insn": i["text"], "kind": "divide_by_zero",
                           "why": "integer division faults if the divisor can be zero",
                           "suggested_check": sc})
-        elif mn.startswith(("ldr", "str", "ldp", "stp")) and re.search(r"\[\s*\w+\s*,\s*[wx]\d", op):
-            # [base, index-register ...] — an array access whose index may be OOB
+        elif (mn.startswith(("ldr", "str", "ldp", "stp")) and re.search(r"\[\s*\w+\s*,\s*[wx]\d", op)) \
+                or (re.search(r"\[\s*\w+\s*\+\s*\w+", op) and mn in ("mov", "movzx", "movsx", "lea", "add")):
+            # array access indexed by a register (arm64 [base, Xn] / x86 [base + index*s])
             sinks.append({"addr": hex(at), "insn": i["text"], "kind": "oob_index",
                           "why": "memory access indexed by a register — a candidate "
                                  "out-of-bounds read/write if the index is attacker-influenced",
@@ -1068,6 +1066,20 @@ def _mcp_scan_sinks(addr):
                           "suggested_check": None,
                           "note": "model the call (add_model) or put an oob_write on the "
                                   "destination buffer, then run with skip_calls=false"})
+    return sinks
+
+
+def _mcp_scan_sinks(addr):
+    """Static pass over a function's disassembly that proposes WHERE to look — the
+    hardest judgment for someone who doesn't know the code. Flags the sink classes
+    SEAL has checks for (narrowing casts, register-indexed memory accesses, integer
+    division, memory-unsafe calls) and, where a check can be formed mechanically,
+    hands back a ready-to-add `suggested_check`. It reads nothing at run time: it is a
+    starting map, not proof — add the checks that fit and run to confirm."""
+    b = _need_binary()
+    a = _addr(addr)
+    d = b.disassemble(a)
+    sinks = scan_sink_instructions(d["instructions"])
     by = {}
     for s in sinks:
         by[s["kind"]] = by.get(s["kind"], 0) + 1
