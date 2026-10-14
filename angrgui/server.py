@@ -942,15 +942,57 @@ def _mcp_functions(query=None, limit: int = 200, only=None, sort=None):
                           for f in shown]}
 
 
+_BARE_NAME = re.compile(r"^[A-Za-z_]\w*$")
+
+def _is_reg_token(s: str) -> bool:
+    """A name that resolves without being a function argument: a register, an exprlang
+    positional alias (a1.., arg0..), or ret. Used only to avoid false 'stale base' warnings."""
+    s = s.lower()
+    if s in ("ret", "sp", "lr", "fp", "pc", "sb"):
+        return True
+    if re.fullmatch(r"(a|arg)\d+", s):                       # a1.., arg0.. positional aliases
+        return True
+    if re.fullmatch(r"[xwqdsvh]\d{1,2}", s):                 # x0.., w0.., v0.., d0.., q0..
+        return True
+    if re.fullmatch(r"[re][a-z]{2}", s) or s in ("rdi", "rsi", "rdx", "rcx"):  # x86 regs
+        return True
+    return False
+
+
 def _mcp_get_function(addr):
     a = _addr(addr)
     d = function(a)
     # agents see the flattened active scenario (initial state + shared checks),
     # plus the list of scenario names and which one is active.
-    return {"addr": hex(a), "name": d["disasm"]["name"],
-            "config": Workspace.flatten(d["config"]),
-            "has_source": bool(d["disasm"].get("source")),
-            "return_heads": d["return_heads"]}
+    cfg = Workspace.flatten(d["config"])
+    out = {"addr": hex(a), "name": d["disasm"]["name"],
+           "config": cfg,
+           "has_source": bool(d["disasm"].get("source")),
+           "return_heads": d["return_heads"]}
+    # Checks are shared/durable and survive restarts and reloads: a check carried over
+    # from a prior session whose addr lands in a DIFFERENT function is a silent landmine
+    # that skews or wastes a run. Surface those so the agent/user can remove them.
+    ins = {i["addr"] for i in d["disasm"].get("instructions", [])}
+    argnames = {a.get("name") for a in cfg.get("args", []) if a.get("name")}
+    stale = []
+    for c in cfg.get("checks", []):
+        cid, kind = c.get("id", ""), c.get("kind", "?")
+        if isinstance(c.get("addr"), int) and ins and c["addr"] not in ins:
+            stale.append(f"{kind} check {cid} is anchored at {c['addr']:#x}, which is not "
+                         f"in this function — likely left over from another function/session; "
+                         f"remove it with remove_check.")
+        base = c.get("base")
+        # an oob base that is a bare identifier must be an argument name of THIS function
+        # (a1.., a register, or an expression are fine) — a leftover name like "p" from
+        # another function silently errors at runtime, so flag it here instead.
+        if isinstance(base, str) and _BARE_NAME.match(base.strip()) \
+                and base.strip() not in argnames and not _is_reg_token(base.strip()):
+            stale.append(f"{kind} check {cid} has base {base!r}, which is not an argument "
+                         f"of this function (args: {sorted(argnames)}) nor a register — it "
+                         f"will error at run time; fix or remove it with remove_check.")
+    if stale:
+        out["warnings"] = stale
+    return out
 
 
 def _mcp_disassemble(addr):
@@ -1039,7 +1081,10 @@ def _mcp_add(addr, *, assumption=None, check=None):
     def mutate(cfg):
         sc = cfg["scenarios"][cfg["active"]]
         if assumption is not None:
-            sc["assumptions"] = list(sc.get("assumptions", [])) + [assumption]
+            cur = list(sc.get("assumptions", []))
+            if assumption.strip() not in {x.strip() for x in cur}:   # idempotent: no dup on re-add/reload
+                cur.append(assumption)
+            sc["assumptions"] = cur
         if check is not None:
             cfg["checks"] = list(cfg.get("checks", [])) + [_coerce_check(check, a)]
     _mutate_config(a, mutate)
@@ -1205,7 +1250,17 @@ def _mcp_get_run(run_id):
 
 
 def _mcp_path_values(run_id, node):
-    return run_values(run_id, int(node))          # {node, values: {addr: {reg,val,store?}}}
+    try:
+        n = int(node)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"node must be an integer path id (the `id` field of a get_run path), got {node!r}")
+    snap = S.backend.run_snapshot(run_id) if S.backend else None
+    if snap is None:
+        raise HTTPException(404, f"no such run {run_id!r}")
+    ids = sorted(x["id"] for x in snap.get("tree", []))
+    if ids and n not in ids:
+        raise HTTPException(404, f"no path id {n} in run {run_id!r}; valid ids: {ids}")
+    return run_values(run_id, n)                   # {node, values: {addr: {reg,val,store?}}}
 
 
 def _mcp_decompile(addr):
@@ -1446,9 +1501,14 @@ PART 3 — THE CORE LOOP (the happy path, in order)
      functions are "sub_<addr>" with named:false — pass only:"interesting" (or "source"
      / "named" / "configured") to skip the CRT/library noise, or connect IDA for names.
 3. get_function(addr)
-     Read the current setup: the active scenario's initial state (args, buffers,
-     assumptions, stdin, files, limits, models, initial_state), the shared checks, and
-     the list of scenario names. Arguments are symbolic by default.
+     Read the current setup, which is nested under the "config" key of the result:
+     config.{args, buffers, assumptions, stdin, files, limits, models, initial_state,
+     checks, scenarios}. Arguments are symbolic by default. NOTE: checks and
+     assumptions are SHARED and DURABLE — they survive restarts and a load_snapshot
+     reload (which resets args/limits but NOT checks/assumptions). So a check left over
+     from a prior session can still be attached; if get_function returns a top-level
+     "warnings" list, it is flagging checks anchored outside this function — remove them
+     with remove_check before running.
 4. disassemble(addr)   (or decompile(addr) if IDA is connected)
      READ THE CODE. Decide which inputs matter and where the interesting
      operations/branches are. You cannot check well what you have not read.
@@ -1561,9 +1621,18 @@ flow). Add checks to hunt specific conditions. Every check may take an optional
         argument name / expression and "size" its length. OMIT base to check every
         write against the allocations tracked by your alloc models (PART 9) — that is
         how you find heap overflows across library calls.
+        base is re-evaluated AT EACH WRITE against the live state, so a frame-relative
+        base like "sp - 0x40" tracks the current sp — but WITHOUT an "addr" the check
+        scans EVERY write in the function, so for a STACK buffer it will also flag the
+        prologue register-saves and the stack-canary store that sit near your frame
+        slot (they are "derived from the frame" and land outside your window). To target
+        one stack buffer cleanly, pin the check to the exact store with
+        "addr":"0x..<the store instruction>" — then it fires only there. (A heap/arg
+        buffer reached through a pointer arg does not have this problem; no addr needed.)
   • oob_read   {"kind":"oob_read","base":"a1","size":16}
         Same as oob_write but for a memory READ that can fall outside the buffer — an
-        out-of-bounds read / information leak. Same fields and modeled mode.
+        out-of-bounds read / information leak. Same fields, same "addr"-to-pin advice,
+        and same modeled mode.
   • null_deref  {"kind":"null_deref"}
         A memory read/write through a pointer the inputs can drive into the null page.
         angr zero-fills unmapped memory, so these never crash on their own — this check
@@ -1596,7 +1665,8 @@ Read it and report it — it is the proof.
 instruction pointer itself became attacker-controlled (e.g. a jump through a symbolic
 function pointer) — a control-flow-hijack lead. The leaf still carries an example.
 
-path_values(run_id, node): for the chosen path, the concrete value assigned at each
+path_values(run_id, node): `node` is the integer `id` of a path from get_run's tree
+(the `id` field — e.g. 0). For that path, the concrete value assigned at each
 instruction — {addr: {reg, val, store}}. This is what the GUI overlays on the
 decompilation/disassembly so the human sees the real value on each line.
 
@@ -1651,6 +1721,9 @@ names:    argument names, a1../arg0.. (parameters), registers (rdi, eax, x0…),
           (the return value), and mem(addr, size) to read memory.
 compare:  == != < <= > >=   are UNSIGNED. Prefix s for signed: s< s<= s> s>=.
           (Getting signedness wrong silently changes the result — be deliberate.)
+          There is NO "u<" / "u>=" — the bare operator is ALREADY the unsigned one.
+          (Don't let the u32()/s32() WIDTH casts below mislead you: those are casts,
+          not operators; for an unsigned compare just write <, not u<.)
 arith/bitwise:  + - * / % & | ^ ~ << >>    (s>> arithmetic shift; s/ s% signed div/mod)
 widths:   u8/u16/u32/u64 take the low N bits unsigned; s8/s16/s32/s64 sign-extend.
 examples: "a1 & 0xff == 0x5a"      "u32(x) + 8 < u32(x)"      "ret s>= 0"
