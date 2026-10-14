@@ -635,32 +635,58 @@ async function clearInitialState() {
   toast("initial state reset to fresh call");
 }
 
+function snapSummary(s) {
+  if (!s) return "no snapshot loaded";
+  const img = s.image || {};
+  return `pc ${hx64(s.pc)} · slide ${hx64(img.slide || 0)}` +
+    (s.core ? ` · core ${s.core}` : ` · ${(s.mem || []).length} mem regions`);
+}
 function openSnapshotLoader() {
   const sc = activeScenario(); if (!sc) return;
   const cur = sc.initial_state && sc.initial_state.kind === "snapshot" ? sc.initial_state : null;
-  const ta = el("textarea", { class: "snapjson", placeholder: '{"pc":..., "regs":{...}, "mem":[{"addr":...,"hex":"..."}]}',
-    style: "width:100%;height:160px;font-family:var(--mono);font-size:11px" },
-    cur ? JSON.stringify({ pc: cur.pc, regs: cur.regs, mem: cur.mem }, null, 1) : "");
-  const symIn = el("input", { type: "text", placeholder: "symbolic fields, e.g.  x1:coord, 0x16fdff000:len",
-    style: "width:100%;font-family:var(--mono)", value: (cur && (cur.symbolic || []).map(s => (s.reg || hx64(s.addr)) + ":" + (s.name || "sym")).join(", ")) || "" });
+  let built = cur ? { ...cur } : null;              // the snapshot (with image/core) we'll apply
+  const pathIn = el("input", { type: "text", placeholder: "/tmp/snap.json  (from seal_snapshot)",
+    style: "flex:1;font-family:var(--mono)" });
+  const summary = el("div", { class: "faint mono", style: "font-size:11px;margin-top:4px" }, snapSummary(cur));
+  const symIn = el("input", { type: "text", placeholder: "symbolic fields, e.g.  v0:pt:f32x2, 0x16fdff0b0:flags",
+    style: "width:100%;font-family:var(--mono)",
+    value: (cur && (cur.symbolic || []).map(s => (s.reg || hx64(s.addr)) + ":" + (s.name || "sym") + (s.float ? ":" + s.float : "")).join(", ")) || "" });
+  const loadBtn = el("button", {}, "Load file");
   const applyBtn = el("button", { class: "primary" }, "Apply");
+  loadBtn.onclick = async () => {
+    const p = pathIn.value.trim(); if (!p) { toast("enter a capture file path", true); return; }
+    loadBtn.disabled = true; loadBtn.textContent = "Loading…";
+    try {
+      const r = await jpost("/api/snapshot/load", { path: p });   // server computes slide + core/mem
+      built = r.initial_state;
+      summary.textContent = `loaded ${r.mode || "snapshot"} · ` + snapSummary(built);
+      toast("snapshot built — mark the attacker-controlled fields, then Apply");
+    } catch (e) { toast("load failed: " + e.message, true); }
+    loadBtn.disabled = false; loadBtn.textContent = "Load file";
+  };
+  applyBtn.onclick = () => {
+    if (!built) { toast("load a capture file first", true); return; }
+    const symbolic = symIn.value.split(",").map(s => s.trim()).filter(Boolean).map(tok => {
+      const [k, name, fl] = tok.split(":").map(x => x && x.trim());
+      const o = /^0x/i.test(k) ? { addr: parseInt(k, 16), name: name || "sym", size: 8 }
+        : { reg: k, name: name || "sym", size: /^[vq]/i.test(k) ? 16 : 8 };
+      if (fl) o.float = fl;
+      return o;
+    });
+    sc.initial_state = { ...built, symbolic };        // keeps image + core
+    bg.remove();
+    saveConfig().then(() => { renderState(); toast("snapshot applied — Explore to run seeded"); });
+  };
   const bg = modal("Load snapshot", el("div", {},
-    el("div", { class: "faint", style: "margin-bottom:6px" }, "Paste a snapshot JSON (registers + memory from a real run, e.g. the lldb capture). Then list the attacker-controlled fields to make symbolic."),
-    el("div", { class: "statelbl" }, "snapshot JSON"), ta,
-    el("div", { class: "statelbl", style: "margin-top:8px" }, "symbolic fields  (reg:name or 0xADDR:name, comma-separated)"), symIn),
+    el("div", { class: "faint", style: "margin-bottom:6px" },
+      "Point at a capture file from ", el("code", {}, "seal_snapshot"),
+      " (lldb). SEAL computes the address slide and loads the memory / process core automatically."),
+    el("div", { class: "statelbl" }, "capture file"),
+    el("div", { class: "row", style: "gap:6px" }, pathIn, loadBtn),
+    summary,
+    el("div", { class: "statelbl", style: "margin-top:8px" }, "symbolic fields  (reg:name[:float]  or  0xADDR:name)"), symIn),
     [applyBtn]);
   ($("#modalHost") || document.body).append(bg);
-  applyBtn.onclick = () => {
-    let snap;
-    try { snap = JSON.parse(ta.value); } catch (e) { toast("invalid JSON: " + e.message, true); return; }
-    const symbolic = symIn.value.split(",").map(s => s.trim()).filter(Boolean).map(tok => {
-      const [k, name] = tok.split(":").map(x => x.trim());
-      return /^0x/i.test(k) ? { addr: parseInt(k, 16), name: name || "sym", size: 8 } : { reg: k, name: name || "sym", size: 8 };
-    });
-    sc.initial_state = { kind: "snapshot", pc: snap.pc, regs: snap.regs || {}, mem: snap.mem || [], symbolic };
-    bg.remove();
-    saveConfig().then(() => { renderState(); toast("snapshot loaded — Explore to run seeded"); });
-  };
 }
 
 // the docked graph + paths, always visible beside the main code view

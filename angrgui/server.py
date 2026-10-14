@@ -347,6 +347,65 @@ def cfg(addr: int):
     return b.cfg_graph(addr)
 
 
+def _snapshot_from_capture(cap: dict) -> dict:
+    """Turn a capture.py snapshot/core into a SEAL initial_state: compute the image slide
+    from the capture's module map + the loaded binary, and carry the core path (demand-paged)
+    or the captured mem regions. No symbolic overlay yet — the caller marks attacker fields."""
+    b = _need_binary()
+    mo = b.project.loader.main_object
+    # min_addr is 0 for a dyld-cache slice; use the lowest real segment vaddr as the file base.
+    segs = [s.vaddr for s in getattr(mo, "segments", []) or []]
+    file_lo = min(segs) if segs else mo.min_addr
+    file_hi = mo.max_addr
+    name = os.path.basename(b.path)
+    mods = cap.get("modules") or []
+    mod = next((m for m in mods if m.get("name") == name), None)
+    if mod is None and mods:                       # fall back to the module the pc is in
+        pc = int(cap.get("pc", 0))
+        mod = next((m for m in mods if abs(int(m.get("text", 0)) - pc) < 0x4000000), None)
+    slide = (int(mod["text"]) - file_lo) if mod else 0
+    regs = cap.get("regs") or {}
+    pc = cap.get("pc")
+    if cap.get("core") and (not regs or pc is None):   # a bare core: read regs from LC_THREAD
+        try:
+            from .snapshot.core import MachOCore
+            cr = MachOCore(cap["core"]).registers()
+            regs = regs or cr
+            pc = pc if pc is not None else cr.get("pc")
+        except Exception:
+            pass
+    snap = {"kind": "snapshot", "pc": int(pc), "regs": regs, "mem": cap.get("mem", []),
+            "image": {"slide": slide, "file_lo": file_lo, "file_hi": file_hi}}
+    if cap.get("core"):
+        snap["core"] = cap["core"]
+    return snap
+
+
+class SnapLoadReq(BaseModel):
+    path: str
+    scenario: str | None = None         # set it on this scenario (by name/index); default: active
+
+
+@app.post("/api/snapshot/load")
+def snapshot_load(req: SnapLoadReq):
+    """Load a capture file (from capture.py), auto-build the SEAL snapshot (slide + core/mem),
+    and set it on a scenario's initial_state. Returns the built snapshot so the GUI can show it
+    and let the user mark symbolic fields."""
+    b = _need_binary()
+    addr = S.focus_addr if getattr(S, "focus_addr", None) else None
+    try:
+        with open(req.path) as fh:
+            cap = json.load(fh)
+    except Exception as e:
+        raise HTTPException(400, f"cannot read capture {req.path!r}: {e}")
+    snap = _snapshot_from_capture(cap)
+    meta = cap.get("capture", {})
+    return {"initial_state": snap, "slide": snap["image"]["slide"],
+            "mode": meta.get("mode"), "core": snap.get("core"),
+            "mem_regions": len(snap.get("mem", [])),
+            "pc": hex(snap["pc"])}
+
+
 @app.put("/api/function/{addr}/config")
 def save_config(addr: int, req: ConfigReq):
     _need_binary()
@@ -934,6 +993,26 @@ def _validate_specs(assumptions=None, checks=None):
     for c in (checks or []):
         if isinstance(c, dict) and c.get("expr") and c.get("kind") != "custom":
             _check_expr(c["expr"], f"{c.get('kind', 'assert')} expression")
+
+
+def _mcp_load_snapshot(func, path, symbolic=None):
+    """Load a capture file (from `seal_snapshot`) and set it as the function's concolic seed:
+    computes the image slide, wires the process core (demand-paged) or mem regions, and
+    optionally marks attacker-controlled fields symbolic. `symbolic` is a list of
+    {reg|addr, name, size?, float?}."""
+    _need_binary()
+    try:
+        with open(path) as fh:
+            cap = json.load(fh)
+    except Exception as e:
+        raise HTTPException(400, f"cannot read capture {path!r}: {e}")
+    snap = _snapshot_from_capture(cap)
+    if symbolic:
+        snap["symbolic"] = symbolic
+    res = _mcp_configure(func, {"initial_state": snap})
+    res["loaded"] = {"slide": hex(snap["image"]["slide"]), "mode": cap.get("capture", {}).get("mode"),
+                     "core": snap.get("core"), "mem_regions": len(snap.get("mem", []))}
+    return res
 
 
 def _mcp_configure(addr, patch: dict):
@@ -1746,6 +1825,12 @@ TOOL_DEFS = [
      "args, buffers, assumptions (list of expression strings), stdin, checks, limits "
      "(e.g. {\"steps\":80,\"seconds\":30,\"skip_calls\":true}). Replaces the given keys.",
      "inputSchema": {"type": "object", "properties": {**_A, "patch": {"type": "object"}}, "required": ["addr", "patch"]}},
+    {"name": "load_snapshot", "description": "Load a capture file from `seal_snapshot` (lldb) as this function's "
+     "concolic seed: auto-computes the image slide, wires the process core (faulted in on demand) or captured "
+     "mem regions, and marks the given fields symbolic. `symbolic` is a list of {reg|addr, name, size?, float?} "
+     "(e.g. [{\"reg\":\"v0\",\"name\":\"pt\",\"size\":16,\"float\":\"f32x2\"}]).",
+     "inputSchema": {"type": "object", "properties": {**_A, "path": {"type": "string"},
+                     "symbolic": {"type": "array", "items": {"type": "object"}}}, "required": ["addr", "path"]}},
     {"name": "add_assumption", "description": "Append one assumption (an expression that must hold at entry, "
      "e.g. \"a1 & 0xff == 0x5a\"). Names: the argument names, a1../arg0.. (parameters), registers, ret.",
      "inputSchema": {"type": "object", "properties": {**_A, "expr": {"type": "string"}}, "required": ["addr", "expr"]}},
@@ -1883,6 +1968,7 @@ _MCP_TOOLS = {
     "disassemble": lambda a: _mcp_disassemble(a["addr"]),
     "decompile": lambda a: _mcp_decompile(a["addr"]),
     "configure": lambda a: _mcp_configure(a["addr"], a["patch"]),
+    "load_snapshot": lambda a: _mcp_load_snapshot(a["addr"], a["path"], a.get("symbolic")),
     "add_assumption": lambda a: _mcp_add(a["addr"], assumption=a["expr"]),
     "add_check": lambda a: _mcp_add(a["addr"], check=a["check"]),
     "run": lambda a: _mcp_run(a["addr"]),

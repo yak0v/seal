@@ -319,12 +319,12 @@ class Run:
         # pull its concrete core value back over the field we just made symbolic).
         if snap.get("core"):
             try:
-                self._install_core_paging(state, snap["core"], mem_overlays)
+                self._install_core_paging(state, snap["core"], mem_overlays, img)
             except Exception as e:
                 log.warning("core paging unavailable: %s", e)
         return state
 
-    def _install_core_paging(self, state, core_path, mem_overlays):
+    def _install_core_paging(self, state, core_path, mem_overlays, img):
         """Fault pages in from a process core on demand (see CorePages / snapshot/core.py).
 
         On every memory access to a CONCRETE address that isn't part of the loaded image,
@@ -337,6 +337,20 @@ class Run:
         loader = self.project.loader
         endn = self.arch.memory_endness
         overlays = list(mem_overlays or [])        # (addr, bv) to keep symbolic over faulted pages
+        slide = int((img or {}).get("slide", 0))
+        # WRITABLE ranges of the loaded image (file addresses): their runtime values live in
+        # the core at file+slide, so we fault those from the core too — otherwise a global the
+        # program changed at runtime would read the binary's ORIGINAL on-disk value (#3). Code
+        # and read-only data stay as cle loaded them (same as the binary, and static).
+        writ = []
+        try:
+            for sec in loader.main_object.sections:
+                if getattr(sec, "is_writable", False) and not getattr(sec, "is_executable", False):
+                    writ.append((sec.min_addr, sec.max_addr))
+        except Exception:
+            pass
+        def in_writable_image(pg):
+            return any(lo <= pg <= hi for lo, hi in writ)
         state.register_plugin("core_pages", CorePages())
 
         def fill(s, which):
@@ -356,8 +370,12 @@ class Run:
             while pg <= last:
                 if pg not in filled:
                     filled.add(pg)
-                    if loader.find_object_containing(pg) is None:   # not in the loaded image
-                        data = core.read_page(pg)
+                    in_img = loader.find_object_containing(pg) is not None
+                    # heap/stack -> core at this (live) address; image writable data -> core at
+                    # file+slide (runtime values); image code/rodata -> leave to cle.
+                    src = (pg + slide) if in_img else pg
+                    if (not in_img) or in_writable_image(pg):
+                        data = core.read_page(src)
                         if data:
                             try:
                                 s.memory.store(pg, data)

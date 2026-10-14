@@ -16,6 +16,9 @@ import struct
 
 _MH_MAGIC_64 = 0xFEEDFACF
 _LC_SEGMENT_64 = 0x19
+_LC_THREAD = 0x4
+_LC_UNIXTHREAD = 0x5
+_ARM_THREAD_STATE64 = 6
 PAGE = 0x1000
 
 
@@ -25,6 +28,7 @@ class MachOCore:
         self._f = open(path, "rb")
         self._mm = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ)
         self.segments: list[tuple[int, int, int, int]] = []   # (vmaddr, vmsize, fileoff, filesize)
+        self._thread_regs: dict[str, int] = {}                 # arm64 state from the first LC_THREAD
         self._parse()
         self.segments.sort()
 
@@ -41,9 +45,31 @@ class MachOCore:
                 vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, p + 24)
                 if vmsize and filesize:
                     self.segments.append((vmaddr, vmsize, fileoff, filesize))
+            elif cmd in (_LC_THREAD, _LC_UNIXTHREAD) and not self._thread_regs:
+                self._parse_thread(data, p + 8, p + cmdsize)
             if cmdsize == 0:
                 break
             p += cmdsize
+
+    def _parse_thread(self, data, start, end):
+        """Pull the arm64 register state out of an LC_THREAD command (x0-x28, fp, lr, sp,
+        pc, cpsr) — so a core is self-contained (iOS or macOS)."""
+        q = start
+        while q + 8 <= end:
+            flavor, count = struct.unpack_from("<II", data, q)
+            q += 8
+            words = count * 4
+            if flavor == _ARM_THREAD_STATE64:
+                base = q
+                regs = {}
+                for i in range(29):
+                    regs[f"x{i}"] = struct.unpack_from("<Q", data, base + i * 8)[0]
+                fp, lr, sp, pc = struct.unpack_from("<QQQQ", data, base + 29 * 8)
+                cpsr = struct.unpack_from("<I", data, base + 33 * 8)[0]
+                regs.update(fp=fp, lr=lr, sp=sp, pc=pc, cpsr=cpsr, x29=fp, x30=lr)
+                self._thread_regs = regs
+                return
+            q += words
 
     def _seg_of(self, vaddr: int):
         lo, hi = 0, len(self.segments) - 1
@@ -57,6 +83,10 @@ class MachOCore:
             else:
                 lo = m + 1
         return None
+
+    def registers(self) -> dict:
+        """arm64 register state captured in the core (empty if no thread command)."""
+        return dict(self._thread_regs)
 
     def contains(self, vaddr: int) -> bool:
         return self._seg_of(vaddr) is not None
