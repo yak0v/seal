@@ -434,11 +434,12 @@ class Run:
             for a in args:
                 if a.get("name") == ref:
                     return ref
-            m = re.fullmatch(r"(?:a|arg)(\d+)", str(ref))
+            # a1../arg0.. aliases OR a bare integer index (arg:0) -> that arg's name
+            m = re.fullmatch(r"(?:a|arg)?(\d+)", str(ref))
             if m and 0 <= int(m.group(1)) < len(args):
                 i = int(m.group(1))
                 return args[i].get("name") or f"arg{i}"
-            return ref
+            return str(ref)        # always a string: it becomes a BVS name/prefix
         buffers = {}
         for b in self.spec.get("buffers", []):
             argname = _resolve_argname(b["arg"])
