@@ -1827,8 +1827,13 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {**_A, "patch": {"type": "object"}}, "required": ["addr", "patch"]}},
     {"name": "load_snapshot", "description": "Load a capture file from `seal_snapshot` (lldb) as this function's "
      "concolic seed: auto-computes the image slide, wires the process core (faulted in on demand) or captured "
-     "mem regions, and marks the given fields symbolic. `symbolic` is a list of {reg|addr, name, size?, float?} "
-     "(e.g. [{\"reg\":\"v0\",\"name\":\"pt\",\"size\":16,\"float\":\"f32x2\"}]).",
+     "mem regions, and marks the given fields symbolic. Each `symbolic` entry makes ONE field symbolic, as either: "
+     "a whole register {reg,name,size?,float?}; a struct field relative to a register {base,offset,name,size?} "
+     "(e.g. {\"base\":\"x0\",\"offset\":\"0xb0\",\"name\":\"flags\",\"size\":4} = the field at x0+0xb0 — no need to "
+     "hand-compute the runtime address); or an absolute address {addr,name,size?}. TIP: make symbolic not only the "
+     "obvious attacker input but any concrete field that SELECTS which branch reaches the bug (e.g. a flags/mode "
+     "field) — otherwise the vulnerable branch may never be taken and you get a misleading 0 findings. Example: "
+     "[{\"reg\":\"v0\",\"name\":\"pt\",\"size\":16,\"float\":\"f32x2\"},{\"base\":\"x0\",\"offset\":\"0xb0\",\"name\":\"flags\",\"size\":4}].",
      "inputSchema": {"type": "object", "properties": {**_A, "path": {"type": "string"},
                      "symbolic": {"type": "array", "items": {"type": "object"}}}, "required": ["addr", "path"]}},
     {"name": "add_assumption", "description": "Append one assumption (an expression that must hold at entry, "

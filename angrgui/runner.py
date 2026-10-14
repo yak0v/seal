@@ -301,11 +301,21 @@ class Run:
             if fl:                                    # shows a number, not a raw byte blob
                 floatvars[nm] = fl if isinstance(fl, str) else ("f64" if sz >= 8 else "f32")
             try:
-                if s.get("reg"):
-                    setattr(state.regs, s["reg"], bv)
-                elif s.get("addr") is not None:
-                    state.memory.store(int(s["addr"]), bv, endness=self.arch.memory_endness)
-                    mem_overlays.append((int(s["addr"]), bv))   # re-applied over faulted core pages
+                if s.get("reg") and s.get("offset") is None:
+                    setattr(state.regs, s["reg"], bv)       # whole register symbolic
+                else:
+                    # a memory field: an absolute addr, OR relative to a register/base — e.g.
+                    # {"base":"x0","offset":"0xb0"} = the field at x0+0xb0 — so you don't have
+                    # to hand-compute runtime addresses (which a reviewer found error-prone).
+                    if s.get("addr") is not None and s.get("base") is None:
+                        addr = int(s["addr"], 0) if isinstance(s["addr"], str) else int(s["addr"])
+                    else:
+                        base = s.get("base") or s.get("reg")
+                        bval = state.solver.eval(getattr(state.regs, base))
+                        off = s.get("offset", 0)
+                        addr = bval + (int(off, 0) if isinstance(off, str) else int(off))
+                    state.memory.store(addr, bv, endness=self.arch.memory_endness)
+                    mem_overlays.append((addr, bv))          # re-applied over faulted core pages
             except Exception as e:
                 log.warning("snapshot symbolic %s: %s", nm, e)
         state.globals["angrgui_floatvars"] = floatvars
@@ -1426,9 +1436,23 @@ class Run:
             sym_args = any(a.get("mode", "symbolic") == "symbolic" for a in self.spec.get("args", []))
             has_input = (sym_args or self.spec.get("buffers") or self.spec.get("stdin")
                          or self.spec.get("files") or self.spec.get("initial_state"))
+            # A check's site was REACHED but never triggered (e.g. a narrowing was executed
+            # but the value always fit) — the single most useful thing to say, because it
+            # means a CONCRETE field is gating the vulnerable branch, not that there's no bug.
+            near = {}
+            for c in self.checks:
+                for a, t in getattr(c, "near", {}).items():
+                    near.setdefault(a, t)
             if not has_input:
                 notes.append("no findings, and no symbolic inputs were set (no symbolic args, buffers, "
                              "stdin, files, or seeded state) — there is nothing for the checks to solve over.")
+            elif near:
+                sites = ", ".join(f"{t or 'site'} @ {hex(a)}" for a, t in list(near.items())[:4])
+                notes.append(f"no findings, BUT a check site WAS REACHED and just never triggered on any "
+                             f"explored path: {sites}. That usually means a bug is there but a CONCRETE "
+                             f"input is gating the vulnerable branch — make the field(s) that SELECT the "
+                             f"branch symbolic too, not only the obvious attacker input (for a snapshot, "
+                             f"mark the gating struct field/flag symbolic as well).")
             elif self.progress["step"] <= 2 and not simgr.active:
                 notes.append("no findings, and exploration stopped almost immediately — the check sites "
                              "may be unreachable from the entry, or the step limit is too low.")

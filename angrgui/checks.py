@@ -136,6 +136,7 @@ class BaseCheck:
         self.ctx = ctx
         self.hits: list[Hit] = []
         self._seen: set = set()
+        self.near: dict = {}     # addr -> text: sites reached but not triggered (for diagnostics)
 
     def install(self, state):
         """Install any angr inspect breakpoints this check needs. Default: none.
@@ -716,6 +717,10 @@ class NarrowingCastCheck(BaseCheck):
         cond = conds[0] if len(conds) == 1 else claripy.Or(*conds)
         try:
             if not state.solver.satisfiable(extra_constraints=[cond]):
+                # Reached a narrowing instruction, but on this path the value always fits —
+                # record it so a 0-finding run can say "reached X but never lossy" instead of
+                # a blank "nothing triggered" (a concrete field is likely gating the overflow).
+                self.near[ins_addr] = text or mn or "narrowing"
                 return
         except Exception:
             return

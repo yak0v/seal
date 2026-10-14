@@ -668,8 +668,11 @@ function openSnapshotLoader() {
     if (!built) { toast("load a capture file first", true); return; }
     const symbolic = symIn.value.split(",").map(s => s.trim()).filter(Boolean).map(tok => {
       const [k, name, fl] = tok.split(":").map(x => x && x.trim());
-      const o = /^0x/i.test(k) ? { addr: parseInt(k, 16), name: name || "sym", size: 8 }
-        : { reg: k, name: name || "sym", size: /^[vq]/i.test(k) ? 16 : 8 };
+      const rel = k.match(/^([A-Za-z]\w*)\s*\+\s*(0x[0-9a-fA-F]+|\d+)$/);   // reg+offset form
+      let o;
+      if (rel) o = { base: rel[1], offset: rel[2], name: name || "sym", size: 8 };
+      else if (/^0x/i.test(k)) o = { addr: parseInt(k, 16), name: name || "sym", size: 8 };
+      else o = { reg: k, name: name || "sym", size: /^[vq]/i.test(k) ? 16 : 8 };
       if (fl) o.float = fl;
       return o;
     });
@@ -684,7 +687,7 @@ function openSnapshotLoader() {
     el("div", { class: "statelbl" }, "capture file"),
     el("div", { class: "row", style: "gap:6px" }, pathIn, loadBtn),
     summary,
-    el("div", { class: "statelbl", style: "margin-top:8px" }, "symbolic fields  (reg:name[:float]  or  0xADDR:name)"), symIn),
+    el("div", { class: "statelbl", style: "margin-top:8px" }, "symbolic fields  (reg:name[:float]  ·  reg+0xOFF:name  ·  0xADDR:name)"), symIn),
     [applyBtn]);
   ($("#modalHost") || document.body).append(bg);
 }
