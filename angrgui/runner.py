@@ -1308,12 +1308,67 @@ class Run:
         self._skip_ret_names[site] = name
         return name
 
+    def _direct_target(self, site: int):
+        """The target address of a direct call (`bl 0x..`/`call 0x..`) at this block,
+        else None (indirect call)."""
+        try:
+            last = self.project.factory.block(site).capstone.insns[-1]
+            if last.mnemonic == "call" or last.mnemonic.startswith("bl"):
+                opc = (last.op_str or "").strip().lstrip("#").strip()
+                if re.fullmatch(r"0x[0-9a-fA-F]+", opc):
+                    return int(opc, 16)
+        except Exception:
+            pass
+        return None
+
+    def _apply_return_bounds(self, state, site: int, retbv):
+        """Constrain a skipped call's return to what the user says it can be (values /
+        min / max). This RESOLVES a 'conditional' finding in the default skip_calls=ON
+        workflow: instead of leaving the return wild, say e.g. aa_clip_edge returns <=3
+        and the out-of-bounds index can no longer occur (the finding is dismissed) — or
+        it still can (confirmed). Matched by callee name substring or call-target address."""
+        bounds = self.spec.get("return_bounds") or []
+        if not bounds:
+            return
+        tgt = self._direct_target(site)
+        name = ((self.binary.name_at(tgt) if tgt is not None else "") or "").lstrip("_")
+        label = (self._skip_ret_names.get(site) or self._callee_label(site) or "")
+        bits = retbv.size()
+        mask = (1 << bits) - 1
+        for b in bounds:
+            call = str(b.get("call", "")).strip()
+            if not call:
+                continue
+            if call.lower().startswith("0x"):
+                try:
+                    hit = (tgt is not None and int(call, 16) == tgt)
+                except ValueError:
+                    hit = False
+            else:
+                low = call.lower().lstrip("_")
+                hit = low in name.lower() or low in label.lower()
+            if not hit:
+                continue
+            try:
+                if b.get("values") is not None:
+                    vs = [int(x) & mask for x in b["values"]]
+                    if vs:
+                        state.add_constraints(claripy.Or(*[retbv == v for v in vs]))
+                if b.get("min") is not None:
+                    state.add_constraints(claripy.UGE(retbv, int(b["min"]) & mask))
+                if b.get("max") is not None:
+                    state.add_constraints(claripy.ULE(retbv, int(b["max"]) & mask))
+            except Exception:
+                pass
+
     def _name_skipped_rets(self, states):
         """CALLLESS writes an Unconstrained value angr names 'fake_ret_value' for
         every skipped call, so unrelated returns look identical in branch
         conditions. Give each a name derived from its callee instead. The value is
         still freshly unconstrained (same semantics) — only the label changes, and
-        it is renamed before the next block consumes it (e.g. `cmp eax, 4`)."""
+        it is renamed before the next block consumes it (e.g. `cmp eax, 4`). When the
+        scenario declares return_bounds for the callee, also constrain the return there
+        — that is how a 'conditional' finding is resolved without leaving skip_calls."""
         if not self.spec.get("limits", {}).get("skip_calls", True):
             return
         ro = self.arch.ret_offset
@@ -1324,7 +1379,11 @@ class Run:
                 rv = s.registers.load(ro, self.arch.bytes)
                 if rv.op != "BVS" or "fake_ret_value" not in rv.args[0]:
                     continue
-                s.registers.store(ro, claripy.BVS(self._skip_ret_name(s), self.arch.bits))
+                hist = list(s.history.bbl_addrs)
+                site = hist[-1] if hist else 0
+                nb = claripy.BVS(self._skip_ret_name(s), self.arch.bits)
+                s.registers.store(ro, nb)
+                self._apply_return_bounds(s, site, nb)
             except Exception:
                 pass
 
@@ -1712,12 +1771,14 @@ class Run:
         cond = [h for h in self.hits if h.extra.get("confidence") == "conditional"]
         if cond:
             calls = sorted({c for h in cond for c in h.extra.get("depends_on", [])})
+            bare = sorted({c[:-4] if c.endswith("_ret") else c for c in calls})
             notes.append(
                 f"{len(cond)} of {len(self.hits)} finding(s) are CONDITIONAL: the triggering "
                 f"value depends on the unconstrained return of a skipped call "
                 f"({', '.join(calls) or 'an unmodeled call'}), so it only holds IF that call can "
-                f"return the needed value. Confirm or dismiss by modeling the call (add_model) or "
-                f"constraining its return (add_assumption on it), then re-run.")
+                f"return the needed value. Resolve it with constrain_return(call=\""
+                f"{bare[0] if bare else '<callee>'}\", max=... / values=[...]) and re-run: if the "
+                f"bound rules out the triggering value the finding is dismissed, else confirmed.")
         # Concrete gates: branches the inputs can't currently steer — the #1 reason a
         # snapshot run misses the bug (a fixed field selects the safe side). Name them
         # and hand over the exact field(s) to make symbolic to open the other side.

@@ -1134,7 +1134,8 @@ def _mcp_configure(addr, patch: dict):
     _validate_specs(patch.get("assumptions"), patch.get("checks"))
     def mutate(cfg):
         sc = cfg["scenarios"][cfg["active"]]
-        for k in ("args", "buffers", "assumptions", "stdin", "files", "limits", "models", "initial_state"):
+        for k in ("args", "buffers", "assumptions", "stdin", "files", "limits", "models",
+                  "initial_state", "return_bounds"):
             if k in patch and patch[k] is not None:
                 sc[k] = {**sc.get("limits", {}), **patch[k]} if k == "limits" else patch[k]
         if patch.get("checks") is not None:
@@ -1172,6 +1173,30 @@ def _mcp_add_model(addr, model):
     return _mcp_get_function(a)["config"]
 
 
+def _mcp_constrain_return(addr, call, values=None, min=None, max=None):
+    """Bound what a SKIPPED call returns, to resolve a 'conditional' finding without
+    leaving the default skip_calls workflow. `call` is the callee (name substring or
+    its 0x call-target address, as named in a finding's depends_on). Give `values`,
+    and/or `min`/`max`. Re-run: if the bound rules out the triggering value the finding
+    is dismissed; if it still fits, the finding is confirmed."""
+    _need_binary()
+    a = _addr(addr)
+    b = {"call": str(call)}
+    if values is not None:
+        b["values"] = [int(x) for x in values]
+    if min is not None:
+        b["min"] = int(min)
+    if max is not None:
+        b["max"] = int(max)
+    if "values" not in b and "min" not in b and "max" not in b:
+        raise HTTPException(400, "give at least one of values / min / max")
+    def mutate(cfg):
+        sc = cfg["scenarios"][cfg["active"]]
+        sc["return_bounds"] = list(sc.get("return_bounds", [])) + [b]
+    _mutate_config(a, mutate)
+    return _mcp_get_function(a)["config"]
+
+
 def _scenario_spec(a: int) -> dict:
     """The run spec for a function's ACTIVE scenario (shared by run + script export)."""
     flat = Workspace.flatten(S.workspace.get_function(a))
@@ -1179,6 +1204,7 @@ def _scenario_spec(a: int) -> dict:
             "assumptions": [x for x in (flat.get("assumptions") or []) if x.strip()],
             "stdin": flat.get("stdin"), "files": flat.get("files") or [], "limits": flat.get("limits") or {},
             "models": flat.get("models") or [], "initial_state": flat.get("initial_state"),
+            "return_bounds": flat.get("return_bounds") or [],
             "checks": [c for c in flat.get("checks", []) if c.get("enabled", True)]}
 
 
@@ -1727,8 +1753,10 @@ get_run(run_id) returns:
       "confirmed"   — the triggering value is driven only by inputs YOU made symbolic.
       "conditional" — it also depends on the unconstrained return of a SKIPPED call
                       (extra.depends_on names the callee); it only holds IF that call
-                      can return the needed value. A LEAD, not a confirmed bug — model
-                      or constrain that call (add_model / add_assumption) and re-run.
+                      can return the needed value. A LEAD, not a confirmed bug. RESOLVE
+                      it with constrain_return(call=<the depends_on callee>, max=/values=)
+                      and re-run: a bound that rules out the triggering value dismisses
+                      the finding; one that still allows it confirms the lead is real.
   • tree: the path tree — nodes with ids, parent links, the block addresses on each
     path, and per-leaf an "example" (inputs for that path) and a classification
     (deadended / returned / unconstrained / errored).
@@ -2106,6 +2134,15 @@ TOOL_DEFS = [
      "{\"kind\":\"alloc\",\"size_arg\":0,\"name\":\"buf\"} (allocate a buffer sized by that arg, tracked for oob_write). "
      "NOTE: skip_calls bypasses models, so to keep a run bounded, model every heavy call the function makes.",
      "inputSchema": {"type": "object", "properties": {**_A, "model": {"type": "object"}}, "required": ["addr", "model"]}},
+    {"name": "constrain_return", "description": "Bound what a SKIPPED call returns, to RESOLVE a 'conditional' "
+     "finding (one whose witness depends on an unmodeled call's return) in the default skip_calls workflow — no "
+     "need to set skip_calls=false. `call` is the callee: a name substring or its 0x call-target address, exactly "
+     "as a finding's extra.depends_on names it. Give `values` (a list of allowed returns) and/or `min`/`max`. "
+     "Re-run: if the bound rules out the triggering value the finding is DISMISSED; if it still fits, CONFIRMED. "
+     "E.g. constrain_return(addr, call=\"aa_clip_edge\", max=3) to ask 'is the OOB real if clip returns at most 3?'.",
+     "inputSchema": {"type": "object", "properties": {**_A, "call": {"type": "string"},
+                     "values": {"type": "array", "items": {"type": "integer"}},
+                     "min": {"type": "integer"}, "max": {"type": "integer"}}, "required": ["addr", "call"]}},
 ]
 
 # documented check kinds (what add_check accepts); kept in sync with checks.py
@@ -2178,6 +2215,7 @@ _MCP_TOOLS = {
     "ida_refresh": lambda a: _mcp_ida_refresh(),
     "ida_import": lambda a: ida_import(),
     "add_model": lambda a: _mcp_add_model(a["addr"], a["model"]),
+    "constrain_return": lambda a: _mcp_constrain_return(a["addr"], a["call"], a.get("values"), a.get("min"), a.get("max")),
     "get_struct": lambda a: (S.ida.struct_layout(a["name"]) if S.ida else _err_no_ida()),
 }
 

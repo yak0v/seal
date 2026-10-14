@@ -67,7 +67,7 @@ import threading
 SUFFIX = ".angrgui.json"
 
 # the initial-state fields that live on a scenario (everything except checks)
-SCEN_FIELDS = ("args", "buffers", "assumptions", "stdin", "files", "limits", "models", "initial_state")
+SCEN_FIELDS = ("args", "buffers", "assumptions", "stdin", "files", "limits", "models", "initial_state", "return_bounds")
 
 
 class Workspace:
