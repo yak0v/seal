@@ -1649,10 +1649,22 @@ get_run(run_id) returns:
   • status: "pending" | "running" | "done" | "error" | "cancelled". POLL until it's
     not pending/running.
   • findings: a list. Each: {kind, addr (integer), message, witness, extra, node}.
+    extra.confidence tells you how much to trust it:
+      "confirmed"   — the triggering value is driven only by inputs YOU made symbolic.
+      "conditional" — it also depends on the unconstrained return of a SKIPPED call
+                      (extra.depends_on names the callee); it only holds IF that call
+                      can return the needed value. A LEAD, not a confirmed bug — model
+                      or constrain that call (add_model / add_assumption) and re-run.
   • tree: the path tree — nodes with ids, parent links, the block addresses on each
     path, and per-leaf an "example" (inputs for that path) and a classification
     (deadended / returned / unconstrained / errored).
-  • summary: counts.
+  • summary: counts, plus:
+      coverage {blocks_covered, blocks_total, pct, unreached[]} — how much of the
+        function the run actually explored. pct<100 with 0 findings does NOT mean safe;
+        the bug may be in an unreached block. Raise steps/loop_bound, relax assumptions,
+        or make a gating input symbolic to reach the rest.
+      confidence {confirmed, conditional} — the finding tally by trust level.
+      notes[] — plain-English hints (why a run was empty, which calls to model, etc.).
 
 THE WITNESS maps each input NAME to its value:
   • a number → {"hex": "0x..", "s": <signed decimal>, "bits": N}. That is the exact

@@ -868,11 +868,63 @@ class Run:
             except Exception:
                 pass
 
+    def _declared_var_names(self, state) -> set:
+        """The claripy variable names of every input SEAL itself made symbolic (args,
+        buffers and their members, snapshot overlays, stdin, files). Anything in a
+        finding's constraints that is NOT in here is engine-introduced — most often an
+        unconstrained return from a skipped call — which is what separates a CONFIRMED
+        finding (driven by real inputs) from a CONDITIONAL one."""
+        declared: set = set()
+        for ast in (state.globals.get("angrgui_vars") or {}).values():
+            if isinstance(ast, claripy.ast.Base):
+                declared |= ast.variables
+        so = state.globals.get("angrgui_stdin")
+        if isinstance(so, claripy.ast.Base):
+            declared |= so.variables
+        for fb in (state.globals.get("angrgui_files") or {}).values():
+            if isinstance(fb, claripy.ast.Base):
+                declared |= fb.variables
+        return declared
+
+    def _classify_finding(self, state) -> tuple[str, list]:
+        """(confidence, depends_on). 'confirmed' = the finding's path constraints involve
+        only declared inputs. 'conditional' = they also depend on an unconstrained value
+        SEAL did not control — a skipped call's return (named after its callee) or a raw
+        fake_ret — so the finding only holds IF that call can produce the needed value;
+        depends_on names them so the next step is obvious (model the call / constrain it)."""
+        if state is None:
+            return "unknown", []
+        declared = self._declared_var_names(state)
+        dep: set = set()
+        for c in state.solver.constraints:
+            try:
+                dep |= c.variables
+            except Exception:
+                pass
+        skip_labels = set(self._skip_ret_names.values())
+        culprits: list = []
+        for v in (dep - declared):
+            lbl = next((l for l in skip_labels if v == l or v.startswith(l + "_")), None)
+            if lbl is not None:
+                culprits.append(lbl)
+            elif "fake_ret_value" in v:
+                culprits.append("an unmodeled call return")
+        if culprits:
+            return "conditional", sorted(set(culprits))
+        return "confirmed", []
+
     def _on_hit(self, hit: Hit, state):
         with self._lock:
             # the state carries the id of the tree node (path stretch) it belongs to
             nid = state.globals.get("angrgui_node") if state is not None else None
             hit.extra["node"] = nid
+            try:
+                conf, deps = self._classify_finding(state)
+                hit.extra["confidence"] = conf
+                if deps:
+                    hit.extra["depends_on"] = deps
+            except Exception:
+                pass
             self.hits.append(hit)
             hit.id = f"f{len(self.hits)}"     # stable per-run finding id (#7): reference as (run_id, id)
             if nid in self.nodes:
@@ -1198,10 +1250,12 @@ class Run:
         try:
             last = self.project.factory.block(site).capstone.insns[-1]
             op = (last.op_str or "").strip()
-            if last.mnemonic == "call":
-                if re.fullmatch(r"0x[0-9a-fA-F]+", op):          # direct: call 0x....
-                    tgt = int(op, 16)
-                    nm = self.binary.name_at(tgt) or f"sub_{tgt:x}"
+            # x86 `call`, arm64 branch-with-link (`bl` direct, `blr`/`blraa..` indirect).
+            if last.mnemonic == "call" or last.mnemonic.startswith("bl"):
+                opc = op.lstrip("#").strip()                     # arm64 prints `bl #0x...`
+                if re.fullmatch(r"0x[0-9a-fA-F]+", opc):         # direct: call/bl <addr>
+                    tgt = int(opc, 16)
+                    nm = (self.binary.name_at(tgt) or f"sub_{tgt:x}").lstrip("_")
                     return f"{nm}_ret"
                 try:                                             # indirect: name by its source line
                     e = self.binary.nearest_line(last.address)
@@ -1386,9 +1440,41 @@ class Run:
             "nodes": len(self.nodes),
             "elapsed": self.progress["elapsed"],
         })
+        self.summary["coverage"] = self._coverage()
+        # how trustworthy the findings are, at a glance (see _classify_finding)
+        conf = {"confirmed": 0, "conditional": 0}
+        for h in self.hits:
+            conf[h.extra.get("confidence", "confirmed")] = \
+                conf.get(h.extra.get("confidence", "confirmed"), 0) + 1
+        if self.hits:
+            self.summary["confidence"] = {k: v for k, v in conf.items() if v}
         notes = self._diagnose(simgr)
         if notes:
             self.summary["notes"] = notes
+
+    def _coverage(self) -> dict:
+        """How much of the TARGET function the run actually explored. A 0-finding run
+        at 100% coverage is a real negative; at 40% it just didn't look — this is the
+        signal that tells those two apart. `unreached` lists the function's own blocks
+        no path entered (capped), so the user can see WHERE exploration fell short."""
+        covered: set = set()
+        for n in self.nodes.values():
+            covered |= set(n.block_addrs)
+        try:
+            total = set(self.func.block_addrs_set) if self.func is not None else set()
+        except Exception:
+            total = set()
+        if not total:
+            return {"blocks_covered": len(covered), "blocks_total": None, "pct": None}
+        covered_in = covered & total
+        unreached = sorted(total - covered_in)
+        return {
+            "blocks_total": len(total),
+            "blocks_covered": len(covered_in),
+            "pct": round(100 * len(covered_in) / len(total)),
+            "unreached": [hex(a) for a in unreached[:50]],
+            "unreached_total": len(unreached),
+        }
 
     def _diagnose(self, simgr) -> list[str]:
         """Human-readable hints about why a run turned out the way it did — so a
@@ -1431,6 +1517,27 @@ class Run:
                          f"angr_arm_patch.py; an x86 x87/SIMD dirty helper (e.g. loadF80le, long double) "
                          f"is an angr limitation with no easy fix — avoid that path or pick another function. "
                          f"A memory error may need a buffer/model; skip_calls avoids stepping into library code.")
+        # Findings that only hold because an UNMODELED call could return the right value
+        # are leads, not confirmed bugs — say so and name the call(s) to model next.
+        cond = [h for h in self.hits if h.extra.get("confidence") == "conditional"]
+        if cond:
+            calls = sorted({c for h in cond for c in h.extra.get("depends_on", [])})
+            notes.append(
+                f"{len(cond)} of {len(self.hits)} finding(s) are CONDITIONAL: the triggering "
+                f"value depends on the unconstrained return of a skipped call "
+                f"({', '.join(calls) or 'an unmodeled call'}), so it only holds IF that call can "
+                f"return the needed value. Confirm or dismiss by modeling the call (add_model) or "
+                f"constraining its return (add_assumption on it), then re-run.")
+        # Coverage: a 0-finding run that only reached part of the function is NOT a clean bill.
+        cov = self.summary.get("coverage") or {}
+        if cov.get("pct") is not None and cov["pct"] < 100:
+            tail = ""
+            if len(self.hits) == 0:
+                tail = (" — a no-finding result here does NOT mean the function is safe; the "
+                        "unreached blocks may hold the bug (raise 'steps'/'loop_bound', relax "
+                        "assumptions, or make a gating input symbolic to reach them).")
+            notes.append(f"explored {cov['pct']}% of the function "
+                         f"({cov['blocks_covered']}/{cov['blocks_total']} blocks){tail}")
         if len(self.hits) == 0 and enabled_checks and not self._setup_notes:
             # a setup note already names a concrete cause; only guess further when there isn't one.
             sym_args = any(a.get("mode", "symbolic") == "symbolic" for a in self.spec.get("args", []))
