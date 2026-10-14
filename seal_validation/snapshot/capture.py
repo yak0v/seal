@@ -38,6 +38,19 @@ def __lldb_init_module(debugger, d):
     # kept for backwards compat with the old aa_lineto workflow:
     debugger.HandleCommand("command script add -f capture.setup aa_setup")
     debugger.HandleCommand("command script add -f capture.aa_break aa_break")
+    debugger.HandleCommand("command script add -f capture.seal_bp seal_bp")
+
+
+def seal_bp(debugger, command, result, internal_dict):
+    """seal_bp <hex offset from CoreGraphics __TEXT base> — set a stopping breakpoint there."""
+    t = debugger.GetSelectedTarget()
+    base = next((m.FindSection("__TEXT").GetLoadAddress(t) for m in t.module_iter()
+                 if m.GetFileSpec().GetFilename() == "CoreGraphics"), None)
+    if base is None:
+        print("CoreGraphics not loaded yet"); return
+    off = int(command.strip(), 16)
+    bp = t.BreakpointCreateByAddress(base + off)
+    print("SEAL_BP @ %#x  (CG __TEXT %#x + %#x)  locations=%d" % (base + off, base, off, bp.GetNumLocations()))
 
 
 def aa_break(debugger, command, result, internal_dict):
