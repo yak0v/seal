@@ -112,6 +112,34 @@ GUI/MCP edits are stored by `workspace.py` as the function's config: a list of
 concretely (`runner.trace_assignments`) to get the value assigned at each instruction — the
 GUI overlays these on the disassembly/decompilation so the human sees real values per line.
 
+### Trust & direction signals (what a run tells you beyond the findings)
+A run is only useful if you know whether to believe it and what to do next. Four signals,
+all computed in `runner.py` and carried in the run snapshot:
+
+- **Finding confidence** (`_classify_finding`, per hit `extra.confidence`): `confirmed` when
+  the triggering value's path constraints involve only declared inputs (`angrgui_vars`);
+  `conditional` when they also involve a skipped call's unconstrained return (named by
+  `_name_skipped_rets` / `_skip_ret_names`), with `extra.depends_on` naming the callee. A
+  conditional finding is a lead, not a bug. `summary.confidence` tallies them.
+- **Coverage** (`_coverage`, `summary.coverage`): covered/total of the function's own blocks,
+  pct, and the unreached blocks — so an empty run says *didn't look* vs *looks safe*.
+- **Concrete gates** (`_note_branch` + `_concrete_gates`, `summary.concrete_gates`): a static
+  2-way branch only ever taken one way with a concrete guard, whose other side was never
+  reached — a frozen snapshot field is steering it. Each gate carries `make_symbolic`, the
+  exact field (found by tracing the tested register to its live defining load) to add to
+  `load_snapshot`'s `symbolic` to open the unexplored side. This is the usual reason a
+  snapshot run reports 0 findings.
+- **Resolution** (`return_bounds` + `_apply_return_bounds`, MCP `constrain_return`): bound a
+  skipped call's return (values/min/max) under the default skip_calls workflow to turn a
+  conditional lead into a verdict — a bound that excludes the triggering value dismisses the
+  finding, one that still allows it confirms it. (Call *models* need `skip_calls=false`;
+  this constrains the CALLLESS return directly so you don't have to leave the default.)
+
+**Direction before the run:** `scan_sinks` (`server.scan_sink_instructions`) statically scans
+a function's disassembly for the sink classes the checks cover (narrowing casts,
+register-indexed accesses, division, memcpy-like calls) and proposes ready-to-add checks —
+the starting map for an unfamiliar function.
+
 ---
 
 ## 4. The neutral contract & the backend seam (`backend.py`)
@@ -137,8 +165,10 @@ Each module's own docstring has the detail; this is the cross-cutting summary.
   `base_addr` is threaded through but **cle's Mach-O backend ignores it** — that's why we
   rebase snapshots instead of loading at a slide (§7).
 
-- **runner.py** — *why:* `_set_arg` is arch-aware (it was x86-only and crashed with
-  `KeyError 'rdi'` on AArch64). The concolic seeder `_build_state_from_snapshot` skips
+- **runner.py** — *why:* argument registers come from `_int_arg_regs` (cc.ARG_REGS with an
+  AArch64 x0..x7 / AMD64 fallback), shared by `_set_arg` AND the call-model builder
+  `_model_compute` — both were separately x86-only and broke on AArch64 (arg setup crashed
+  with `KeyError 'rdi'`; models silently read nonexistent registers). The concolic seeder `_build_state_from_snapshot` skips
   `pc`/`ip` when applying captured registers so a saved `pc` can't clobber the chosen
   start address — **this is what makes mid-function seeding work** — and restores each
   register at its real width (so a 128-bit NEON reg isn't truncated) and the condition
