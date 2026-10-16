@@ -176,6 +176,8 @@ class Run:
         self._loop_bound = 0
         self._skip_ret_names: dict = {}        # call-site addr -> readable name for its skipped-call return
         self._branches: dict = {}              # branch block addr -> {taken:set, sym:bool}: concrete-gate tracking
+        self._concretized: list = []           # lossy symbolic-address concretizations (under-report warning)
+        self._conc_seen: set = set()
 
     # ------------------------------------------------------------------ control
     def cancel(self):
@@ -659,6 +661,39 @@ class Run:
         P.display_name = "model_" + str(m.get("func") or "call")
         return P()
 
+    def _install_concretization_watch(self, state):
+        """When angr accesses memory through a SYMBOLIC address it pins it to one concrete
+        value (its default strategy). If that address was genuinely multi-valued — an
+        attacker-influenced index — the pin loses information: a LATER check on the same
+        index can under-report (e.g. an out-of-bounds WRITE never fires because an earlier
+        READ already pinned the index to an in-bounds value). Record such lossy events,
+        deduped and capped, so the run can WARN instead of silently missing the primitive."""
+        CAP = 8
+        lo, hi = self.func_addr, self.func_addr + self.func_size
+
+        def on_conc(s):
+            if len(self._concretized) >= CAP:
+                return
+            try:
+                expr = s.inspect.address_concretization_expr
+                if expr is None or not expr.symbolic:
+                    return
+                ins = s.scratch.ins_addr
+                if ins is None or not (lo <= ins < hi):
+                    return
+                action = getattr(s.inspect, "address_concretization_action", None)
+                key = (ins, action)
+                if key in self._conc_seen:
+                    return
+                if len(s.solver.eval_upto(expr, 2)) < 2:      # effectively one address -> not lossy
+                    return
+                self._conc_seen.add(key)
+                self._concretized.append({"addr": ins, "action": action})
+            except Exception:
+                pass
+
+        state.inspect.b("address_concretization", when=angr.BP_BEFORE, action=on_conc)
+
     def _install_models(self, state):
         self._hooked = []
         models = self.spec.get("models") or []
@@ -1137,6 +1172,7 @@ class Run:
             except Exception as e:
                 log.warning("could not set solver timeout: %s", e)
             self._install_models(state)
+            self._install_concretization_watch(state)
 
             ctx = self._make_context()
             self._state_checks = []
@@ -1799,6 +1835,18 @@ class Run:
                 f"explored — e.g. the branch at {g['at']} always went to {g['always_went']} and never "
                 f"reached {g['never_reached']}. That is a fixed value gating the path, not a dead end: "
                 f"make the field that selects it symbolic.{hint}")
+        # Lossy address concretization: a symbolic index got pinned, so a later check on
+        # it can under-report (notably an OOB write masked by an earlier OOB read).
+        if self._concretized:
+            first = self._concretized[0]
+            act = first.get("action") or "access"
+            notes.append(
+                f"{len(self._concretized)} symbolic memory address(es) were pinned to one value "
+                f"during the run (first: a {act} at {hex(first['addr'])}). angr concretizes a "
+                f"symbolic access to a single address, so a LATER check on that same index can "
+                f"UNDER-REPORT — e.g. an out-of-bounds WRITE may not fire because an earlier READ "
+                f"already pinned the index. To test such a site in isolation, pin the check to it "
+                f"and give the index a fixed value (constrain_return / an assumption) and sweep.")
         # Coverage: a 0-finding run that only reached part of the function is NOT a clean bill.
         cov = self.summary.get("coverage") or {}
         if cov.get("pct") is not None and cov["pct"] < 100:
