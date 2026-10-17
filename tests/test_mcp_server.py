@@ -153,3 +153,14 @@ def test_constrain_return_requires_a_bound(loaded):
     msg = srv._handle_mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                            "params": {"name": "constrain_return", "arguments": {"addr": hex(fa), "call": "x"}}})
     assert msg["result"].get("isError")
+
+
+def test_configure_clears_initial_state(loaded):
+    """configure({initial_state: null}) drops a seeded snapshot (back to from-scratch);
+    previously the is-not-None guard silently ignored it."""
+    fa = _addr(loaded.S.binary, "route")
+    _call("configure", {"addr": hex(fa),
+                        "patch": {"initial_state": {"kind": "snapshot", "pc": fa, "regs": {}}}})
+    assert _call("get_function", {"addr": hex(fa)})["config"]["initial_state"]
+    _call("configure", {"addr": hex(fa), "patch": {"initial_state": None}})
+    assert _call("get_function", {"addr": hex(fa)})["config"].get("initial_state") is None

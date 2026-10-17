@@ -1171,8 +1171,15 @@ def _mcp_configure(addr, patch: dict):
         sc = cfg["scenarios"][cfg["active"]]
         for k in ("args", "buffers", "assumptions", "stdin", "files", "limits", "models",
                   "initial_state", "return_bounds"):
-            if k in patch and patch[k] is not None:
-                sc[k] = {**sc.get("limits", {}), **patch[k]} if k == "limits" else patch[k]
+            if k not in patch:
+                continue
+            if patch[k] is None:
+                # An explicit null clears the snapshot (back to a from-scratch run); for
+                # the other fields clear with [] / {} (a null there would break the runner).
+                if k == "initial_state":
+                    sc["initial_state"] = None
+                continue
+            sc[k] = {**sc.get("limits", {}), **patch[k]} if k == "limits" else patch[k]
         if patch.get("checks") is not None:
             cfg["checks"] = [_coerce_check(c, a) for c in patch["checks"]]
     _mutate_config(a, mutate)
