@@ -944,12 +944,14 @@ class Run:
                 declared |= fb.variables
         return declared
 
-    def _classify_finding(self, state) -> tuple[str, list]:
-        """(confidence, depends_on). 'confirmed' = the finding's path constraints involve
-        only declared inputs. 'conditional' = they also depend on an unconstrained value
-        SEAL did not control — a skipped call's return (named after its callee) or a raw
-        fake_ret — so the finding only holds IF that call can produce the needed value;
-        depends_on names them so the next step is obvious (model the call / constrain it)."""
+    def _classify_finding(self, state, hit=None) -> tuple[str, list]:
+        """(confidence, depends_on). 'confirmed' = the finding depends only on declared
+        inputs. 'conditional' = it also depends on an unconstrained value SEAL did not
+        control — a skipped call's return (named after its callee) or a raw fake_ret — so
+        it only holds IF that call can produce the needed value; depends_on names them.
+        Dependency = the path constraints UNION the triggering expression's own variables
+        (extra._dep), so a bug driven by an unconstrained return is caught even when no
+        branch constrained it (e.g. buf[clip()] with no guard on the return)."""
         if state is None:
             return "unknown", []
         declared = self._declared_var_names(state)
@@ -959,6 +961,8 @@ class Run:
                 dep |= c.variables
             except Exception:
                 pass
+        if hit is not None:
+            dep |= set(hit.extra.get("_dep", []))
         skip_labels = set(self._skip_ret_names.values())
         culprits: list = []
         for v in (dep - declared):
@@ -977,12 +981,13 @@ class Run:
             nid = state.globals.get("angrgui_node") if state is not None else None
             hit.extra["node"] = nid
             try:
-                conf, deps = self._classify_finding(state)
+                conf, deps = self._classify_finding(state, hit)
                 hit.extra["confidence"] = conf
                 if deps:
                     hit.extra["depends_on"] = deps
             except Exception:
                 pass
+            hit.extra.pop("_dep", None)       # internal: don't leak var names to output
             self.hits.append(hit)
             hit.id = f"f{len(self.hits)}"     # stable per-run finding id (#7): reference as (run_id, id)
             if nid in self.nodes:

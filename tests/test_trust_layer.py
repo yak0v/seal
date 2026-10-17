@@ -126,3 +126,71 @@ def test_scan_sinks_on_sample(binary):
     sinks = scan_sink_instructions(d["instructions"])
     assert any(s["kind"] == "divide_by_zero" for s in sinks), \
         f"expected a divide_by_zero sink in div_z, got {[s['kind'] for s in sinks]}"
+
+
+# -- conditional confidence, return_bounds, concrete_gates (samples/trust_sample) ----
+TRUST_BIN = os.path.join(ROOT, "samples", "trust_sample")
+
+
+@pytest.fixture(scope="module")
+def trust():
+    if not os.path.exists(TRUST_BIN):
+        try:
+            subprocess.check_call(["make", "-C", os.path.join(ROOT, "samples"), "trust_sample"])
+        except Exception as e:
+            pytest.skip(f"cannot build trust_sample: {e}")
+    return Binary(TRUST_BIN, progress=lambda m: None)
+
+
+def _via_return_spec(trust, return_bounds=None):
+    # via_return(buf, a, b): buf[clip_count(a,b)] = a  -- index from a SKIPPED call
+    spec = {
+        "func_addr": _addr(trust, "via_return"),
+        "args": [{"name": "buf", "mode": "symbolic", "size": 8},
+                 {"name": "a", "mode": "symbolic", "size": 4},
+                 {"name": "b", "mode": "symbolic", "size": 4}],
+        "buffers": [{"arg": "buf", "size": 16}],
+        "checks": [{"id": "w", "kind": "oob_write", "enabled": True}],
+        "limits": {"steps": 60, "active": 80, "seconds": 30, "skip_calls": True},
+    }
+    if return_bounds is not None:
+        spec["return_bounds"] = return_bounds
+    return spec
+
+
+def test_finding_confidence_conditional(trust):
+    """The oob_write index comes from the skipped call clip_count, so the finding is
+    CONDITIONAL and names that callee in depends_on."""
+    snap = _run(trust, _via_return_spec(trust))
+    hits = [h for h in snap["hits"] if h["kind"] == "oob_write"]
+    assert hits, "expected an oob_write finding (index from the skipped clip_count)"
+    assert hits[0]["extra"].get("confidence") == "conditional"
+    assert any("clip_count" in d for d in (hits[0]["extra"].get("depends_on") or []))
+    assert (snap["summary"].get("confidence") or {}).get("conditional", 0) >= 1
+
+
+def test_return_bounds_resolve_conditional(trust):
+    """Bounding the skipped call's return resolves the lead: max<=3 (in-bounds for a
+    4-slot buffer) dismisses it; allowing >=5 keeps it. Proves the bound is a real
+    constraint, not blanket suppression."""
+    dismissed = _run(trust, _via_return_spec(trust, [{"call": "clip_count", "max": 3}]))
+    assert not [h for h in dismissed["hits"] if h["kind"] == "oob_write"], \
+        "max<=3 should make buf[n] in-bounds and dismiss the oob_write"
+    kept = _run(trust, _via_return_spec(trust, [{"call": "clip_count", "values": [5]}]))
+    assert [h for h in kept["hits"] if h["kind"] == "oob_write"], \
+        "a return of 5 indexes out of a 4-slot buffer; the oob_write must remain"
+
+
+def test_concrete_gate_reported(trust):
+    """gated(p,i) guards p[i] behind `if (g_mode)`; g_mode is concrete 0 from scratch, so
+    the guarded side is never explored — a concrete gate the run must surface."""
+    snap = _run(trust, {
+        "func_addr": _addr(trust, "gated"),
+        "args": [{"name": "p", "mode": "symbolic", "size": 8},
+                 {"name": "i", "mode": "symbolic", "size": 4}],
+        "buffers": [{"arg": "p", "size": 64}],
+        "limits": {"steps": 40, "active": 60, "seconds": 30, "skip_calls": True},
+    })
+    gates = snap["summary"].get("concrete_gates") or []
+    assert gates, "expected a concrete_gate for the g_mode-guarded branch"
+    assert all("test" in g and "never_reached" in g for g in gates)

@@ -169,13 +169,26 @@ class BaseCheck:
             tmp.add_constraints(c)
         return self._witness(tmp)
 
-    def _record(self, state, addr, message, witness=None, extra=None, dedup_key=None):
+    def _record(self, state, addr, message, witness=None, extra=None, dedup_key=None, trigger=None):
         key = dedup_key if dedup_key is not None else (addr, message)
         if key in self._seen:
             return
         self._seen.add(key)
-        self.hits.append(Hit(self.id, self.kind, addr, message,
-                             witness or {}, extra or {}))
+        extra = dict(extra or {})
+        # Variables of the TRIGGERING expression (the OOB address, the narrowed value,
+        # the asserted condition). The confidence classifier unions these with the path
+        # constraints — so a finding whose triggering VALUE is an unconstrained skipped
+        # call return is still seen as conditional even when no branch constrained it.
+        if trigger is not None:
+            tvars: set = set()
+            for t in (trigger if isinstance(trigger, (list, tuple)) else [trigger]):
+                try:
+                    tvars |= t.variables
+                except Exception:
+                    pass
+            if tvars:
+                extra["_dep"] = sorted(tvars)
+        self.hits.append(Hit(self.id, self.kind, addr, message, witness or {}, extra))
         self.ctx.on_hit(self.hits[-1], state)
 
 
@@ -371,7 +384,7 @@ class IntOverflowCheck(BaseCheck):
                          extra={"mnemonic": mn, "op": op_char, "signedness": label,
                                 "operands": opvals, "src_line": loc,
                                 "result_bits": n, "path": self.ctx.path_of(state)},
-                         dedup_key=(ins_addr, label, op_char))
+                         dedup_key=(ins_addr, label, op_char), trigger=(a, b))
 
     def _concrete_ops(self, state, operands, cond):
         tmp = state.copy()
@@ -438,7 +451,8 @@ class AssertCheck(BaseCheck):
         self._record(state, addr, f"assert can be false: {self.expr}", witness,
                      extra={"expr": self.expr, "src_line": self.ctx.line_for(addr),
                             "path": self.ctx.path_of(state)},
-                     dedup_key=(addr, self.expr))
+                     dedup_key=(addr, self.expr),
+                     trigger=(ast if isinstance(ast, claripy.ast.Base) else None))
 
 
 # --------------------------------------------------------------------------- reach / avoid
@@ -736,7 +750,7 @@ class NarrowingCastCheck(BaseCheck):
         self._record(state, ins_addr, msg, witness,
                      extra={"from_bits": big, "to_bits": small, "mnemonic": mn,
                             "src_line": loc, "path": self.ctx.path_of(state)},
-                     dedup_key=(ins_addr, big, small))
+                     dedup_key=(ins_addr, big, small), trigger=list(fulls))
 
 
 # --------------------------------------------------------------------------- float_anomaly
@@ -922,7 +936,7 @@ class BufferBoundsCheck(BaseCheck):
                             "buffer_base": (hex(base_v) if base_v is not None else None),
                             "buffer_size": size_v if size_v is not None else self.size,
                             "src_line": self.ctx.line_for(ins_addr), "path": self.ctx.path_of(state)},
-                     dedup_key=(ins_addr, base_v))
+                     dedup_key=(ins_addr, base_v), trigger=wa)
 
 
 class NullDerefCheck(BaseCheck):
@@ -1066,7 +1080,7 @@ class DivByZeroCheck(BaseCheck):
             pass
         self._record(state, ins_addr, f"division by zero at {hex(ins_addr)}: the divisor can be 0",
                      witness, extra={"src_line": self.ctx.line_for(ins_addr), "path": self.ctx.path_of(state)},
-                     dedup_key=(ins_addr,))
+                     dedup_key=(ins_addr,), trigger=divisor)
 
 
 CHECK_TYPES = {

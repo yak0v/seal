@@ -5,7 +5,12 @@ ifeq ($(shell uname -s),Darwin)
   ifeq ($(origin CC),default)
     CC := $(firstword $(shell command -v x86_64-linux-gnu-gcc x86_64-linux-musl-gcc 2>/dev/null))
     ifeq ($(CC),)
-      $(error no x86-64 Linux cross-compiler found; brew install filosottile/musl-cross/musl-cross)
+      # fall back to zig as a drop-in x86-64 Linux cross-compiler, if present
+      ifneq ($(shell command -v zig 2>/dev/null),)
+        CC := zig cc -target x86_64-linux-musl
+      else
+        $(error no x86-64 Linux cross-compiler found; brew install filosottile/musl-cross/musl-cross, or install zig)
+      endif
     endif
   endif
 endif
@@ -13,7 +18,11 @@ CC ?= gcc
 CFLAGS ?= -g -O0 -fno-stack-protector -no-pie -fno-omit-frame-pointer -Wno-unused-result
 PYTHON ?= $(if $(wildcard ../.venv/bin/python),../.venv/bin/python,python3)
 
-all: vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample struct_sample
+all: vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample struct_sample trust_sample
+
+# conditional-finding + concrete-gate shapes for the trust/direction features
+trust_sample: trust_sample.c
+	$(CC) $(CFLAGS) -fno-inline -o $@ $<
 
 vuln: vuln.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -29,7 +38,7 @@ vuln.angrgui.json: vuln make_workspace.py
 	$(PYTHON) make_workspace.py vuln
 
 clean:
-	rm -f vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample struct_sample
+	rm -f vuln vuln.angrgui.json jsonc_printbuf checks_sample float_sample struct_sample trust_sample
 
 .PHONY: all clean
 
