@@ -114,3 +114,42 @@ def test_skip_calls_lets_a_caller_branch(loaded):
     assert res["status"] == "done", res.get("error")
     # with calls skipped, main's own dispatch on the stdin bytes produces branches
     assert len([p for p in res["paths"] if p["cond"]]) >= 2
+
+
+def test_scan_sinks_shape(loaded):
+    """scan_sinks returns the documented shape; each sink names a kind and a reason."""
+    fa = _addr(loaded.S.binary, "route")
+    r = _call("scan_sinks", {"addr": hex(fa)})
+    assert {"func", "name", "count", "by_kind", "sinks", "hint"} <= set(r)
+    for s in r["sinks"]:
+        assert {"addr", "kind", "why"} <= set(s)
+
+
+def test_remove_check_by_id(loaded):
+    """remove_check accepts the `id` field get_function emits (not only `check`)."""
+    fa = _addr(loaded.S.binary, "route")
+    _call("configure", {"addr": hex(fa), "patch": {"checks": []}})
+    _call("add_check", {"addr": hex(fa), "check": {"kind": "null_deref"}})
+    cid = _call("get_function", {"addr": hex(fa)})["config"]["checks"][0]["id"]
+    _call("remove_check", {"addr": hex(fa), "id": cid})
+    assert all(c["id"] != cid for c in _call("get_function", {"addr": hex(fa)})["config"]["checks"])
+
+
+def test_constrain_return_replaces_per_call(loaded):
+    """Re-constraining the same call REPLACES its bound (no silent stacking into UNSAT);
+    a different call adds a separate one."""
+    fa = _addr(loaded.S.binary, "route")
+    _call("configure", {"addr": hex(fa), "patch": {"return_bounds": []}})
+    _call("constrain_return", {"addr": hex(fa), "call": "helper", "max": 3})
+    out = _call("constrain_return", {"addr": hex(fa), "call": "helper", "values": [5]})
+    assert out["return_bounds"] == [{"call": "helper", "values": [5]}]
+    out2 = _call("constrain_return", {"addr": hex(fa), "call": "other", "max": 1})
+    assert len(out2["return_bounds"]) == 2
+
+
+def test_constrain_return_requires_a_bound(loaded):
+    """constrain_return with no values/min/max is a clean 400, not a silent no-op."""
+    fa = _addr(loaded.S.binary, "route")
+    msg = srv._handle_mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "constrain_return", "arguments": {"addr": hex(fa), "call": "x"}}})
+    assert msg["result"].get("isError")
