@@ -194,3 +194,34 @@ def test_concrete_gate_reported(trust):
     gates = snap["summary"].get("concrete_gates") or []
     assert gates, "expected a concrete_gate for the g_mode-guarded branch"
     assert all("test" in g and "never_reached" in g for g in gates)
+
+
+def _by_pointee_spec(trust, auto):
+    spec = {
+        "func_addr": _addr(trust, "by_pointee"),
+        "args": [{"name": "p", "mode": "symbolic", "size": 8}],
+        "limits": {"steps": 40, "active": 60, "seconds": 30, "skip_calls": True},
+    }
+    if auto:
+        spec["limits"]["auto_pointers"] = True
+    return spec
+
+
+def test_auto_pointers_reaches_pointee_gated_code(trust):
+    """by_pointee guards a block behind `if (p[0] == 0x5a)`. Without a backing region p[0]
+    reads 0 and the block is unreachable (a concrete gate); with limits.auto_pointers the
+    pointee is symbolic and the block is reached — the point of the feature."""
+    off = _run(trust, _by_pointee_spec(trust, auto=False))
+    on = _run(trust, _by_pointee_spec(trust, auto=True))
+    assert off["summary"]["coverage"]["pct"] < 100
+    assert off["summary"].get("concrete_gates"), "the pointee branch should be a concrete gate when off"
+    assert on["summary"]["coverage"]["blocks_covered"] > off["summary"]["coverage"]["blocks_covered"]
+    # a run that relied on auto-backing says so, so the findings read as leads
+    assert any("auto_pointers backed" in n for n in on["summary"].get("notes", []))
+
+
+def test_auto_pointers_off_by_default(trust):
+    """The capability must be opt-in: a default run does not auto-back, so nothing changes
+    for existing scenarios/tests."""
+    snap = _run(trust, _by_pointee_spec(trust, auto=False))
+    assert not any("auto_pointers backed" in n for n in snap["summary"].get("notes", []))

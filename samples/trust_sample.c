@@ -39,4 +39,14 @@ int gated(const int *p, int i) {
     return -1;
 }
 
+/* A branch gated by the POINTED-TO value. Without a backing region, p[0] reads 0 and the
+ * guarded block is unreachable; with limits.auto_pointers the pointee is symbolic and the
+ * block becomes reachable — the whole point of auto_pointers (bugs in pointed-to data). */
+int by_pointee(const int *p) {
+    if (p[0] == 0x5a) {
+        return p[1] + 1;
+    }
+    return 0;
+}
+
 int main(void) { return 0; }

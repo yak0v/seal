@@ -178,6 +178,7 @@ class Run:
         self._branches: dict = {}              # branch block addr -> {taken:set, sym:bool}: concrete-gate tracking
         self._concretized: list = []           # lossy symbolic-address concretizations (under-report warning)
         self._conc_seen: set = set()
+        self._auto_backed: set = set()          # pointer args auto-backed with a symbolic region (limits.auto_pointers)
 
     # ------------------------------------------------------------------ control
     def cancel(self):
@@ -446,6 +447,22 @@ class Run:
         for b in self.spec.get("buffers", []):
             argname = _resolve_argname(b["arg"])
             buffers[argname] = (int(b.get("size", 64)), b.get("layout") or [])
+
+        # Opt-in (limits.auto_pointers): auto-back every symbolic pointer-sized arg that
+        # has no explicit buffer with a symbolic region, so a function that dereferences a
+        # pointer arg is analysable WITHOUT hand-declaring each buffer, and the pointee is
+        # attacker-controlled. This is a deliberate ASSUMPTION — that the pointer is valid
+        # and points to a controllable region of this size — which is WRONG for an
+        # internal/fixed pointer, so _diagnose flags any run that relied on it.
+        self._auto_backed = set()
+        if self.spec.get("limits", {}).get("auto_pointers"):
+            wb = self.arch.bytes
+            for i, a in enumerate(args):
+                nm = a.get("name") or f"arg{i}"
+                if (a.get("mode", "symbolic") == "symbolic" and not a.get("float")
+                        and int(a.get("size") or wb) == wb and nm not in buffers):
+                    buffers[nm] = (self.AUTO_PTR_REGION, [])
+                    self._auto_backed.add(nm)
 
         # stdin has to be handed to call_state: swapping state.posix.stdin afterwards
         # leaves the file uninitialised and the first state copy crashes
@@ -774,6 +791,7 @@ class Run:
 
     # ------------------------------------------------------------------ buffers / structs
     PTR_MAX_DEPTH = 5                        # cap recursive pointer expansion (cycles/blowup)
+    AUTO_PTR_REGION = 0x1000                 # symbolic region size behind an auto-backed pointer arg
 
     def _alloc_region(self, size: int) -> int:
         """Hand out the next page-aligned scratch block of at least `size` bytes."""
@@ -1780,7 +1798,16 @@ class Run:
                 f"the function dereferenced pointer arg(s) with NO buffer set up — {who}. "
                 f"Those reads go to unmapped/zero memory, so this run is NOT a meaningful "
                 f"validation: declare a buffer for each such arg (configure buffers:[{{arg,size}}]), "
-                f"and for a struct arg give pointer members their own target (nested buffers).")
+                f"and for a struct arg give pointer members their own target (nested buffers). "
+                f"Or set limits.auto_pointers=true to auto-back every pointer arg with a symbolic "
+                f"region (finds bugs in the pointed-to data; treat results as leads — see below).")
+        if self._auto_backed:
+            notes.append(
+                f"auto_pointers backed pointer arg(s) {', '.join(sorted(self._auto_backed))} with a "
+                f"{self.AUTO_PTR_REGION}-byte SYMBOLIC region each. Any finding here ASSUMES that "
+                f"pointer is valid and points to attacker-controlled memory of at least that size — "
+                f"true for a real input buffer, FALSE for an internal/fixed pointer. Treat these as "
+                f"leads: confirm the pointer is actually attacker-influenced before trusting the bug.")
         enabled_checks = [c for c in self.spec.get("checks", []) if c.get("enabled", True)]
         unconstrained = len(getattr(simgr, "unconstrained", []))
         errored = len(getattr(simgr, "errored", []))

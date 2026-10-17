@@ -1726,6 +1726,13 @@ LIMITS — bound the exploration. configure(a, {"limits":{...}}):
     BYPASSES models (PART 9), so don't set it when you rely on modeled allocations.
   • loop_bound: cap iterations of a loop with a symbolic trip count (stops infinite
     unrolling). find / avoid: optional target/forbidden addresses for directed search.
+  • auto_pointers: true auto-backs every symbolic POINTER-sized arg that has no explicit
+    buffer with a symbolic region, so a function that dereferences a pointer arg is
+    analysable without hand-declaring each buffer, and the pointed-to DATA is treated as
+    attacker-controlled (finds bugs in struct/array contents, not just scalar args). It is
+    an ASSUMPTION — that the pointer is valid and points to a controllable region — so it
+    can over-report for an internal/fixed pointer; a run that used it says so in
+    summary.notes, and those findings are leads to confirm. Off by default.
 
 ════════════════════════════════════════════════════════════════════════
 PART 5 — CHECKS (what to look for).  add_check(addr, check); or remove_check.
