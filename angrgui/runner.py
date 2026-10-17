@@ -454,14 +454,16 @@ class Run:
         # attacker-controlled. This is a deliberate ASSUMPTION — that the pointer is valid
         # and points to a controllable region of this size — which is WRONG for an
         # internal/fixed pointer, so _diagnose flags any run that relied on it.
-        self._auto_backed = set()
+        # args the server already injected a TYPED auto-pointer buffer for (real struct
+        # layout); still count them as auto-backed so the run is flagged assumption-based.
+        self._auto_backed = set(self.spec.get("_auto_ptr_args", []))
         if self.spec.get("limits", {}).get("auto_pointers"):
             wb = self.arch.bytes
             for i, a in enumerate(args):
                 nm = a.get("name") or f"arg{i}"
                 if (a.get("mode", "symbolic") == "symbolic" and not a.get("float")
                         and int(a.get("size") or wb) == wb and nm not in buffers):
-                    buffers[nm] = (self.AUTO_PTR_REGION, [])
+                    buffers[nm] = (self.AUTO_PTR_REGION, [])     # untyped -> flat symbolic region
                     self._auto_backed.add(nm)
 
         # stdin has to be handed to call_state: swapping state.posix.stdin afterwards
@@ -1802,12 +1804,19 @@ class Run:
                 f"Or set limits.auto_pointers=true to auto-back every pointer arg with a symbolic "
                 f"region (finds bugs in the pointed-to data; treat results as leads — see below).")
         if self._auto_backed:
+            typed = set(self.spec.get("_auto_ptr_args", []))
+            how = []
+            if typed:
+                how.append(f"{', '.join(sorted(typed))} by their struct type (named fields, pointer "
+                           f"members expanded)")
+            flat = self._auto_backed - typed
+            if flat:
+                how.append(f"{', '.join(sorted(flat))} with a flat {self.AUTO_PTR_REGION}-byte region")
             notes.append(
-                f"auto_pointers backed pointer arg(s) {', '.join(sorted(self._auto_backed))} with a "
-                f"{self.AUTO_PTR_REGION}-byte SYMBOLIC region each. Any finding here ASSUMES that "
-                f"pointer is valid and points to attacker-controlled memory of at least that size — "
-                f"true for a real input buffer, FALSE for an internal/fixed pointer. Treat these as "
-                f"leads: confirm the pointer is actually attacker-influenced before trusting the bug.")
+                f"auto_pointers backed pointer arg(s): {'; '.join(how)}. Any finding here ASSUMES each "
+                f"pointer is valid and points to attacker-controlled memory — true for a real input "
+                f"buffer, FALSE for an internal/fixed pointer. Treat these as leads: confirm the pointer "
+                f"is actually attacker-influenced before trusting the bug.")
         enabled_checks = [c for c in self.spec.get("checks", []) if c.get("enabled", True)]
         unconstrained = len(getattr(simgr, "unconstrained", []))
         errored = len(getattr(simgr, "errored", []))

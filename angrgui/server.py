@@ -571,6 +571,68 @@ def _enrich_buffer_members(spec: dict) -> dict:
     return spec
 
 
+_AUTO_PTR_DEPTH = 2            # how deep to expand struct pointer members under auto_pointers
+
+
+def _ida_fill_layout(struct_type, depth=0):
+    """Convert an IDA struct type into a runner fill `layout`: named members, with pointer
+    members expanded into their OWN backed sub-regions (recursively, depth-capped). Returns
+    (size, layout), or (None, None) if the type is unknown. Reuses _fill_region's proven
+    nested-pointer support — so auto_pointers backs the pointed-to data by its REAL type."""
+    try:
+        data = S.ida.struct_layout(struct_type)
+    except Exception:
+        return None, None
+    members = data.get("members") or []
+    if not members:
+        return None, None
+    layout = []
+    for m in members:
+        try:
+            off = int(m["offset"]); sz = int(m.get("size") or 0)
+        except Exception:
+            continue
+        nm = str(m.get("name") or f"m{off:x}")
+        if nm.startswith("_gap") or sz <= 0:
+            continue                         # padding stays part of the symbolic blob
+        if m.get("is_ptr") and depth < _AUTO_PTR_DEPTH:
+            tn = m.get("type_name") or ""
+            tsz, sub = _ida_fill_layout(tn, depth + 1) if tn else (None, None)
+            target = {"size": tsz or 64}
+            if sub:
+                target["layout"] = sub
+            layout.append({"offset": off, "size": sz, "name": nm, "mode": "pointer", "target": target})
+        else:
+            layout.append({"offset": off, "size": sz, "name": nm})
+    return (int(data.get("size") or 0) or None), layout
+
+
+def _auto_point_buffers(spec):
+    """limits.auto_pointers + IDA: inject a typed buffer (real struct layout, pointer
+    members expanded) for each symbolic pointer arg with a known struct type, so the
+    pointed-to data is backed ACCURATELY by its type instead of as a flat blob. Untyped
+    pointer args fall through to the runner's flat auto-backing. Records the injected arg
+    names in `_auto_ptr_args` so the runner still flags the run as assumption-based."""
+    if not (spec.get("limits") or {}).get("auto_pointers") or S.ida is None:
+        return spec
+    have = {str(b.get("arg")) for b in (spec.get("buffers") or [])}
+    for i, a in enumerate(spec.get("args", []) or []):
+        nm = a.get("name") or f"arg{i}"
+        if (a.get("mode", "symbolic") != "symbolic" or a.get("float")
+                or int(a.get("size") or 8) != 8 or nm in have):
+            continue
+        st = _arg_struct_type(spec["func_addr"], nm)
+        if not st:
+            continue
+        size, layout = _ida_fill_layout(st)
+        if not layout:
+            continue
+        spec.setdefault("buffers", []).append(
+            {"arg": nm, "size": size or 0x200, "layout": layout, "struct_type": st})
+        spec.setdefault("_auto_ptr_args", []).append(nm)
+    return spec
+
+
 def _persist_run_record(run_id: str, spec: dict, source: str):
     """Save a finished run's findings + metadata to the workspace (durable, concurrency-
     safe). The huge path tree is NOT stored — just the summary and the findings (with
@@ -613,6 +675,7 @@ def _start_run(spec: dict, source: str = "gui") -> str:
     if S.backend.binary.get_function(spec["func_addr"]) is None:
         raise HTTPException(404, "no such function")
     _merge_global_models(spec)
+    _auto_point_buffers(spec)
     _enrich_buffer_members(spec)
     run_id = S.backend.new_run_id()
 
