@@ -288,7 +288,7 @@ async function selectFunction(f) {
 // initial state). A.func holds the structure; A.config is a live view onto the
 // active scenario, with the shared checks array exposed as A.config.checks so
 // all the existing per-field editors keep working unchanged.
-const SCEN_FIELDS = ["name", "args", "buffers", "assumptions", "stdin", "files", "limits", "initial_state"];
+const SCEN_FIELDS = ["name", "args", "buffers", "assumptions", "stdin", "files", "limits", "initial_state", "return_bounds"];
 function normalizeScenario(s, i) {
   s = s || {};
   s.name = s.name || ("Scenario " + (i + 1));
@@ -299,6 +299,7 @@ function normalizeScenario(s, i) {
   s.files = s.files || [];
   s.limits = Object.assign({ steps: 150, active: 300, seconds: 30, loop_bound: 12, find: null, avoid: [] }, s.limits || {});
   s.initial_state = s.initial_state || null;   // null = fresh call (symbolic args); else {kind:"snapshot",...}
+  s.return_bounds = s.return_bounds || [];     // constrain_return: bound a skipped call's return
   return s;
 }
 function normalizeFunc(cfg) {
@@ -844,6 +845,7 @@ function renderRight() {
   body.append(sectionAssumptions());
   body.append(sectionModels());
   body.append(sectionChecks());
+  body.append(sectionReturnBounds());
   body.append(sectionRun());
   body.append(sectionHits());
   $$(".sec", body).forEach(makeCollapsible);
@@ -1453,6 +1455,43 @@ function describeCheck(c) {
   return "";
 }
 
+// ============================================================ return bounds (constrain_return)
+// Bound what a SKIPPED call returns, to resolve a CONDITIONAL finding without leaving the
+// default skip_calls workflow. One bound per call (adding the same call replaces it).
+function sectionReturnBounds() {
+  const s = el("div", { class: "sec" });
+  s.append(el("h3", {}, "Return bounds ", el("span", { class: "faint", style: "font-weight:400;font-size:11px" }, "(resolve conditional findings)")));
+  const b = el("div", { class: "body" });
+  const rb = A.config.return_bounds = A.config.return_bounds || [];
+  if (!rb.length) b.append(el("div", { class: "faint", style: "font-size:12px;margin-bottom:6px" },
+    "A conditional finding depends on a skipped call's return. Bound that call here, then re-run: a bound that rules out the dangerous value dismisses the finding; one that still allows it confirms it."));
+  rb.forEach((x, i) => {
+    const desc = x.values != null ? "∈ {" + x.values.join(", ") + "}"
+      : [x.min != null ? "≥ " + x.min : null, x.max != null ? "≤ " + x.max : null].filter(Boolean).join(" and ");
+    b.append(el("div", { class: "row", style: "gap:6px;font-size:12px;margin:3px 0" },
+      el("code", {}, x.call), el("span", { class: "faint" }, "ret " + desc), el("span", { class: "grow" }),
+      btn("✕", () => { rb.splice(i, 1); saveConfig(); renderRight(); }, "tiny ghost")));
+  });
+  // add form: call + (max | values)
+  const call = el("input", { placeholder: "call (name or 0x…, e.g. aa_clip_edge)", style: "flex:2;min-width:0" });
+  const max = el("input", { placeholder: "max", style: "flex:1;min-width:0", type: "number" });
+  const vals = el("input", { placeholder: "or values: 0,1,2,3", style: "flex:1;min-width:0" });
+  const add = () => {
+    const c = call.value.trim(); if (!c) { toast("enter the call", true); return; }
+    const bound = { call: c };
+    if (vals.value.trim()) bound.values = vals.value.split(",").map(v => +v.trim()).filter(v => !isNaN(v));
+    else if (max.value !== "") bound.max = +max.value;
+    else { toast("give a max or values", true); return; }
+    A.config.return_bounds = rb.filter(x => String(x.call) !== c).concat([bound]);   // replace per call
+    call.value = max.value = vals.value = "";
+    saveConfig().then(() => { renderRight(); toast("bound " + c + " — re-run to resolve"); });
+  };
+  b.append(el("div", { class: "row", style: "gap:4px;margin-top:6px" }, call, max, vals,
+    btn("+ bound", add, "tiny primary")));
+  s.append(b);
+  return s;
+}
+
 // ==================================================================== run section
 function sectionRun() {
   const s = el("div", { class: "sec" });
@@ -1468,6 +1507,11 @@ function sectionRun() {
     el("input", { type: "checkbox", checked: L.skip_calls ? "" : null, style: "width:auto",
       onchange: e => { L.skip_calls = e.target.checked; scheduleSave(); } }),
     "skip calls ", el("span", { class: "faint" }, "(explore only this function)")));
+  b.append(el("label", { class: "row", style: "font-size:12px;gap:6px;margin-bottom:8px",
+      title: "Back every symbolic pointer arg with a symbolic region so bugs in the POINTED-TO data are findable (uses the arg's real IDA struct type when known). It's an assumption — findings are flagged as leads. Off by default." },
+    el("input", { type: "checkbox", checked: L.auto_pointers ? "" : null, style: "width:auto",
+      onchange: e => { L.auto_pointers = e.target.checked; scheduleSave(); } }),
+    "auto-back pointers ", el("span", { class: "faint" }, "(explore data behind pointer args)")));
 
   const running = A.run && (A.run.snapshot?.status === "running" || A.run.snapshot?.status === "pending");
   const runBtn = el("button", { class: "primary", style: "width:100%;padding:8px", onclick: startRun,
