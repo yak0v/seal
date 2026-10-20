@@ -344,7 +344,17 @@ async function selectFunction(f) {
   stopPolling();
   renderFunctions();
   $("#pane-code").innerHTML = '<div class="empty">Loading…</div>';
-  const d = await api("/api/function/" + f.addr);
+  let d;
+  try {
+    d = await api("/api/function/" + f.addr);
+  } catch (e) {                               // don't fail silently: a broken /api/function
+    toast("couldn't open this function: " + e.message, true);   // left A.func null, so the
+    $("#pane-code").innerHTML = '<div class="empty">Could not load this function.<br>'  // State
+      + (e.message || "") + '</div>';                                                    // tab
+    A.fn = A.detail = A.config = A.func = null;                 // read "Select a function".
+    renderRight();
+    return;
+  }
   A.detail = d;
   A.func = normalizeFunc(d.config); bindConfig(); A._vars = null;
   // re-attach the most recent run for this function (survives a page reload)
