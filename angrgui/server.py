@@ -2042,13 +2042,37 @@ Two things SEAL does for you here:
     and stack addresses are left alone). You pass the raw captured snapshot + the
     slide; SEAL does the math.
 
-HOW TO CAPTURE A SNAPSHOT (outside SEAL — lldb can't run inside it): the repo ships
-angrgui/snapshot/capture.py (an lldb script that dumps registers + pointer-reachable
-memory in exactly this shape and records the image slide) and live_bp.py (break by
-ADDRESS in a shared-cache image — breaking by a stripped local symbol name hangs).
-Capture at the TRUE function entry (lldb: --skip-prologue false) or the argument
-registers will already be spilled and dead. See docs/ARCHITECTURE.md "Concolic
-seeding" for the full workflow. Then feed the JSON straight into initial_state.
+EASIEST PATH — DON'T hand-build the initial_state above for a capture file. If you HAVE
+a capture file (see below), just call the `load_snapshot` TOOL: it reads the file,
+auto-computes the image slide, wires the process core / memory, and marks the fields you
+name symbolic — one call. The raw initial_state shape above is only for a hand-made seed.
+
+    load_snapshot(addr, path="/tmp/snap.json",
+                  symbolic=[{"reg":"v0","name":"pt","size":16,"float":"f32x2"},
+                            {"base":"x0","offset":"0xb0","name":"flags","size":4}])
+
+HOW TO CREATE A CAPTURE FILE (lldb — you CANNOT run lldb inside SEAL; give these exact
+commands to the user running the target process, then use the file they produce). The
+repo ships `seal_validation/snapshot/capture.py`:
+
+    (lldb) command script import seal_validation/snapshot/capture.py
+    (lldb) breakpoint set --address <addr of the function>   # TRUE entry — args are live
+    (lldb) run
+    (lldb) seal_snapshot /tmp/snap.json core                 # RECOMMENDED: full process core
+
+The last arg is the capture MODE:
+  • core    — RECOMMENDED. `process save-core`: the WHOLE process memory image; SEAL
+              demand-pages from the .core (kept next to the json) so every address has its
+              real bytes. Complete and sound.
+  • full    — all writable/anonymous regions AND read-only file-backed ones, in the json.
+  • (none)  — reachable only: BFS from the argument registers. Smallest, but can MISS
+              memory a field reaches once you make it symbolic — prefer core.
+
+For a dyld-shared-cache image (iOS/macOS framework) break by ADDRESS. capture.py also
+registers `seal_bp <hex offset from the CoreGraphics __TEXT base>` as a convenience, e.g.
+`seal_bp 0x4e548` then `continue` then `seal_snapshot /tmp/snap.json core`. Then
+load_snapshot(addr, "/tmp/snap.json", symbolic=[...]). Full workflow:
+docs/ARCHITECTURE.md §7.
 
 ════════════════════════════════════════════════════════════════════════
 PART 8 — THE EXPRESSION LANGUAGE (assumptions and assert "expr")
