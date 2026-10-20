@@ -375,40 +375,58 @@ def _apply_ida_names(fns):
 
 @app.get("/api/function/{addr}")
 def function(addr: int):
+    # Robust by design: the ONLY fatal case is a genuinely unknown function (404). Every
+    # enrichment step (disasm, DWARF, arg seeding, return heads) is best-effort, so one
+    # failing piece can never blank the whole function view (A.func stayed null -> the
+    # State tab read "Select a function" and the code pane hung on "Loading…").
     b = _need_binary()
     fn = b.get_function(addr)
     if fn is None:
         raise HTTPException(404, "no such function")
-    disasm = b.disassemble(addr)
-    dwarf = [v.to_json(b.word_bytes) for v in b.dwarf_vars(addr)]
-    cfg = S.workspace.get_function(addr) if S.workspace else Workspace._default_func()
-    # seed default args from DWARF / calling convention into the active scenario
-    sc = cfg["scenarios"][cfg["active"]]
-    if not sc.get("args"):
-        # Prefer IDA's parameters (names the user sees in the decompilation, and float/
-        # vector args pre-marked) so setting up a buffer uses the SAME name as the code
-        # (#2); fall back to DWARF / calling-convention args.
-        ida_params = _ida_params(addr)
-        # the function may be addressed by an interior/containing address that isn't the
-        # exact head in function_list — don't crash the whole detail fetch over it.
-        matches = [f for f in b.function_list() if f["addr"] == addr]
-        cc_args = matches[0]["args"] if matches else []
-        if ida_params and len(ida_params) >= len(cc_args):
-            for p in ida_params:
-                a = {"name": p["name"], "mode": "symbolic",
-                     "size": p["size"] or b.word_bytes, "signed": True}
-                if p.get("float"):
-                    a["float"] = True
-                sc.setdefault("args", []).append(a)
-        else:
-            for a in cc_args:
-                sc.setdefault("args", []).append({
-                    "name": a["name"], "mode": "symbolic",
-                    "size": a["size"] or b.word_bytes, "signed": a.get("signed", True),
-                })
+    try:
+        cfg = S.workspace.get_function(addr) if S.workspace else Workspace._default_func()
+    except Exception as e:
+        log.warning("config load failed for %#x: %s", addr, e)
+        cfg = Workspace._default_func()
+    try:
+        disasm = b.disassemble(addr)
+    except Exception as e:
+        log.warning("disassemble failed for %#x: %s", addr, e)
+        disasm = {"addr": addr, "name": (b.name_at(addr) or hex(addr)),
+                  "instructions": [], "source": None, "call_targets": []}
+    try:
+        dwarf = [v.to_json(b.word_bytes) for v in b.dwarf_vars(addr)]
+    except Exception:
+        dwarf = []
+    # seed default args into the active scenario — best-effort, never fatal
+    try:
+        sc = cfg["scenarios"][cfg["active"]]
+        if not sc.get("args"):
+            # Prefer IDA's parameters (the names shown in the decompilation, float/vector
+            # pre-marked); fall back to the calling convention's args.
+            ida_params = _ida_params(addr)
+            matches = [f for f in b.function_list() if f["addr"] == addr]
+            cc_args = matches[0]["args"] if matches else []
+            if ida_params and len(ida_params) >= len(cc_args):
+                for p in ida_params:
+                    a = {"name": p["name"], "mode": "symbolic",
+                         "size": p["size"] or b.word_bytes, "signed": True}
+                    if p.get("float"):
+                        a["float"] = True
+                    sc.setdefault("args", []).append(a)
+            else:
+                for a in cc_args:
+                    sc.setdefault("args", []).append({
+                        "name": a["name"], "mode": "symbolic",
+                        "size": a["size"] or b.word_bytes, "signed": a.get("signed", True)})
+    except Exception as e:
+        log.warning("arg-seeding failed for %#x: %s", addr, e)
+    try:
+        return_heads = [hex(h) for h in b.return_block_heads(addr)]
+    except Exception:
+        return_heads = []
     return {"disasm": disasm, "dwarf": dwarf, "config": cfg,
-            "return_heads": [hex(h) for h in b.return_block_heads(addr)],
-            "last_run": S.last_run.get(addr)}
+            "return_heads": return_heads, "last_run": S.last_run.get(addr)}
 
 
 @app.get("/api/sinks/{addr}")
