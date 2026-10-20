@@ -389,7 +389,10 @@ def function(addr: int):
         # vector args pre-marked) so setting up a buffer uses the SAME name as the code
         # (#2); fall back to DWARF / calling-convention args.
         ida_params = _ida_params(addr)
-        cc_args = [f for f in b.function_list() if f["addr"] == addr][0]["args"]
+        # the function may be addressed by an interior/containing address that isn't the
+        # exact head in function_list — don't crash the whole detail fetch over it.
+        matches = [f for f in b.function_list() if f["addr"] == addr]
+        cc_args = matches[0]["args"] if matches else []
         if ida_params and len(ida_params) >= len(cc_args):
             for p in ida_params:
                 a = {"name": p["name"], "mode": "symbolic",
