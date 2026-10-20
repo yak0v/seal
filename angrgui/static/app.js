@@ -1546,8 +1546,18 @@ function sectionHits() {
 function renderHit(h, i) {
   const kindCls = h.kind === "reach" ? "reach" : h.kind === "assert" ? "assert" : "";
   const box = el("div", { class: "hit " + kindCls });
+  const conf = h.extra?.confidence;              // confirmed | conditional (see runner._classify_finding)
+  const deps = h.extra?.depends_on || [];
+  const confBadge = conf === "conditional"
+    ? el("span", { class: "pill warn", title: "CONDITIONAL — the triggering value depends on the unconstrained return of a skipped call ("
+        + deps.join(", ") + "). A lead, not a confirmed bug: bound that call's return (Return bounds, below) to confirm or dismiss." }, "conditional")
+    : conf === "confirmed"
+      ? el("span", { class: "pill ok", title: "CONFIRMED — driven only by inputs you made symbolic." }, "confirmed")
+      : null;
   box.append(el("div", { class: "h1" },
     el("span", { class: "pill " + (h.kind === "reach" ? "info" : "bad") }, h.kind.replace("_", " ")),
+    confBadge,
+    deps.length ? el("span", { class: "faint", style: "font-size:11px" }, "needs " + deps.join(", ")) : null,
     el("span", { class: "grow mono", style: "font-size:11px" }, hx64(h.addr)),
     h.extra?.src_line ? el("span", { class: "faint" }, h.extra.src_line.file + ":" + h.extra.src_line.line) : null));
   box.append(el("div", { class: "msg" }, h.message));
@@ -1726,6 +1736,8 @@ function renderTree(force) {
     notes.forEach(n => box.append(el("div", { class: "rnote" }, n)));
     pane.append(box);
   }
+  const gatesBox = renderGates(snap);
+  if (gatesBox) pane.append(gatesBox);
   if (view === "tree") {
     pane.classList.add("treemode");
     const host = el("div", { class: "ptreegraph" });
@@ -2039,12 +2051,65 @@ function pathsSummary(T, snap) {
     dropped: "dropped (max active)", unconstrained: "hijackable jump", unknown_call: "unknown call target", error: "errored", unfinished: "unfinished", running: "still running", left_image: "tail-called out of the image" };
   const parts = Object.entries(counts).map(([r, c]) => el("span", { class: "pill " + (END_STYLE[r]?.[0] || "") }, `${c} ${names[r] || r}`));
   const hits = snap.hits.length;
+  const cov = snap.summary?.coverage;
+  const conf = snap.summary?.confidence || {};
+  const covPill = (cov && cov.pct != null)
+    ? el("span", { class: "pill " + (cov.pct >= 100 ? "ok" : "warn"),
+        title: `explored ${cov.blocks_covered}/${cov.blocks_total} blocks` + (cov.unreached?.length ? " · unreached: " + cov.unreached.join(" ") : "")
+          + (cov.pct < 100 ? " — a 0-finding result at <100% is 'didn't look', not 'safe'" : "") },
+        `${cov.pct}% explored`)
+    : null;
+  const confPills = [
+    conf.confirmed ? el("span", { class: "pill ok", title: "findings driven only by your symbolic inputs" }, `${conf.confirmed} confirmed`) : null,
+    conf.conditional ? el("span", { class: "pill warn", title: "findings that depend on a skipped call's return — leads to resolve with a return bound" }, `${conf.conditional} conditional`) : null,
+  ].filter(Boolean);
   return el("div", { class: "psum" },
     el("b", {}, `${leaves.length} path${leaves.length === 1 ? "" : "s"}:`), ...parts,
+    covPill,
     el("span", { class: "grow" }),
+    ...confPills,
     hits ? el("span", { class: "pill bad" }, `${hits} finding${hits > 1 ? "s" : ""}`) : el("span", { class: "faint" }, "no findings"));
 }
 const leafReason = (n, snap) => n.end?.reason || (["running", "pending"].includes(snap.status) ? "running" : "unfinished");
+
+// Concrete gates: branches a fixed value steered one way, whose other side was never
+// explored. Show each with its test + the exact field to make symbolic, and (for a
+// snapshot-seeded scenario) a one-click button to add that field to the symbolic overlay.
+function renderGates(snap) {
+  const gates = snap.summary?.concrete_gates || [];
+  if (!gates.length) return null;
+  const box = el("div", { class: "gatesbox" });
+  box.append(el("b", {}, `🔒 ${gates.length} concrete gate${gates.length > 1 ? "s" : ""} — a fixed value steers these; the other side was never explored`));
+  const isSnap = (A.config?.initial_state || {})?.kind === "snapshot";
+  gates.forEach(g => {
+    const row = el("div", { class: "gaterow" });
+    row.append(el("span", { class: "mono", style: "font-size:11px",
+      title: `always went ${g.always_went}, never reached ${g.never_reached}` }, g.at),
+      el("span", { class: "gtest mono" }, g.test || ""));
+    (g.make_symbolic || []).forEach(f => {
+      const label = `[${f.base}, ${f.offset}] (${f.size}B)`;
+      row.append(el("button", { class: "tiny" + (isSnap ? " primary" : " ghost"),
+        title: isSnap ? "make this field symbolic and re-run to open the other side"
+                      : "make this field symbolic (snapshot-seeded scenarios get a one-click add; otherwise add it to your buffer layout)",
+        onclick: isSnap ? () => addGateField(f) : null,
+        disabled: isSnap ? null : "" }, "make " + label + " symbolic"));
+    });
+    if (!(g.make_symbolic || []).length)
+      row.append(el("span", { class: "faint", style: "font-size:11px" }, "(deciding value is computed/loaded upstream — read the test + decompilation at " + g.at + ")"));
+    box.append(row);
+  });
+  return box;
+}
+function addGateField(f) {
+  const init = A.config.initial_state;
+  if (!init || init.kind !== "snapshot") { toast("add this field symbolic in your buffer layout", true); return; }
+  init.symbolic = init.symbolic || [];
+  const name = "gate_" + (f.offset || "0").replace(/^0x/, "");
+  if (init.symbolic.some(s => s.base === f.base && s.offset === f.offset)) { toast("already symbolic"); return; }
+  init.symbolic.push({ base: f.base, offset: f.offset, name, size: f.size });
+  A._vars = null;
+  saveConfig().then(() => { renderState(); rerenderCodeViews(); toast("made " + name + " symbolic — Explore to re-run"); });
+}
 
 // module-level truncation (drawPathTree has its own local `short`, not in scope here)
 function _trunc(s, n) { return s && s.length > n ? s.slice(0, n - 1) + "…" : (s || ""); }
