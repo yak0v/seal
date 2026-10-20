@@ -1,211 +1,382 @@
 """
-Per-binary workspace: the assumptions and checks the user has set up for each
-function, saved as JSON next to the binary (``<binary>.angrgui.json``) so a
-project survives restarts.
+Session store: everything SEAL knows about analysing one binary, in a single
+SQLite file (``<binary>.sdb`` — a "seal db") so a whole session survives restarts
+and can be saved/loaded explicitly.
 
-A function's setup is split into *scenarios* and shared *checks*.  A scenario is
-one way of reaching the function — its own initial state (arguments, symbolic
-stdin / files, assumptions, limits).  The checks (reach / avoid / assert / …)
-are shared across all scenarios of the function; only the initial state changes
-when you switch scenario.  Stored shape::
+A session holds:
+  - **meta**: which binary this session is for (path + sha256 + size), the IDA URL,
+    timestamps, and the global function-return models.
+  - **functions**: each function's setup, split into per-reach *scenarios* and shared
+    *checks* (see the shape notes below).
+  - **runs**: every run's record (findings + summary + metadata) AND its FULL snapshot
+    (the path tree), so clicking a past run still works after a restart.
+  - **targets**: the TODO queue of functions to test next.
+
+A function's setup is split into *scenarios* and shared *checks*.  A scenario is one
+way of reaching the function — its own initial state (arguments, symbolic stdin /
+files, assumptions, limits, snapshot seed).  The checks are shared across all
+scenarios; only the initial state changes when you switch scenario.  Structured shape::
 
     {"checks": [...],
-     "scenarios": [{"name", "args", "buffers", "assumptions", "stdin", "files", "limits"}, ...],
+     "scenarios": [{"name", "args", "buffers", "assumptions", "stdin", "files", "limits",
+                    "models", "initial_state", "return_bounds"}, ...],
      "active": 0}
 
-Older project files stored the initial state flat alongside the checks; those are
-migrated into a single "Default" scenario on load.
+WHY SQLite (not the old one-JSON-file)
+    - The NEW thing here is storing full run snapshots (large path trees), many of them.
+      JSON rewrote the WHOLE file on every change (and config saves are constant), and
+      had to parse every tree just to list runs. SQLite writes only the changed row and
+      lists runs from lightweight columns, loading a tree only when that run is opened.
+    - Shared access (human GUI + agents over MCP) is serialised safely; a crash mid-write
+      leaves the DB consistent (transactional) instead of corrupting the whole project.
+    - It is one portable file (``.sdb``) the user can Save As / Load as a named session.
 
-ROLE
-    The persistence + shape layer for a function's analysis setup. It owns the
-    split between per-reach SCENARIOS and SHARED checks, migrates old project files
-    to the current shape, and flattens a scenario down to the flat dict the rest of
-    SEAL (runner, codegen, MCP) actually consumes. It stores nothing about results —
-    only the setup — in ``<binary>.angrgui.json`` beside the binary.
-
-WHY IT'S LIKE THIS
-    - Scenarios vs. shared checks: the SAME function is often reached several ways
-      (different args / stdin / a concolic snapshot seed), but you want to hunt for
-      the same bugs in all of them. So initial state is per-scenario and checks are
-      shared — switching scenario changes only how the function is entered.
-    - SCEN_FIELDS is the single source of truth for "what is initial state". Every
-      place that copies/cleans/flattens a scenario iterates SCEN_FIELDS, so adding a
-      field in one spot keeps migrate/clean/flatten consistent. Note `initial_state`
-      is in it: the concolic snapshot seed ({kind:"snapshot", pc, regs, mem, symbolic})
-      lives ON THE SCENARIO, which is why a seeded setup survives restarts.
-    - `flatten()` exists because the runner/codegen/MCP want one flat dict (one
-      scenario's state + the shared checks + scenario metadata), not the nested
-      structured shape — the structured shape is for editing, the flat shape for use.
-    - Saved next to the binary (not in a central DB) so a project is self-contained
-      and portable: copy the binary + its .angrgui.json and the setup travels.
-    - Atomic save (write tmp + os.replace) so a crash mid-save can't corrupt a project.
+MIGRATION
+    Opening a binary whose session is still the legacy ``<binary>.angrgui.json`` (and no
+    ``.sdb`` yet) imports it automatically, so existing projects are not lost.
 
 EXTENDING
-    - New per-scenario initial-state field: add it to SCEN_FIELDS (here) AND teach the
-      GUI/MCP that read & write it. `_migrate`, `_clean_scenario` and `flatten` all key
-      off SCEN_FIELDS, so they pick it up automatically.
-    - New shape migration: handle the old shape inside `_migrate` and keep returning
-      the current structured shape; every read path goes through `_migrate`, so one
-      place covers load, get and set.
-
-PITFALLS
-    - Don't add an initial-state field anywhere but SCEN_FIELDS — a field not listed
-      there is silently dropped by `_clean_scenario`/`flatten` and won't persist.
-    - Checks are shared: writing checks onto a scenario (instead of cfg["checks"]) is
-      wrong; they belong at the function level.
-    - `flatten()`'s "scenarios" key is a list of NAMES (plus "active"), not the full
-      scenario objects — consumers that want the state read the flat fields directly.
-    - `get_function` always returns a migrated copy; mutate and hand back via
-      `set_function` — don't assume you're holding the stored object.
+    - New per-scenario initial-state field: add it to SCEN_FIELDS. `_migrate`,
+      `_clean_scenario` and `flatten` all key off it.
+    - The public API (get/set/update_function, add_run/runs/get_run_record/update_run,
+      targets, function_models, flatten/migrate) is unchanged from the JSON version, so
+      callers and tests keep working; storage is the only thing that moved.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import threading
+import time
 
-SUFFIX = ".angrgui.json"
+SUFFIX = ".sdb"
+LEGACY_SUFFIX = ".angrgui.json"
+FORMAT_VERSION = 1
+MAX_RUNS = 1000               # cap stored run records (newest kept)
+MAX_SNAPSHOTS = 250           # cap stored full snapshots (newest kept); older runs keep their record
 
 # the initial-state fields that live on a scenario (everything except checks)
 SCEN_FIELDS = ("args", "buffers", "assumptions", "stdin", "files", "limits", "models", "initial_state", "return_bounds")
 
 
-class Workspace:
-    def __init__(self, binary_path: str):
-        self.binary_path = os.path.abspath(binary_path)
-        self.store_path = self.binary_path + SUFFIX
-        # RLock (re-entrant): atomic read-modify-write helpers take the lock and call
-        # _save_locked, so concurrent agents/users editing the project can't corrupt it.
-        self._lock = threading.RLock()
-        self.data = {"functions": {}, "meta": {}}
-        self.load()
+def _sha256(path: str) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
 
-    def load(self):
-        if os.path.isfile(self.store_path):
+
+class Workspace:
+    def __init__(self, binary_path: str, store_path: str | None = None):
+        self.binary_path = os.path.abspath(binary_path) if binary_path else None
+        # the session file: an explicit store_path, else <binary>.sdb beside the binary.
+        self.store_path = os.path.abspath(store_path) if store_path else (self.binary_path + SUFFIX)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.store_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._init_schema()
+        self._import_legacy_if_empty()
+        self._init_meta()
+
+    # ------------------------------------------------------------------ schema / meta
+    def _init_schema(self):
+        with self._lock:
+            self._conn.executescript(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);"
+                "CREATE TABLE IF NOT EXISTS functions (addr TEXT PRIMARY KEY, config TEXT);"
+                "CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, func INTEGER, when_ REAL, "
+                "  record TEXT, snapshot TEXT);"
+                "CREATE INDEX IF NOT EXISTS runs_func ON runs(func);"
+                "CREATE INDEX IF NOT EXISTS runs_when ON runs(when_);"
+                "CREATE TABLE IF NOT EXISTS targets (func INTEGER PRIMARY KEY, data TEXT);")
+            self._conn.commit()
+
+    def _init_meta(self):
+        now = time.time()
+        with self._lock:
+            if self._get_meta("format_version") is None:
+                self._set_meta("format_version", FORMAT_VERSION)
+                self._set_meta("created", now)
+            # record the binary identity so a loaded session knows what it is for
+            if self.binary_path and os.path.isfile(self.binary_path):
+                if self._get_meta("binary_path") is None:
+                    self._set_meta("binary_path", self.binary_path)
+                    self._set_meta("binary_size", os.path.getsize(self.binary_path))
+                    self._set_meta("binary_sha256", _sha256(self.binary_path))
+            elif self.binary_path and self._get_meta("binary_path") is None:
+                self._set_meta("binary_path", self.binary_path)
+
+    def _get_meta(self, key: str):
+        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return json.loads(row["value"]) if row else None
+
+    def _set_meta(self, key: str, value):
+        with self._lock:
+            self._conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                               (key, json.dumps(value)))
+            self._conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('modified', ?)",
+                               (json.dumps(time.time()),))
+            self._conn.commit()
+
+    def get_meta(self, key: str):
+        with self._lock:
+            return self._get_meta(key)
+
+    def set_meta(self, key: str, value):
+        self._set_meta(key, value)
+
+    def info(self) -> dict:
+        """A summary of this session (for GUI/MCP): the binary it is for, counts, times."""
+        with self._lock:
+            nf = self._conn.execute("SELECT COUNT(*) c FROM functions").fetchone()["c"]
+            nr = self._conn.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"]
+            ns = self._conn.execute("SELECT COUNT(*) c FROM runs WHERE snapshot IS NOT NULL").fetchone()["c"]
+            return {
+                "store_path": self.store_path,
+                "binary_path": self._get_meta("binary_path"),
+                "binary_sha256": self._get_meta("binary_sha256"),
+                "binary_size": self._get_meta("binary_size"),
+                "ida_url": self._get_meta("ida_url"),
+                "created": self._get_meta("created"),
+                "modified": self._get_meta("modified"),
+                "functions_configured": nf, "runs": nr, "runs_with_snapshot": ns,
+            }
+
+    def binary_matches(self, path: str) -> tuple[bool, str]:
+        """Does `path` look like the binary this session is for? Returns (ok, reason)."""
+        want = self._get_meta("binary_sha256")
+        if not want:
+            return True, "no checksum recorded"
+        got = _sha256(path)
+        if got is None:
+            return False, "binary not readable"
+        return (got == want), ("checksum matches" if got == want else "binary CHANGED since the session was saved")
+
+    # ------------------------------------------------------------------ legacy import
+    def _import_legacy_if_empty(self):
+        """If this .sdb is new (no functions) and a legacy <binary>.angrgui.json exists,
+        import it so existing projects are not lost."""
+        with self._lock:
+            has = self._conn.execute("SELECT 1 FROM functions LIMIT 1").fetchone()
+            if has:
+                return
+        legacy = (self.binary_path + LEGACY_SUFFIX) if self.binary_path else None
+        if not (legacy and os.path.isfile(legacy)):
+            return
+        try:
+            with open(legacy) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        for addr, cfg in (data.get("functions") or {}).items():
             try:
-                with open(self.store_path) as fh:
-                    self.data = json.load(fh)
-                self.data.setdefault("functions", {})
-                self.data.setdefault("meta", {})
-            except (OSError, ValueError):
+                self.set_function(int(addr), cfg)
+            except Exception:
                 pass
+        for rec in (data.get("runs") or []):
+            try:
+                self.add_run(dict(rec))
+            except Exception:
+                pass
+        for t in (data.get("targets") or []):
+            try:
+                self.add_target(int(t["func"]), t.get("note"), t.get("by", "user"))
+                if t.get("status") and t["status"] != "open":
+                    self.update_target(int(t["func"]), status=t["status"])
+            except Exception:
+                pass
+        fm = data.get("function_models")
+        if fm:
+            self.set_function_models(fm)
 
     # ---------------------------------------- global function-return models
-    # Models that apply whenever a function is called, across every analysis:
-    #   by_name[func]  -> {kind, ...}      replaces a statically-called function
-    #   by_site[hexad] -> {kind, ...}      replaces one (usually indirect) call site
     def function_models(self) -> dict:
-        fm = self.data.setdefault("function_models", {})
+        with self._lock:
+            fm = self._get_meta("function_models") or {}
         fm.setdefault("by_name", {})
         fm.setdefault("by_site", {})
         return fm
 
     def set_function_models(self, fm: dict):
-        self.data["function_models"] = {"by_name": dict((fm or {}).get("by_name") or {}),
-                                        "by_site": dict((fm or {}).get("by_site") or {})}
-        self.save()
-
-    def save(self):
-        with self._lock:
-            self._save_locked()
-
-    def _save_locked(self):
-        tmp = self.store_path + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(self.data, fh, indent=2)
-        os.replace(tmp, self.store_path)
+        self._set_meta("function_models", {"by_name": dict((fm or {}).get("by_name") or {}),
+                                           "by_site": dict((fm or {}).get("by_site") or {})})
 
     # ------------------------------------------------------------- per function
     def get_function(self, addr: int) -> dict:
         """The function's setup in the structured (scenarios) shape."""
         with self._lock:
-            return self._migrate(self.data["functions"].get(str(addr)))
+            row = self._conn.execute("SELECT config FROM functions WHERE addr=?", (str(addr),)).fetchone()
+        return self._migrate(json.loads(row["config"]) if row else None)
 
     def set_function(self, addr: int, cfg: dict):
         with self._lock:
-            self.data["functions"][str(addr)] = self._migrate(cfg)
-            self._save_locked()
+            self._conn.execute("INSERT OR REPLACE INTO functions(addr, config) VALUES (?, ?)",
+                               (str(addr), json.dumps(self._migrate(cfg))))
+            self._conn.commit()
+            self._touch()
 
     def update_function(self, addr: int, mutate):
-        """Atomic read-modify-write of one function's setup (concurrency-safe): reads the
-        migrated config, hands it to `mutate(cfg)`, stores + saves — all under the lock, so
-        two agents editing the SAME function can't lose each other's change."""
+        """Atomic read-modify-write of one function's setup (concurrency-safe)."""
         with self._lock:
-            cfg = self._migrate(self.data["functions"].get(str(addr)))
+            row = self._conn.execute("SELECT config FROM functions WHERE addr=?", (str(addr),)).fetchone()
+            cfg = self._migrate(json.loads(row["config"]) if row else None)
             mutate(cfg)
-            self.data["functions"][str(addr)] = self._migrate(cfg)
-            self._save_locked()
+            cfg = self._migrate(cfg)
+            self._conn.execute("INSERT OR REPLACE INTO functions(addr, config) VALUES (?, ?)",
+                               (str(addr), json.dumps(cfg)))
+            self._conn.commit()
+            self._touch()
             return cfg
 
-    # ------------------------------------------------------------- run records (#8/#9)
-    # Durable run results — findings + metadata (NOT the huge path tree) — so a project's
-    # findings survive restart and feed the review/documentation layer. Keyed nowhere
-    # special: a flat list, newest last, capped to avoid unbounded growth.
+    # ------------------------------------------------------------- run records + snapshots
     def add_run(self, record: dict):
+        rid = record.get("id")
+        if not rid:
+            return
         with self._lock:
-            runs = self.data.setdefault("runs", [])
-            runs.append(record)
-            if len(runs) > 1000:
-                del runs[:len(runs) - 1000]
-            self._save_locked()
+            self._conn.execute("INSERT OR REPLACE INTO runs(id, func, when_, record, snapshot) "
+                               "VALUES (?, ?, ?, ?, COALESCE((SELECT snapshot FROM runs WHERE id=?), NULL))",
+                               (rid, int(record["func"]) if record.get("func") is not None else None,
+                                float(record.get("when", time.time())), json.dumps(record), rid))
+            # prune oldest records beyond the cap
+            self._conn.execute(
+                "DELETE FROM runs WHERE id IN (SELECT id FROM runs ORDER BY when_ DESC LIMIT -1 OFFSET ?)",
+                (MAX_RUNS,))
+            self._conn.commit()
+            self._touch()
 
     def runs(self, func_addr: int | None = None) -> list:
         with self._lock:
-            runs = list(self.data.get("runs", []))
-        if func_addr is not None:
-            return [r for r in runs if r.get("func") == int(func_addr)]
-        return runs
+            if func_addr is not None:
+                rows = self._conn.execute("SELECT record FROM runs WHERE func=? ORDER BY when_ ASC",
+                                          (int(func_addr),)).fetchall()
+            else:
+                rows = self._conn.execute("SELECT record FROM runs ORDER BY when_ ASC").fetchall()
+        return [json.loads(r["record"]) for r in rows]
 
     def get_run_record(self, run_id: str) -> dict | None:
         with self._lock:
-            return next((dict(r) for r in self.data.get("runs", []) if r.get("id") == run_id), None)
+            row = self._conn.execute("SELECT record FROM runs WHERE id=?", (run_id,)).fetchone()
+        return json.loads(row["record"]) if row else None
 
     def update_run(self, run_id: str, **fields) -> dict | None:
         with self._lock:
-            for r in self.data.get("runs", []):
-                if r.get("id") == run_id:
-                    r.update(fields)
-                    self._save_locked()
-                    return dict(r)
-        return None
+            row = self._conn.execute("SELECT record FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not row:
+                return None
+            rec = json.loads(row["record"]); rec.update(fields)
+            self._conn.execute("UPDATE runs SET record=? WHERE id=?", (json.dumps(rec), run_id))
+            self._conn.commit()
+            self._touch()
+            return rec
 
-    # ------------------------------------------------------------- targets / TODO (#9)
-    # Functions the user wants tested next, as a shared work queue for the agents.
+    def save_run_snapshot(self, run_id: str, snapshot: dict):
+        """Persist a run's FULL snapshot (path tree + findings) so it still opens after a
+        restart. Capped: only the most recent MAX_SNAPSHOTS keep their (large) snapshot;
+        older runs keep their lightweight record."""
+        with self._lock:
+            if not self._conn.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone():
+                return
+            self._conn.execute("UPDATE runs SET snapshot=? WHERE id=?", (json.dumps(snapshot), run_id))
+            # drop snapshots (keep records) beyond the newest MAX_SNAPSHOTS
+            self._conn.execute(
+                "UPDATE runs SET snapshot=NULL WHERE id IN ("
+                "  SELECT id FROM runs WHERE snapshot IS NOT NULL ORDER BY when_ DESC LIMIT -1 OFFSET ?)",
+                (MAX_SNAPSHOTS,))
+            self._conn.commit()
+            self._touch()
+
+    def get_run_snapshot(self, run_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT snapshot FROM runs WHERE id=?", (run_id,)).fetchone()
+        return json.loads(row["snapshot"]) if (row and row["snapshot"]) else None
+
+    # ------------------------------------------------------------- targets / TODO
     def add_target(self, func: int, note: str | None = None, by: str = "user") -> dict:
         with self._lock:
-            targets = self.data.setdefault("targets", [])
-            rec = next((t for t in targets if t.get("func") == int(func)), None)
-            if rec is None:
-                rec = {"func": int(func), "note": note, "by": by, "status": "open"}
-                targets.append(rec)
-            else:                            # re-opening / updating an existing one
+            row = self._conn.execute("SELECT data FROM targets WHERE func=?", (int(func),)).fetchone()
+            if row:
+                rec = json.loads(row["data"])
                 if note is not None:
                     rec["note"] = note
                 rec["status"] = "open"
-            self._save_locked()
+            else:
+                rec = {"func": int(func), "note": note, "by": by, "status": "open"}
+            self._conn.execute("INSERT OR REPLACE INTO targets(func, data) VALUES (?, ?)",
+                               (int(func), json.dumps(rec)))
+            self._conn.commit()
+            self._touch()
             return dict(rec)
 
     def targets(self, status: str | None = None) -> list:
         with self._lock:
-            out = [dict(t) for t in self.data.get("targets", [])]
+            rows = self._conn.execute("SELECT data FROM targets").fetchall()
+        out = [json.loads(r["data"]) for r in rows]
         return [t for t in out if status is None or t.get("status") == status]
 
     def update_target(self, func: int, **fields) -> dict | None:
         with self._lock:
-            for t in self.data.get("targets", []):
-                if t.get("func") == int(func):
-                    t.update(fields)
-                    self._save_locked()
-                    return dict(t)
-        return None
+            row = self._conn.execute("SELECT data FROM targets WHERE func=?", (int(func),)).fetchone()
+            if not row:
+                return None
+            rec = json.loads(row["data"]); rec.update(fields)
+            self._conn.execute("UPDATE targets SET data=? WHERE func=?", (json.dumps(rec), int(func)))
+            self._conn.commit()
+            self._touch()
+            return rec
+
+    # ------------------------------------------------------------- save / load session
+    def save_as(self, path: str) -> str:
+        """Write a copy of this whole session (meta, functions, runs + snapshots, targets)
+        to `path` (a .sdb). Returns the absolute path."""
+        path = os.path.abspath(os.path.expanduser(path))
+        if not path.endswith(SUFFIX):
+            path += SUFFIX
+        with self._lock:
+            dest = sqlite3.connect(path)
+            try:
+                self._conn.backup(dest)       # consistent copy even while in use
+            finally:
+                dest.close()
+        return path
+
+    def _touch(self):
+        self._conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('modified', ?)",
+                           (json.dumps(time.time()),))
+        self._conn.commit()
+
+    def close(self):
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    def all(self) -> dict:
+        """Reconstruct the legacy nested dict (functions/runs/targets/meta) — kept for the
+        few callers that want the whole thing (e.g. 'configure every function' views)."""
+        with self._lock:
+            funcs = {r["addr"]: json.loads(r["config"])
+                     for r in self._conn.execute("SELECT addr, config FROM functions").fetchall()}
+            runs = [json.loads(r["record"])
+                    for r in self._conn.execute("SELECT record FROM runs ORDER BY when_ ASC").fetchall()]
+            targets = [json.loads(r["data"]) for r in self._conn.execute("SELECT data FROM targets").fetchall()]
+            meta = {r["key"]: json.loads(r["value"]) for r in self._conn.execute("SELECT key, value FROM meta").fetchall()}
+        return {"functions": funcs, "runs": runs, "targets": targets, "meta": meta,
+                "function_models": meta.get("function_models", {})}
 
     # ------------------------------------------------------------- shape helpers
     @staticmethod
     def _default_scenario(name: str = "Default") -> dict:
         return {"name": name, "args": [], "buffers": [], "assumptions": [],
                 "stdin": None, "files": [],
-                # skip_calls ON by default — stay inside the target function (see runner);
-                # a model-based run flips it off explicitly.
+                # skip_calls ON by default — stay inside the target function (see runner).
                 "limits": {"skip_calls": True}, "models": []}
 
     @staticmethod
@@ -222,7 +393,6 @@ class Workspace:
                    "active": int(cfg.get("active", 0) or 0)}
             out["active"] = max(0, min(out["active"], len(out["scenarios"]) - 1))
             return out
-        # legacy flat -> one "Default" scenario carrying the initial state
         sc = Workspace._default_scenario()
         for k in SCEN_FIELDS:
             if k in cfg:
@@ -253,10 +423,6 @@ class Workspace:
         sc = cfg["scenarios"][idx]
         out = {k: sc.get(k) for k in SCEN_FIELDS}
         out["checks"] = list(cfg.get("checks", []))
-        # scenario metadata so agents can see / pick among them
         out["scenarios"] = [s.get("name") or f"Scenario {j + 1}" for j, s in enumerate(cfg["scenarios"])]
         out["active"] = idx
         return out
-
-    def all(self) -> dict:
-        return self.data

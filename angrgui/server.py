@@ -269,6 +269,75 @@ def load(req: LoadReq):
     return {"binary": S.binary.info()}
 
 
+# ----------------------------------------------------------------- sessions (.sdb)
+def _session_info() -> dict:
+    """What/where the current session is — for the GUI title bar and the MCP tool."""
+    if S.workspace is None:
+        return {"loaded": False}
+    info = S.workspace.info()
+    info["loaded"] = True
+    info["binary_name"] = os.path.basename(info.get("binary_path") or "") or None
+    return info
+
+
+def _save_session(path: str) -> dict:
+    """Write the whole current session to `path` (a .sdb) and continue working IN it
+    (like Save As): further edits persist to the named file."""
+    if S.workspace is None:
+        raise HTTPException(400, "no session to save (load a binary first)")
+    newpath = S.workspace.save_as(os.path.expanduser(path))
+    if os.path.abspath(newpath) != os.path.abspath(S.workspace.store_path):
+        binp = S.workspace.binary_path
+        S.workspace.close()
+        S.workspace = Workspace(binp, store_path=newpath)   # continue in the saved file
+    BUS.publish("session", f"saved session to {os.path.basename(newpath)}", path=newpath)
+    return {"ok": True, "store_path": newpath, "session": _session_info()}
+
+
+def _load_session(path: str) -> dict:
+    """Open a saved .sdb session: load the binary it is for and restore all its data."""
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"no such session file: {path}")
+    probe = Workspace(None, store_path=path)
+    binp = probe.get_meta("binary_path")
+    probe.close()
+    if not binp:
+        raise HTTPException(400, "this session does not record which binary it is for")
+    if not os.path.isfile(binp):
+        raise HTTPException(404, f"the session's binary is missing: {binp}")
+    warning = None
+    try:
+        S.backend = make_backend("angr", path=binp, progress=lambda m: None)
+        S.workspace = Workspace(binp, store_path=path)
+        ok, reason = S.workspace.binary_matches(binp)
+        if not ok:
+            warning = reason
+        S.last_run.clear()
+        ida_url = S.workspace.get_meta("ida_url")
+    except Exception as e:
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+    BUS.publish("session", f"loaded session {os.path.basename(path)} ({os.path.basename(binp)})",
+                path=path, binary=binp)
+    return {"ok": True, "binary": S.binary.info(), "session": _session_info(),
+            "warning": warning, "ida_url": ida_url}
+
+
+@app.get("/api/session")
+def api_session():
+    return _session_info()
+
+
+@app.post("/api/session/save")
+def api_session_save(body: dict = Body(...)):
+    return _save_session(body.get("path") or "")
+
+
+@app.post("/api/session/load")
+def api_session_load(body: dict = Body(...)):
+    return _load_session(body.get("path") or "")
+
+
 @app.get("/api/functions")
 def functions():
     b = _need_binary()
@@ -640,9 +709,9 @@ def _auto_point_buffers(spec):
 
 
 def _persist_run_record(run_id: str, spec: dict, source: str):
-    """Save a finished run's findings + metadata to the workspace (durable, concurrency-
-    safe). The huge path tree is NOT stored — just the summary and the findings (with
-    their concrete witnesses), which are the lasting artifact."""
+    """Save a finished run to the session: the findings + metadata RECORD, and the FULL
+    snapshot (path tree) so the run still opens after a restart. The record is small and
+    always kept; snapshots are capped to the most recent (older runs keep their record)."""
     if S.workspace is None:
         return
     try:
@@ -671,6 +740,8 @@ def _persist_run_record(run_id: str, spec: dict, source: str):
     }
     try:
         S.workspace.add_run(rec)
+        if snap is not None:                 # keep the full path tree so the run reopens after restart
+            S.workspace.save_run_snapshot(run_id, snap)
     except Exception as e:
         log.warning("could not persist run record %s: %s", run_id, e)
 
@@ -727,6 +798,8 @@ def events(request: Request, after: int | None = None):
 @app.get("/api/run/{run_id}")
 def run_status(run_id: str):
     snap = S.backend.run_snapshot(run_id) if S.backend else None
+    if snap is None and S.workspace is not None:
+        snap = S.workspace.get_run_snapshot(run_id)      # persisted full snapshot (survives restart)
     if snap is None:
         raise HTTPException(404, "no such run")
     return snap
@@ -764,6 +837,8 @@ def run_values(run_id: str, node: int, until: int | None = None):
     assignment result). `until` (a finding's address) stops the trace at that instruction,
     so values reflect the loop iteration that caused the finding."""
     snap = S.backend.run_snapshot(run_id) if S.backend else None
+    if snap is None and S.workspace is not None:
+        snap = S.workspace.get_run_snapshot(run_id)      # restored run: paths load, re-exec values may be empty
     if snap is None:
         raise HTTPException(404, "no such run")
     example = _leaf_example(snap, node)
@@ -846,6 +921,11 @@ def ida_connect(req: IdaConnectReq):
         raise HTTPException(502, str(e))
     S.ida = sess
     st = sess.status()
+    if S.workspace is not None:
+        try:
+            S.workspace.set_meta("ida_url", req.url)   # remember it with the session
+        except Exception:
+            pass
     BUS.publish("ida", f"connected to IDA ({st.get('server')}, {st.get('name_count')} names)", **st)
     return st
 
@@ -1440,7 +1520,16 @@ def _mcp_resolve_target(func, status="done"):
 def _mcp_get_run(run_id):
     r = S.runs.get(run_id)
     if r is None:
-        # fall back to the persisted record (survives restart / another process's run)
+        # the full snapshot persists in the session — return it so a restarted run opens
+        # with its paths/findings intact (not just the compact record).
+        snap = S.workspace.get_run_snapshot(run_id) if S.workspace else None
+        if snap is not None:
+            tree = [{"id": n["id"], "parent": n["parent"], "cond": n["cond"], "kind": n["kind"],
+                     "end": (n.get("end") or {}).get("reason"), "detail": (n.get("end") or {}).get("text"),
+                     "hits": n["hits"]} for n in snap.get("tree", [])]
+            return {"status": snap.get("status"), "error": snap.get("error"), "stored": True,
+                    "summary": snap.get("summary"), "findings": snap.get("hits"), "paths": tree}
+        # else fall back to the lightweight record (its snapshot was pruned)
         rec = S.workspace.get_run_record(run_id) if S.workspace else None
         if rec is not None:
             return {"status": rec.get("status"), "stored": True, "when": rec.get("when"),
@@ -1466,6 +1555,8 @@ def _mcp_path_values(run_id, node):
     except (TypeError, ValueError):
         raise HTTPException(400, f"node must be an integer path id (the `id` field of a get_run path), got {node!r}")
     snap = S.backend.run_snapshot(run_id) if S.backend else None
+    if snap is None and S.workspace is not None:
+        snap = S.workspace.get_run_snapshot(run_id)
     if snap is None:
         raise HTTPException(404, f"no such run {run_id!r}")
     ids = sorted(x["id"] for x in snap.get("tree", []))
@@ -2221,6 +2312,17 @@ TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {"func": {"type": "string"}, "status": {"type": "string", "enum": ["done", "open"]}}, "required": ["func"]}},
     {"name": "load_binary", "description": "Load an ELF binary by absolute path (replaces the current one). Analyses before returning.",
      "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "session_info", "description": "The current session: which binary it is for (path + checksum), its .sdb store "
+     "path, counts (functions configured, runs, runs with a saved snapshot), and the IDA url. A SEAL session (a .sdb "
+     "'seal db') holds EVERYTHING about analysing one binary — every function's setup, every run WITH its full path tree "
+     "and findings, the TODO targets — and auto-saves, so a restart keeps it all.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "save_session", "description": "Write the whole current session to a .sdb file at `path` and continue working IN "
+     "it (like Save As) — later edits persist there. Use it to keep named sessions you can reload.",
+     "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "load_session", "description": "Open a saved .sdb session: loads the binary it is for and restores all its data "
+     "(function setups, runs with their findings/paths, targets). Warns if the binary changed since the session was saved.",
+     "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
     {"name": "add_scenario", "description": "Add a scenario (a separate initial-state setup) to a function and make it active. "
      "duplicate=true copies the active scenario's initial state. Checks are shared across scenarios.",
      "inputSchema": {"type": "object", "properties": {**_A, "name": {"type": "string"}, "duplicate": {"type": "boolean"}}, "required": ["addr"]}},
@@ -2337,6 +2439,9 @@ _MCP_TOOLS = {
     "get_run": lambda a: _mcp_get_run(a["run_id"]),
     "path_values": lambda a: _mcp_path_values(a["run_id"], a["node"]),
     "load_binary": lambda a: _mcp_load_binary(a["path"]),
+    "session_info": lambda a: _session_info(),
+    "save_session": lambda a: _save_session(a["path"]),
+    "load_session": lambda a: _load_session(a["path"]),
     "add_scenario": lambda a: _mcp_add_scenario(a["addr"], a.get("name"), a.get("duplicate", False)),
     "select_scenario": lambda a: _mcp_select_scenario(a["addr"], a["scenario"]),
     "rename_scenario": lambda a: _mcp_rename_scenario(a["addr"], a["scenario"], a["name"]),

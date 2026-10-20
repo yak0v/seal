@@ -33,7 +33,7 @@ def loaded():
     srv.S.runs = {}
     yield srv
     try:
-        os.remove(BIN + ".mcptest.angrgui.json")
+        os.remove(BIN + ".mcptest.sdb")
     except OSError:
         pass
 
@@ -164,3 +164,22 @@ def test_configure_clears_initial_state(loaded):
     assert _call("get_function", {"addr": hex(fa)})["config"]["initial_state"]
     _call("configure", {"addr": hex(fa), "patch": {"initial_state": None}})
     assert _call("get_function", {"addr": hex(fa)})["config"].get("initial_state") is None
+
+
+def test_session_info_and_save(loaded, tmp_path):
+    """session_info reports the loaded session; save_session writes a .sdb that reopens
+    with the same data (parity: same as the /api/session* endpoints)."""
+    info = _call("session_info", {})
+    assert info["loaded"] is True
+    assert info["functions_configured"] >= 0 and "store_path" in info
+    # set something, then save the session elsewhere and verify it round-trips
+    fa = _addr(loaded.S.binary, "route")
+    _call("configure", {"addr": hex(fa), "patch": {"assumptions": ["x > 0"]}})
+    dest = str(tmp_path / "saved.sdb")
+    out = _call("save_session", {"path": dest})
+    assert out["ok"] and os.path.isfile(out["store_path"])
+    from angrgui.workspace import Workspace
+    reopened = Workspace(None, store_path=out["store_path"])
+    cfg = reopened.get_function(fa)
+    assert "x > 0" in cfg["scenarios"][cfg["active"]]["assumptions"]
+    reopened.close()

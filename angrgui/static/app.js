@@ -98,6 +98,7 @@ window.addEventListener("DOMContentLoaded", init);
 
 async function init() {
   $("#openBtn").addEventListener("click", openBrowser);
+  $("#sessionBtn").addEventListener("click", openSessionMenu);
   $("#fnSearch").addEventListener("input", renderFunctions);
   $("#onlyNamed").addEventListener("change", renderFunctions);
   $$(".tab").forEach(t => t.addEventListener("click", () => selectTab(t.dataset.tab)));
@@ -149,8 +150,15 @@ async function refreshState() {
     $("#binfo").textContent = `${s.binary.name}  ·  ${s.binary.arch}  ·  ${s.binary.function_count} funcs` +
       (s.binary.has_dwarf ? "  ·  DWARF" : "  ·  no debug info");
     await loadFunctions();
+    try {                                   // show the active session file on the button
+      const info = await api("/api/session");
+      const nm = info.store_path ? info.store_path.split("/").pop() : null;
+      $("#sessionBtn").textContent = nm ? "Session: " + nm + " ▾" : "Session ▾";
+    } catch (e) {}
+    if ($("#pane-notebook")?.classList.contains("sel")) renderNotebook();   // scope to this binary/session
   } else {
     $("#binfo").textContent = "no binary loaded";
+    $("#sessionBtn").textContent = "Session ▾";
     openBrowser();
   }
 }
@@ -209,6 +217,79 @@ async function openBrowser(startPath) {
   go(cwd);
 }
 const fmtSize = (n) => n > 1e6 ? (n / 1e6).toFixed(1) + "M" : n > 1e3 ? (n / 1e3).toFixed(1) + "K" : n + "B";
+
+// ==================================================================== sessions (.sdb)
+async function openSessionMenu() {
+  let info = {};
+  try { info = await api("/api/session"); } catch (e) {}
+  const body = el("div", { class: "col", style: "gap:10px;min-width:440px" });
+  if (info.loaded) {
+    body.append(el("div", {}, el("b", {}, "Current session")),
+      el("div", { class: "faint mono", style: "font-size:12px;word-break:break-all" }, info.store_path || ""),
+      el("div", { class: "faint", style: "font-size:12px" },
+        `binary: ${info.binary_name || "—"}  ·  ${info.functions_configured} function(s) set up  ·  ${info.runs} run(s) (${info.runs_with_snapshot} with saved paths)`),
+      el("div", { class: "faint", style: "font-size:11px" }, "This session auto-saves to the .sdb above — a restart keeps everything. Save As to keep a named copy, or Load another session."));
+  } else {
+    body.append(el("div", { class: "faint" }, "No binary loaded. Open a binary, or load a saved session."));
+  }
+  const m = modal("Session (.sdb)", body, [
+    el("button", { onclick: () => { m.remove(); loadSessionDialog(); } }, "📂 Load session…"),
+    el("button", { class: "primary", disabled: info.loaded ? null : "", onclick: () => { m.remove(); saveSessionDialog(info.store_path); } }, "💾 Save session as…"),
+    el("button", { onclick: () => m.remove() }, "Close")]);
+  $("#modalHost").append(m);
+}
+const _dirRow = (ic, name, on) => el("div", { class: "fbrow", onclick: on }, el("span", { class: "ic" }, ic), el("span", { class: "grow" }, name));
+async function _browseSdb(listBox, cwdLabel, path, onDir, onSdb) {
+  let data;
+  try { data = await api("/api/browse?path=" + encodeURIComponent(path || "")); }
+  catch (e) { toast(e.message, true); return null; }
+  cwdLabel.textContent = data.cwd;
+  listBox.replaceChildren(_dirRow("📁", "..", () => onDir(data.parent)));
+  data.entries.filter(e => e.dir).forEach(en => listBox.append(_dirRow("📁", en.name, () => onDir(en.path))));
+  data.entries.filter(e => !e.dir && e.name.endsWith(".sdb")).forEach(en => listBox.append(_dirRow("🗄", en.name, () => onSdb(en))));
+  return data.cwd;
+}
+async function saveSessionDialog(currentPath) {
+  let cwd = "";
+  const listBox = el("div", { style: "min-height:220px;max-height:40vh;overflow:auto" });
+  const cwdLabel = el("div", { class: "mono faint", style: "margin-bottom:8px;word-break:break-all" });
+  const nameInput = el("input", { placeholder: "my-session.sdb", style: "width:100%;box-sizing:border-box",
+    value: currentPath ? currentPath.split("/").pop() : "session.sdb" });
+  const go = async (p) => { const c = await _browseSdb(listBox, cwdLabel, p, go, (en) => nameInput.value = en.name); if (c != null) cwd = c; };
+  const doSave = async () => {
+    const fn = nameInput.value.trim(); if (!fn) { toast("enter a filename", true); return; }
+    try { const r = await jpost("/api/session/save", { path: cwd + "/" + fn }); m.remove();
+      toast("saved → " + r.store_path.split("/").pop()); refreshState(); }
+    catch (e) { toast("save failed: " + e.message, true); }
+  };
+  const m = modal("Save session as…", el("div", {}, cwdLabel, listBox,
+    el("div", { class: "col", style: "gap:3px;margin-top:8px" }, el("span", { class: "faint", style: "font-size:11px" }, "save as (folder above):"), nameInput)),
+    [el("button", { onclick: () => m.remove() }, "Cancel"), el("button", { class: "primary", onclick: doSave }, "Save")]);
+  $("#modalHost").append(m);
+  go("");
+}
+async function loadSessionDialog() {
+  const listBox = el("div", { style: "min-height:300px;max-height:50vh;overflow:auto" });
+  const cwdLabel = el("div", { class: "mono faint", style: "margin-bottom:8px;word-break:break-all" });
+  const go = (p) => _browseSdb(listBox, cwdLabel, p, go, (en) => doLoad(en.path));
+  async function doLoad(path) {
+    m.remove();
+    const busy = modal("Loading session", el("div", { class: "col", style: "gap:10px" },
+      el("div", {}, "Opening ", el("b", {}, path.split("/").pop())), el("div", { class: "prog" }, el("i", { style: "width:60%" }))), []);
+    try {
+      const r = await jpost("/api/session/load", { path });
+      busy.remove();
+      A.fn = A.detail = A.config = A.func = A.run = null;
+      await refreshState();
+      if (r.warning) toast("session loaded — ⚠ " + r.warning, true);
+      else toast("loaded session for " + (r.binary?.name || "binary"));
+    } catch (e) { busy.remove(); toast("load failed: " + e.message, true); }
+  }
+  const m = modal("Load session (.sdb)", el("div", {}, el("div", { class: "faint", style: "font-size:12px;margin-bottom:6px" }, "Pick a .sdb session file. It reopens the binary it was made for and restores everything."), cwdLabel, listBox),
+    [el("button", { onclick: () => m.remove() }, "Cancel")]);
+  $("#modalHost").append(m);
+  go("");
+}
 
 // ==================================================================== functions list
 async function loadFunctions() {
@@ -3252,30 +3333,40 @@ function openSnapshotGuide() {
     " from a realistic state and you make only the attacker-controlled fields symbolic. That turns" +
     " a bug from “every path looks dangerous” into a precise condition."));
   body.append(el("p", { class: "dp" }, el("b", {}, "1 · Capture it with lldb"),
-    " — the repo ships an lldb script that dumps exactly the shape SEAL loads:"));
+    " — the repo ships ", code("seal_validation/snapshot/capture.py"), ". Import it, stop at the "
+    + "function entry (its args are live there), then run ", code("seal_snapshot"), ":"));
   body.append(pre(
     "# attach lldb to (or launch) the process that runs this function, then:\n" +
-    "(lldb) command script import angrgui/snapshot/capture.py\n" +
-    "# stop at the TRUE function entry (args are live there). For a normal symbol:\n" +
-    "(lldb) breakpoint set --name <func> --skip-prologue false\n" +
-    "(lldb) run <args>\n" +
-    "(lldb) seal_snapshot --out snapshot.json --sym x1:coord\n" +
-    "#   --sym marks attacker-controlled fields (reg:name or 0xADDR:name), comma-separated"));
+    "(lldb) command script import seal_validation/snapshot/capture.py\n" +
+    "# stop at the TRUE function entry (args are live). For a normal symbol:\n" +
+    "(lldb) breakpoint set --address <addr of the function>\n" +
+    "(lldb) run\n" +
+    "(lldb) seal_snapshot /tmp/snap.json core      # <- recommended: a FULL process core"));
+  body.append(el("p", { class: "dp" }, el("b", {}, "Pick the capture mode"),
+    " (the last arg to ", code("seal_snapshot"), "):"));
+  body.append(el("ul", { class: "dp", style: "margin:2px 0 8px 18px;line-height:1.5" },
+    el("li", {}, el("b", {}, "core"), " — RECOMMENDED. Runs ", code("process save-core"),
+      ": the WHOLE process memory image. SEAL demand-pages from the ", code(".core"),
+      " on the fly (", code("angrgui/snapshot/core.py"), "), so every address has its real bytes —"
+      + " nothing is guessed. Complete and sound; the ", code(".core"), " sits beside the json."),
+    el("li", {}, el("b", {}, "full"), " — all writable/anonymous regions AND read-only file-backed ones, captured eagerly into the json."),
+    el("li", {}, el("b", {}, "(default)"), " — reachable only: BFS from the argument registers. Smallest, but can MISS memory a field reaches once you make it symbolic — prefer ", code("core"), ".")));
   body.append(el("p", { class: "dp" }, el("b", {}, "For a dyld-shared-cache image"),
-    " (iOS/macOS framework), break by ADDRESS — a local symbol name hangs lldb:"));
+    " (iOS/macOS framework) you break by ADDRESS. ", code("capture.py"),
+    " has a helper for a CoreGraphics __TEXT offset:"));
   body.append(pre(
-    "(lldb) command script import seal_validation/snapshot/live_bp.py\n" +
+    "(lldb) command script import seal_validation/snapshot/capture.py\n" +
     "(lldb) b main\n(lldb) run\n" +
-    "(lldb) seal_setbp CoreGraphics 0x186a24e80   # the file address of the function\n" +
+    "(lldb) seal_bp 0x4e548          # file offset from the CoreGraphics __TEXT base\n" +
     "(lldb) continue\n" +
-    "(lldb) seal_snapshot --out snapshot.json --sym x1:coord"));
+    "(lldb) seal_snapshot /tmp/snap.json core"));
   body.append(el("p", { class: "dp" }, el("b", {}, "2 · Load it"), " — use ",
-    code("Load snapshot…"), " here and paste ", code("snapshot.json"), ". A live capture holds" +
-    " ASLR-slid addresses; include the ", code("image.slide"), " the capture prints and SEAL rebases it" +
-    " to the binary's file addresses automatically."));
-  body.append(el("p", { class: "dp" }, el("b", {}, "3 · Make inputs symbolic"), " — click a variable or" +
-    " argument in the decompilation (or use ", code("+ mark symbolic"), " below) to add it to the snapshot's" +
-    " symbolic set without reloading. Then add a check and Explore."));
+    code("Load snapshot…"), " here and paste ", code("/tmp/snap.json"), " (keep the ", code(".core"),
+    " file next to it). A live capture holds ASLR-slid addresses; SEAL computes the image ",
+    code("slide"), " from the module map and rebases to the binary's file addresses automatically."));
+  body.append(el("p", { class: "dp" }, el("b", {}, "3 · Make inputs symbolic"), " — in SEAL (not at capture):"
+    + " click a variable or argument in the decompilation (or ", code("+ mark symbolic"), " below) to add it"
+    + " to the snapshot's symbolic set without reloading. Then add a check and Explore."));
   body.append(el("p", { class: "dp faint" }, "Full details, including the exact CoreGraphics CVE walkthrough, are in ",
     code("docs/ARCHITECTURE.md"), " §7 and ", code("angrgui/snapshot/"), "."));
   const m = modal("How to generate a snapshot", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
