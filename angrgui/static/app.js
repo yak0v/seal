@@ -1379,6 +1379,7 @@ function sectionChecks() {
   const s = el("div", { class: "sec" });
   s.append(el("h3", {}, "Checks", el("span", { class: "grow" }),
     el("button", { class: "tiny ghost", title: "show these checks as angr code", onclick: () => showInScript("= checks") }, "</>"),
+    btn("⌕ scan", scanSinks, "tiny", "scan the function for candidate bug sites (narrowing casts, register-indexed accesses, division, memcpy) and add the ones that look live"),
     el("button", { class: "tiny", onclick: (e) => openDetectMenu(e.currentTarget) }, "+ detect ▾"),
     btn("+ assert", () => openAssertModal(null), "tiny"),
     btn("+ custom", () => openCustomModal(null), "tiny")));
@@ -1387,6 +1388,44 @@ function sectionChecks() {
   s.append(b);
   return s;
 }
+// scan_sinks: static pass proposing candidate bug sites, each with a one-click "add check".
+async function scanSinks() {
+  if (!A.fn) return;
+  let d;
+  try { d = await api("/api/sinks/" + A.fn.addr); }
+  catch (e) { toast("scan failed: " + e.message, true); return; }
+  const body = el("div", {});
+  body.append(el("div", { class: "faint", style: "margin-bottom:8px" },
+    `${d.count} candidate sink${d.count === 1 ? "" : "s"} in ${d.name || "this function"}. These are STATIC candidates, not findings — add the ones that look live, make the inputs that reach them symbolic, then Explore to confirm.`));
+  if (!d.count) body.append(el("div", { class: "empty" }, "No candidate sinks found."));
+  const addedAddrs = new Set((A.config.checks || []).map(c => Number(c.addr)));
+  (d.sinks || []).forEach(sc => {
+    const row = el("div", { class: "gaterow", style: "border-bottom:1px solid var(--line);padding:6px 0" });
+    row.append(el("span", { class: "pill warn" }, sc.kind.replace(/_/g, " ")),
+      el("span", { class: "mono", style: "font-size:11px", title: sc.why }, sc.addr),
+      el("span", { class: "gtest mono", title: sc.note || sc.why }, sc.insn),
+      el("span", { class: "grow" }));
+    if (sc.suggested_check) {
+      const already = addedAddrs.has(Number(sc.suggested_check.addr));
+      const addBtn = el("button", { class: "tiny primary", disabled: already ? "" : null,
+        title: already ? "a check already covers this address" : "add this check",
+        onclick: (e) => {
+          const chk = Object.assign({}, sc.suggested_check);
+          if (chk.addr != null) chk.addr = Number(chk.addr);
+          chk.name = sc.kind.replace(/_/g, " ") + " @ " + sc.addr;
+          addCheck(chk);
+          e.currentTarget.textContent = "added"; e.currentTarget.disabled = true;
+        } }, already ? "added" : "+ add check");
+      row.append(addBtn);
+    } else {
+      row.append(el("span", { class: "faint", style: "font-size:11px", title: sc.note }, "manual (see note)"));
+    }
+    body.append(row);
+  });
+  const m = modal("Scan for sinks — candidate bug sites", body, [el("button", { class: "primary", onclick: () => m.remove() }, "Close")]);
+  $("#modalHost").append(m);
+}
+
 function renderCheck(c, i) {
   const box = el("div", { class: "check" + (c.enabled ? "" : " dis") });
   const kindPill = { int_overflow: "warn", narrowing_cast: "warn", float_anomaly: "warn", div_by_zero: "warn",

@@ -339,6 +339,12 @@ def function(addr: int):
             "last_run": S.last_run.get(addr)}
 
 
+@app.get("/api/sinks/{addr}")
+def api_sinks(addr: int):
+    """Static sink scan for the GUI — same result as the MCP scan_sinks tool."""
+    return _mcp_scan_sinks(addr)
+
+
 @app.get("/api/cfg/{addr}")
 def cfg(addr: int):
     b = _need_binary()
