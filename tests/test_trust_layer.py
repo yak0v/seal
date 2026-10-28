@@ -252,6 +252,35 @@ def test_symbolic_size_finds_off_by_one_that_fixed_size_misses(trust):
     assert w.get("n", {}).get("u") == w.get("i", {}).get("u")   # the trigger is i == n (one past)
 
 
+def _rw_mask_spec(trust, sym_addrs):
+    # rw_mask(buf, r): reads buf[r-1] (pins r), then writes buf[r] (OOB when r>=4)
+    lim = {"steps": 80, "active": 150, "seconds": 30, "skip_calls": True}
+    if sym_addrs:
+        lim["symbolic_addrs"] = True
+    return {
+        "func_addr": _addr(trust, "rw_mask"),
+        "args": [{"name": "buf", "mode": "symbolic", "size": 8},
+                 {"name": "r", "mode": "symbolic", "size": 4}],
+        "buffers": [{"arg": "buf", "size": 16}],
+        "checks": [{"id": "w", "kind": "oob_write", "enabled": True}],
+        "limits": lim,
+    }
+
+
+def test_symbolic_addrs_unmasks_oob_write(trust):
+    """By default an earlier read pins the symbolic index, so the later OOB WRITE is masked
+    (and flagged by the under-report note). limits.symbolic_addrs keeps the index symbolic so
+    the write's full range is checked and the OOB surfaces."""
+    off = _run(trust, _rw_mask_spec(trust, sym_addrs=False))
+    on = _run(trust, _rw_mask_spec(trust, sym_addrs=True))
+    assert not [h for h in off["hits"] if h["kind"] == "oob_write"], \
+        "default should mask the write (the read pinned the index)"
+    assert [h for h in on["hits"] if h["kind"] == "oob_write"], \
+        "symbolic_addrs must unmask the OOB write"
+    # the default run should flag the gap (and point at the fix)
+    assert any("under-report" in n.lower() or "pinned" in n.lower() for n in off["summary"].get("notes", []))
+
+
 def test_auto_pointers_off_by_default(trust):
     """The capability must be opt-in: a default run does not auto-back, so nothing changes
     for existing scenarios/tests."""

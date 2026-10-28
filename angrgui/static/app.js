@@ -1653,6 +1653,11 @@ function sectionRun() {
     el("input", { type: "checkbox", checked: L.auto_pointers ? "" : null, style: "width:auto",
       onchange: e => { L.auto_pointers = e.target.checked; scheduleSave(); } }),
     "auto-back pointers ", el("span", { class: "faint" }, "(explore data behind pointer args)")));
+  b.append(el("label", { class: "row", style: "font-size:12px;gap:6px;margin-bottom:8px",
+      title: "Keep attacker-controlled memory ADDRESSES symbolic instead of pinning them to one value. By default angr concretizes a symbolic index, so an OOB WRITE after an OOB READ on the same index can be MASKED (you'll see an 'under-report' note). This makes the checks see the index's full range so those writes surface. Costs more solver time. Off by default." },
+    el("input", { type: "checkbox", checked: L.symbolic_addrs ? "" : null, style: "width:auto",
+      onchange: e => { L.symbolic_addrs = e.target.checked; scheduleSave(); } }),
+    "symbolic addresses ", el("span", { class: "faint" }, "(don't pin symbolic indices — find masked OOB writes)")));
 
   const running = A.run && (A.run.snapshot?.status === "running" || A.run.snapshot?.status === "pending");
   const runBtn = el("button", { class: "primary", style: "width:100%;padding:8px", onclick: startRun,

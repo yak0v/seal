@@ -1922,6 +1922,13 @@ LIMITS — bound the exploration. configure(a, {"limits":{...}}):
     BYPASSES models (PART 9), so don't set it when you rely on modeled allocations.
   • loop_bound: cap iterations of a loop with a symbolic trip count (stops infinite
     unrolling). find / avoid: optional target/forbidden addresses for directed search.
+  • symbolic_addrs: true keeps attacker-controlled memory ADDRESSES symbolic instead of
+    pinning them to one value. By default angr concretizes a symbolic index, so a LATER
+    access on the same index is masked — the classic case is an out-of-bounds WRITE that
+    doesn't fire because an earlier READ already pinned the index (you'll see the "symbolic
+    address pinned … UNDER-REPORT" note). Turning this on makes the oob/overflow checks see
+    the index's FULL range, so those input-dependent writes surface. Costs more solver time;
+    off by default.
   • auto_pointers: true auto-backs every symbolic POINTER-sized arg that has no explicit
     buffer with a symbolic region, so a function that dereferences a pointer arg is
     analysable without hand-declaring each buffer, and the pointed-to DATA is treated as

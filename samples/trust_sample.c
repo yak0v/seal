@@ -60,4 +60,15 @@ char at_index(const char *buf, unsigned n, unsigned i) {
     return 0;
 }
 
+/* OOB WRITE masked by an earlier read that pins the index: buf is 4 ints (16 bytes); the
+ * read buf[r-1] makes angr concretize the symbolic index r, and the later write buf[r]
+ * (OOB when r>=4) then sees a pinned r and looks in-bounds. The write is the more dangerous
+ * primitive, so under-reporting it is exactly the gap #2 targets. */
+int rw_mask(int *buf, unsigned r) {
+    int x = 0;
+    if (r) x = buf[r - 1];
+    buf[r] = x + 1;
+    return x;
+}
+
 int main(void) { return 0; }

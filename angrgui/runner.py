@@ -408,6 +408,15 @@ class Run:
             angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
             angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
         }
+        if self.spec.get("limits", {}).get("symbolic_addrs"):
+            # Opt-in: keep attacker-controlled memory ADDRESSES symbolic instead of pinning
+            # them to one value. By default angr concretizes a symbolic index, so a later
+            # access on the same index (notably an OOB WRITE after an OOB READ) is masked and
+            # under-reported. With this on, the index stays symbolic and the oob checks see
+            # its full range — at the cost of more solver work, so it's off by default.
+            for o in ("SYMBOLIC_WRITE_ADDRESSES", "CONSERVATIVE_READ_STRATEGY"):
+                if hasattr(angr.options, o):
+                    opts.add(getattr(angr.options, o))
         if self.spec.get("limits", {}).get("skip_calls", True):
             # DEFAULT ON: don't descend into called functions — a call returns a fresh
             # unconstrained value, so exploration stays in the target function and its
@@ -1900,8 +1909,10 @@ class Run:
                 f"reached {g['never_reached']}. That is a fixed value gating the path, not a dead end: "
                 f"make the field that selects it symbolic.{hint}")
         # Lossy address concretization: a symbolic index got pinned, so a later check on
-        # it can under-report (notably an OOB write masked by an earlier OOB read).
-        if self._concretized:
+        # it can under-report (notably an OOB write masked by an earlier OOB read). Only
+        # surface it when symbolic_addrs is OFF — if it's already on, the mitigation is
+        # applied and pointing at it would be misleading.
+        if self._concretized and not self.spec.get("limits", {}).get("symbolic_addrs"):
             first = self._concretized[0]
             act = first.get("action") or "access"
             notes.append(
@@ -1909,8 +1920,8 @@ class Run:
                 f"during the run (first: a {act} at {hex(first['addr'])}). angr concretizes a "
                 f"symbolic access to a single address, so a LATER check on that same index can "
                 f"UNDER-REPORT — e.g. an out-of-bounds WRITE may not fire because an earlier READ "
-                f"already pinned the index. To test such a site in isolation, pin the check to it "
-                f"and give the index a fixed value (constrain_return / an assumption) and sweep.")
+                f"already pinned the index. FIX: set limits.symbolic_addrs=true to keep the index "
+                f"symbolic so the checks see its full range (costs more solver time).")
         # Coverage: a 0-finding run that only reached part of the function is NOT a clean bill.
         cov = self.summary.get("coverage") or {}
         if cov.get("pct") is not None and cov["pct"] < 100:
