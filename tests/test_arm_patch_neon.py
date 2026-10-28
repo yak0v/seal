@@ -528,3 +528,40 @@ def test_fp_recip_rsqrt_estimate():
             ec, es = _frecpe(x), _frsqrte(x)
             assert gc[i] == ec or (_isnan32(gc[i]) and _isnan32(ec)), f"FRECPE {hex(x)} {hex(gc[i])} != {hex(ec)}"
             assert gs[i] == es or (_isnan32(gs[i]) and _isnan32(es)), f"FRSQRTE {hex(x)} {hex(gs[i])} != {hex(es)}"
+
+
+# ---------------- scalar FP round-to-integral / precision ----------------
+import math as _math
+
+
+def _d(bits):
+    return _struct.unpack("<d", _struct.pack("<Q", bits & ((1 << 64) - 1)))[0]
+
+
+def _db(x):
+    return _struct.unpack("<Q", _struct.pack("<d", x))[0]
+
+
+def test_round_to_integral():
+    cases = {"Iop_RoundF64toF64_NEAREST": round, "Iop_RoundF64toF64_NegINF": _math.floor,
+             "Iop_RoundF64toF64_PosINF": _math.ceil, "Iop_RoundF64toF64_ZERO": _math.trunc}
+    for name in cases:
+        assert name in irop.operations, name
+    op = irop.operations["Iop_RoundF64toF64_ZERO"]
+    for v in [2.7, -2.7, 0.4, -0.4, 100.0, -0.0]:
+        got = _ev(name if False else "Iop_RoundF64toF64_ZERO", claripy.BVV(_db(v), 64))
+        assert _d(got) == _math.trunc(v)
+    # sign of zero preserved on round-to-zero magnitude
+    assert _ev("Iop_RoundF64toF64_NEAREST", claripy.BVV(_db(-0.5), 64)) == _db(-0.0)
+    assert _ev("Iop_RoundF64toF64_PosINF", claripy.BVV(_db(0.1), 64)) == _db(1.0)
+    assert _ev("Iop_RoundF64toF64_NegINF", claripy.BVV(_db(-0.1), 64)) == _db(-1.0)
+
+
+def test_round_f64_to_f32_precision():
+    op = irop.operations["Iop_RoundF64toF32"]
+    # 1 + 2^-40 is below f32 precision -> rounds to 1.0 (kept as double)
+    got = _ev("Iop_RoundF64toF32", claripy.BVV(_db(1.0 + 2 ** -40), 64))
+    assert _d(got) == 1.0
+    tr = irop.operations["Iop_TruncF64asF32"]
+    got = claripy.backends.concrete.eval(tr._calculate([claripy.BVV(_db(1.5), 64)]), 1)[0]
+    assert _f32(got) == 1.5

@@ -45,6 +45,18 @@ IMPLEMENTED IR OPS  (determined by scanning the whole CoreGraphics .text; keep i
 * QandQ*Nnarrow     — Iop_QandQ{,R}{Sar,Shr}Nnarrow*  (SQSHRN/UQSHRN/SQSHRUN + rounding:
                       saturating shift-RIGHT then NARROW; (V128,I8)->V128, low half = result,
                       Q = LSB of upper half). Verified vs NEON hardware.
+* Shift space       — the ENTIRE NEON variable/immediate/narrowing shift space is covered.
+* Integer families  — Cnt (CNT), Cls (CLS), Left, Widen (SXTL/UXTL), Interleave (TRN1/TRN2),
+                      Avg (SRHADD/URHADD), PwAdd/PwMax/PwMin + PwAddL (ADDP/.../SADDLP),
+                      QDMulHi/QRDMulHi, QDMull, NarrowBin, PolynomialMul/Mull (PMUL/PMULL),
+                      QAddExt (SUQADD/USQADD), the remaining Reverse shapes + ZeroHI120.
+* NEON FP           — vector Sqrt, Cmp{GT,GE,UN}, Recip/RSqrt Step (FRECPS/FRSQRTS),
+                      Max/MinNum, FP pairwise, int<->fp + fp<->fixed conversions, saturating
+                      fp->int (FCVTZS/U), reciprocal / rsqrt ESTIMATE (FRECPE/FRSQRTE/URECPE/
+                      URSQRTE — the ARM table approximations), scalar round-to-integral
+                      (FRINT{N,M,P,Z}) and f64<->f32 precision rounding.
+  Every one of the above was verified BIT-EXACT against this machine's native NEON hardware
+  (or, where no intrinsic exists, an independent reference that was itself hardware-checked).
 * Iop_SqrtF64       — scalar double sqrt (claripy.fpSqrt)
 
 OVERRIDES of angr ops that it HAS but computes wrongly on symbolic input:
@@ -55,19 +67,18 @@ OVERRIDES of angr ops that it HAS but computes wrongly on symbolic input:
                       symbolic + concrete), VERIFIED bit-exact vs numpy.float16. The direct
                       F64toF16(+x2) is left a clean error (double-rounding via f32).
 
-REMAINING — being filled in family by family (everything exactly modelable, each verified
-against this machine's native NEON hardware). A wrong saturating/rounding handler silently
-corrupts analysis, so each goes in only once hardware-verified, never on a hunch:
+DELIBERATE GAPS — a clean UnsupportedIROpError, because a plausible-but-wrong result is
+worse (these are rare and NOT on normal data-flow paths):
+    MAddF32 / MSubF32 / MSubF64 (FMA)   — claripy has no single-rounding fused-multiply-add;
+                                          faking it with mul+add double-rounds (WRONG).
+    SHA256 / SHA512                     — crypto round functions (large; rare).
+    ScaleF64                            — x87 fscale (not arm64).
+    RecipEst64Fx2, RecpExpF32/F64       — f64 FRECPE / FRECPX (doable later; same method).
+NOT arm64 at all (can never be emitted by an AArch64 binary), so intentionally absent:
+    BCD / Decimal128 (D128/D64/D32), PowerPC (Yl2x/2xm1/PRem/MullEven/PolynomialMulAdd/
+    Div*E), AArch32-legacy vector shifts (Sal/QSal/QShl plain), x86 scalar-in-vector (*F0x*).
 
-    Iop_QSal*, Iop_QShl* (plain)  (ARM32-legacy saturating/arith vector shifts)
-    non-shift NEON integer families — PwAdd/PwMax/PwMin (pairwise), Avg (rounding halving
-      add), Interleave (zip/uzp/trn), Mull/QDMull (widening multiply), Cls (count leading
-      sign bits), QDMulHi/QRDMulHi (saturating doubling multiply high), QAddEx, ...
-    the modelable NEON FP — Recip/Rsqrt estimate+step, pairwise FP.
-    (the entire NEON variable/immediate/narrowing SHIFT space — Sh/Rsh/QandQsh/QShlNsat/
-     QandQ*Nnarrow — is now IMPLEMENTED above.)
-
-If an analyzed path hits one, add a validated handler here (same pattern as the
+If an analyzed path hits a gap, add a validated handler here (same pattern as the
 others). Also: libVEX cannot decode LSE atomics (ldadd/cas/ldapr) or `udf`; hook
 those per project like PAC if a path needs them.
 
@@ -763,6 +774,41 @@ def _op_generic_UIntEst(self, args):
     return _fp_concat(out)
 
 
+_RMODE = {"NEAREST": "RM_NearestTiesEven", "NegINF": "RM_TowardsNegativeInf",
+          "PosINF": "RM_TowardsPositiveInf", "ZERO": "RM_TowardsZero"}
+
+
+def _op_round_to_int(self, args):
+    """Iop_RoundF64toF64_{NEAREST,NegINF,PosINF,ZERO}: FRINT{N,M,P,Z} — round a double to an
+    integral double. Values with |x| >= 2^52 are already integral (and NaN/Inf pass through);
+    smaller values round via an int64 round-trip in the requested mode."""
+    rm = getattr(claripy.fp.RM, _RMODE[self.name.rsplit("_", 1)[1]])
+    xbv = args[-1]
+    x = xbv.raw_to_fp()
+    big = claripy.fpGEQ(claripy.fpAbs(x), claripy.FPV(2.0 ** 52, claripy.FSORT_DOUBLE)) | claripy.fpIsNaN(x)
+    is_zero = x == claripy.FPV(0.0, claripy.FSORT_DOUBLE)
+    safe = claripy.If(big | is_zero, claripy.FPV(0.0, claripy.FSORT_DOUBLE), x)   # keep fpToSBV in range
+    rounded = claripy.fpToFP(rm, claripy.fpToSBV(rm, safe, 64), claripy.FSORT_DOUBLE).raw_to_bv()
+    sign = xbv & claripy.BVV(1 << 63, 64)
+    # when the rounded magnitude is 0, carry the input's sign (FRINT(-0.5) = -0.0)
+    rounded = claripy.If(rounded & claripy.BVV((1 << 63) - 1, 64) == 0, sign, rounded)
+    return claripy.If(big | is_zero, xbv, rounded)                                # big/NaN/Inf/+-0 pass through
+
+
+def _op_round_f64_to_f32(self, args):
+    """Iop_RoundF64toF32: round a double to single precision but KEEP it a double (the value
+    representable in f32, as f64). = widen(narrow(x))."""
+    rne = claripy.fp.RM.RM_NearestTiesEven
+    x = args[-1].raw_to_fp()
+    return claripy.fpToFP(rne, claripy.fpToFP(rne, x, claripy.FSORT_FLOAT), claripy.FSORT_DOUBLE).raw_to_bv()
+
+
+def _op_trunc_f64_as_f32(self, args):
+    """Iop_TruncF64asF32: convert a double to single precision (result is F32)."""
+    rne = claripy.fp.RM.RM_NearestTiesEven
+    return claripy.fpToFP(rne, args[-1].raw_to_fp(), claripy.FSORT_FLOAT).raw_to_bv()
+
+
 def _op_slice64(self, args):
     """Iop_Slice64 (I64,I64,I8)->I64: EXT. Concatenate arg1(high):arg2(low) and extract the
     64-bit field starting at byte arg3. arg3==0 -> arg2, arg3==8 -> arg1."""
@@ -921,6 +967,9 @@ _SPECIFIC = {
     "Iop_RecipEst32Fx2": _op_generic_FPEst, "Iop_RecipEst32Fx4": _op_generic_FPEst,
     "Iop_RecipEst32Fx8": _op_generic_FPEst,
     "Iop_RSqrtEst32Fx2": _op_generic_FPEst, "Iop_RSqrtEst32Fx4": _op_generic_FPEst,
+    "Iop_RoundF64toF64_NEAREST": _op_round_to_int, "Iop_RoundF64toF64_NegINF": _op_round_to_int,
+    "Iop_RoundF64toF64_PosINF": _op_round_to_int, "Iop_RoundF64toF64_ZERO": _op_round_to_int,
+    "Iop_RoundF64toF32": _op_round_f64_to_f32, "Iop_TruncF64asF32": _op_trunc_f64_as_f32,
 }
 _GENERIC = {
     "NarrowUn": _op_generic_NarrowUn,
@@ -1056,6 +1105,10 @@ _REGISTER = [
     # --- FP reciprocal / rsqrt estimate (FRECPE / FRSQRTE) ---
     "Iop_RecipEst32Fx2", "Iop_RecipEst32Fx4", "Iop_RecipEst32Fx8",
     "Iop_RSqrtEst32Fx2", "Iop_RSqrtEst32Fx4",
+    # --- scalar FP round-to-integral / precision (FRINT*, FCVT d<->s) ---
+    "Iop_RoundF64toF64_NEAREST", "Iop_RoundF64toF64_NegINF",
+    "Iop_RoundF64toF64_PosINF", "Iop_RoundF64toF64_ZERO",
+    "Iop_RoundF64toF32", "Iop_TruncF64asF32",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.
@@ -1099,6 +1152,11 @@ _EXPLICIT_ATTRS = {
     "Iop_Fixed32UToF32x4_RN": _explicit(generic_name="Fixed32UToF32x4_RN"),
     "Iop_Fixed32SToF32x2_RN": _explicit(generic_name="Fixed32SToF32x2_RN"),
     "Iop_Fixed32UToF32x2_RN": _explicit(generic_name="Fixed32UToF32x2_RN"),
+    "Iop_RoundF64toF64_NEAREST": _explicit(generic_name="Round", from_type="F", from_size="64", to_type="F", to_size="64", conversion="to"),
+    "Iop_RoundF64toF64_NegINF": _explicit(generic_name="Round", from_type="F", from_size="64", to_type="F", to_size="64", conversion="to"),
+    "Iop_RoundF64toF64_PosINF": _explicit(generic_name="Round", from_type="F", from_size="64", to_type="F", to_size="64", conversion="to"),
+    "Iop_RoundF64toF64_ZERO": _explicit(generic_name="Round", from_type="F", from_size="64", to_type="F", to_size="64", conversion="to"),
+    "Iop_RoundF64toF32": _explicit(generic_name="Round", from_type="F", from_size="64", to_type="F", to_size="64", conversion="to"),
 }
 
 _applied = False
