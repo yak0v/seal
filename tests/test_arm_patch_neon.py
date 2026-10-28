@@ -294,3 +294,63 @@ def test_qaddext_suqadd_usqadd():
                         s = max(0, min((1 << lw) - 1, s)) & ((1 << lw) - 1)
                     exp.append(s & ((1 << lw) - 1))
                 assert got == exp, f"{name} L={L} R={R} got={got} exp={exp}"
+
+
+# ---------------- NEON FP: sqrt, compares, recip/rsqrt step, maxnum/minnum, FP pairwise ----------------
+import struct as _struct
+
+
+def _f32(bits):
+    return _struct.unpack("<f", _struct.pack("<I", bits & 0xffffffff))[0]
+
+
+def _f32b(x):
+    return _struct.unpack("<I", _struct.pack("<f", x))[0]
+
+
+def test_fp_sqrt_vector():
+    for name, lw, cnt, vals in [("Iop_Sqrt32Fx4", 32, 4, [4.0, 9.0, 2.0, 0.25])]:
+        assert name in irop.operations
+        got = _lanes(_ev(name, claripy.BVV(_pack([_f32b(v) for v in vals], 32), 128)), 32, 4)
+        import math
+        for g, v in zip(got, vals):
+            assert abs(_f32(g) - math.sqrt(v)) < 1e-6
+
+
+def test_fp_compare_masks():
+    gt = irop.operations["Iop_CmpGT32Fx4"]
+    a = claripy.BVV(_pack([_f32b(2.0), _f32b(1.0), _f32b(float("nan")), _f32b(-1.0)], 32), 128)
+    b = claripy.BVV(_pack([_f32b(1.0), _f32b(2.0), _f32b(0.0), _f32b(-2.0)], 32), 128)
+    got = _lanes(claripy.backends.concrete.eval(gt._calculate([a, b]), 1)[0], 32, 4)
+    assert got == [0xffffffff, 0, 0, 0xffffffff]           # 2>1, 1>2 no, nan no, -1>-2
+    un = irop.operations["Iop_CmpUN32Fx4"]
+    got = _lanes(claripy.backends.concrete.eval(un._calculate([a, b]), 1)[0], 32, 4)
+    assert got == [0, 0, 0xffffffff, 0]                    # only the NaN lane is unordered
+
+
+def test_fp_recip_rsqrt_step():
+    rs = irop.operations["Iop_RecipStep32Fx4"]
+    a = claripy.BVV(_pack([_f32b(3.0), _f32b(0.0), _f32b(1.0), _f32b(2.0)], 32), 128)
+    b = claripy.BVV(_pack([_f32b(0.5), _f32b(float("inf")), _f32b(1.0), _f32b(1.0)], 32), 128)
+    got = _lanes(claripy.backends.concrete.eval(rs._calculate([a, b]), 1)[0], 32, 4)
+    assert abs(_f32(got[0]) - 0.5) < 1e-6                  # 2 - 3*0.5
+    assert _f32(got[1]) == 2.0                             # 0*inf special -> 2.0
+    assert abs(_f32(got[2]) - 1.0) < 1e-6                  # 2 - 1
+    rsq = irop.operations["Iop_RSqrtStep32Fx4"]
+    got = _lanes(claripy.backends.concrete.eval(rsq._calculate([a, b]), 1)[0], 32, 4)
+    assert _f32(got[1]) == 1.5                             # 0*inf special -> 1.5
+
+
+def test_fp_maxnum_minnum():
+    mx = irop.operations["Iop_MaxNumF32"]
+    assert _f32(claripy.backends.concrete.eval(mx._calculate([claripy.BVV(_f32b(1.0), 32), claripy.BVV(_f32b(float("nan")), 32)]), 1)[0]) == 1.0
+    mn = irop.operations["Iop_MinNumF32"]
+    assert _f32(claripy.backends.concrete.eval(mn._calculate([claripy.BVV(_f32b(5.0), 32), claripy.BVV(_f32b(2.0), 32)]), 1)[0]) == 2.0
+
+
+def test_fp_pairwise():
+    pa = irop.operations["Iop_PwAdd32Fx2"]
+    a = claripy.BVV(_pack([_f32b(1.0), _f32b(2.0)], 32), 64)
+    b = claripy.BVV(_pack([_f32b(3.0), _f32b(4.0)], 32), 64)
+    got = _lanes(claripy.backends.concrete.eval(pa._calculate([a, b]), 1)[0], 32, 2)
+    assert abs(_f32(got[0]) - 3.0) < 1e-6 and abs(_f32(got[1]) - 7.0) < 1e-6

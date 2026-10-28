@@ -539,11 +539,113 @@ def _op_generic_QAddExt(self, args):
     return _concat_lanes(out)
 
 
+def _fp_lane(bv, lw, i):
+    return bv[(i + 1) * lw - 1:i * lw].raw_to_fp()
+
+
+def _fp_concat(bvs):               # bvs: low lane first
+    return claripy.Concat(*reversed(bvs))
+
+
+def _fmax(a, b):
+    """ARM FPMax: NaN in either -> that value's partner is ignored in favour of the NaN's
+    propagation; for numbers, the larger (+0 > -0). We return a NaN if either is NaN."""
+    nan = claripy.fpIsNaN(a) | claripy.fpIsNaN(b)
+    larger = claripy.If(claripy.fpGT(a, b), a, b)
+    return claripy.If(nan, claripy.If(claripy.fpIsNaN(a), a, b), larger)
+
+
+def _fmin(a, b):
+    nan = claripy.fpIsNaN(a) | claripy.fpIsNaN(b)
+    smaller = claripy.If(claripy.fpLT(a, b), a, b)
+    return claripy.If(nan, claripy.If(claripy.fpIsNaN(a), a, b), smaller)
+
+
+def _fmaxnum(a, b):
+    """FMAXNM / IEEE maxNum: if exactly one is NaN, return the number; both NaN -> NaN."""
+    return claripy.If(claripy.fpIsNaN(a), b, claripy.If(claripy.fpIsNaN(b), a, claripy.If(claripy.fpGT(a, b), a, b)))
+
+
+def _fminnum(a, b):
+    return claripy.If(claripy.fpIsNaN(a), b, claripy.If(claripy.fpIsNaN(b), a, claripy.If(claripy.fpLT(a, b), a, b)))
+
+
+def _op_generic_FSqrt(self, args):
+    """Iop_Sqrt{32,64}Fx<cnt>: vector FSQRT (round to nearest-even)."""
+    lw, cnt = int(self._vector_size), int(self._vector_count)
+    rm = claripy.fp.RM.RM_NearestTiesEven
+    x = args[0]
+    return _fp_concat([claripy.fpSqrt(rm, _fp_lane(x, lw, i)).raw_to_bv() for i in range(cnt)])
+
+
+def _op_generic_FCmp(self, args):
+    """Iop_Cmp{GT,GE,UN}<lw>Fx<cnt>: lanewise FP compare -> all-ones / all-zeros per lane.
+    GT/GE are ordered (NaN -> false); UN is the unordered predicate (either lane NaN)."""
+    m = re.search(r"Cmp(GT|GE|UN)(\d+)Fx(\d+)", self.name)
+    kind, lw, cnt = m.group(1), int(m.group(2)), int(m.group(3))
+    a, b = args[-2], args[-1]
+    ones, zero = claripy.BVV((1 << lw) - 1, lw), claripy.BVV(0, lw)
+    out = []
+    for i in range(cnt):
+        fa, fb = _fp_lane(a, lw, i), _fp_lane(b, lw, i)
+        if kind == "GT":
+            pred = claripy.fpGT(fa, fb)
+        elif kind == "GE":
+            pred = claripy.fpGEQ(fa, fb)
+        else:
+            pred = claripy.fpIsNaN(fa) | claripy.fpIsNaN(fb)
+        out.append(claripy.If(pred, ones, zero))
+    return _fp_concat(out)
+
+
+def _op_generic_FStep(self, args):
+    """Iop_RecipStep<lw>Fx<cnt> = (2.0 - a*b); Iop_RSqrtStep = (3.0 - a*b)/2.0. If one arg
+    is 0 and the other +/-inf, the result is the constant (2.0 / 1.5) rather than NaN."""
+    m = re.search(r"(Recip|RSqrt)Step(\d+)Fx(\d+)", self.name)
+    rsqrt, lw, cnt = m.group(1) == "RSqrt", int(m.group(2)), int(m.group(3))
+    rm = claripy.fp.RM.RM_NearestTiesEven
+    sort = claripy.FSORT_FLOAT if lw == 32 else claripy.FSORT_DOUBLE
+    two = claripy.FPV(2.0, sort)
+    const = claripy.FPV(1.5 if rsqrt else 2.0, sort)
+    a, b = args[-2], args[-1]
+    out = []
+    for i in range(cnt):
+        fa, fb = _fp_lane(a, lw, i), _fp_lane(b, lw, i)
+        special = (claripy.fpIsInf(fa) & (fb == claripy.FPV(0.0, sort))) | \
+                  (claripy.fpIsInf(fb) & (fa == claripy.FPV(0.0, sort)))
+        if rsqrt:
+            three = claripy.FPV(3.0, sort)
+            val = claripy.fpDiv(rm, claripy.fpSub(rm, three, claripy.fpMul(rm, fa, fb)), two)
+        else:
+            val = claripy.fpSub(rm, two, claripy.fpMul(rm, fa, fb))
+        out.append(claripy.If(special, const, val).raw_to_bv())
+    return _fp_concat(out)
+
+
+def _op_generic_FMaxMinNum(self, args):
+    """Iop_{Max,Min}NumF{32,64}: scalar FMAXNM / FMINNM (IEEE maxNum/minNum)."""
+    m = re.search(r"(Max|Min)NumF(\d+)", self.name)
+    is_max, lw = m.group(1) == "Max", int(m.group(2))
+    fa, fb = args[-2].raw_to_fp(), args[-1].raw_to_fp()
+    return (_fmaxnum(fa, fb) if is_max else _fminnum(fa, fb)).raw_to_bv()
+
+
 def _op_generic_PwFP(self, args):
-    """FP pairwise (PwAdd/PwMax/PwMin 32Fx*). Implemented+verified in the NEON-FP batch;
-    until then a CLEAN error (never a guessed FP result, which would be worse than a gap)."""
-    from angr.errors import UnsupportedIROpError
-    raise UnsupportedIROpError(f"{self.name}: FP pairwise not yet modeled (coming in the NEON-FP batch)")
+    """FP pairwise: Iop_PwAdd32Fx2 and Iop_Pw{Max,Min}32Fx{2,4} (FADDP/FMAXP/FMINP).
+    PwFoo([a,b],[c,d]) = [Foo(a,b), Foo(c,d)] — arg1's pair(s) low, arg2's high."""
+    m = re.search(r"Pw(Add|Max|Min)(\d+)Fx(\d+)", self.name)
+    kind, lw, cnt = m.group(1), int(m.group(2)), int(m.group(3))
+    rm = claripy.fp.RM.RM_NearestTiesEven
+    def foo(x, y):
+        if kind == "Add":
+            return claripy.fpAdd(rm, x, y)
+        return _fmax(x, y) if kind == "Max" else _fmin(x, y)
+    out = []
+    for arg in (args[0], args[1]):
+        lanes = [_fp_lane(arg, lw, i) for i in range(cnt)]
+        for k in range(0, cnt, 2):
+            out.append(foo(lanes[k], lanes[k + 1]).raw_to_bv())
+    return _fp_concat(out)
 
 
 def _op_generic_PwAddL(self, args):
@@ -611,6 +713,15 @@ _GENERIC = {
     "PolynomialMull": _op_generic_PolynomialMull,  # PMULL
     "QAddExtUSsat": _op_generic_QAddExt,   # SUQADD
     "QAddExtSUsat": _op_generic_QAddExt,   # USQADD
+    # --- NEON FP ---
+    "Sqrt": _op_generic_FSqrt,             # vector FSQRT
+    "CmpGT": _op_generic_FCmp,             # FCMGT
+    "CmpGE": _op_generic_FCmp,             # FCMGE
+    "CmpUN": _op_generic_FCmp,             # unordered compare
+    "RecipStep": _op_generic_FStep,        # FRECPS (2 - a*b)
+    "RSqrtStep": _op_generic_FStep,        # FRSQRTS (3 - a*b)/2
+    "MaxNum": _op_generic_FMaxMinNum,      # FMAXNM
+    "MinNum": _op_generic_FMaxMinNum,      # FMINNM
     "Sh": _op_generic_Sh,                  # SSHL/USHL per-lane variable shift (all lane widths)
     "Rsh": _op_generic_Rsh,                # SRSHL/URSHL rounding variable shift
     "QandUQsh": _op_generic_QandQsh,       # UQSHL  (sat, V256 result+Q)
@@ -694,6 +805,14 @@ _REGISTER = [
     # --- Batch D: ARM64 saturating add extensions (SUQADD / USQADD) ---
     "Iop_QAddExtUSsatSS8x16", "Iop_QAddExtUSsatSS16x8", "Iop_QAddExtUSsatSS32x4", "Iop_QAddExtUSsatSS64x2",
     "Iop_QAddExtSUsatUU8x16", "Iop_QAddExtSUsatUU16x8", "Iop_QAddExtSUsatUU32x4", "Iop_QAddExtSUsatUU64x2",
+    # --- NEON FP (exact): vector sqrt, compares, recip/rsqrt step, max/min num, FP pairwise ---
+    "Iop_Sqrt32Fx4", "Iop_Sqrt64Fx2", "Iop_Sqrt64Fx4",
+    "Iop_CmpGT32Fx2", "Iop_CmpGT32Fx4", "Iop_CmpGE32Fx2", "Iop_CmpGE32Fx4",
+    "Iop_CmpUN32Fx4", "Iop_CmpUN64Fx2",
+    "Iop_RecipStep32Fx2", "Iop_RecipStep32Fx4", "Iop_RecipStep64Fx2",
+    "Iop_RSqrtStep32Fx2", "Iop_RSqrtStep32Fx4", "Iop_RSqrtStep64Fx2",
+    "Iop_MaxNumF32", "Iop_MaxNumF64", "Iop_MinNumF32", "Iop_MinNumF64",
+    "Iop_PwAdd32Fx2", "Iop_PwMax32Fx2", "Iop_PwMin32Fx2", "Iop_PwMax32Fx4", "Iop_PwMin32Fx4",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.
