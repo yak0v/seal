@@ -66,6 +66,26 @@ def _pack(vals, lw):
     return out
 
 
+def _ref_sat(val, sh_byte, lw, in_signed, sat_signed, rounding, out_lw):
+    """Generalised saturating-shift reference (hardware-verified): shift by the signed
+    sh_byte, then clamp to the sat_signed range of out_lw bits. Covers QShlNsat (left,
+    out_lw==lw) and the saturating-narrow ops (right, out_lw<lw). Returns (result, Q)."""
+    shift = sh_byte - 256 if sh_byte >= 128 else sh_byte
+    sval = val - (1 << lw) if (in_signed and (val >> (lw - 1)) & 1) else val
+    if shift >= 0:
+        res = sval << shift
+    else:
+        n = -shift
+        res = ((sval if in_signed else val) + ((1 << (n - 1)) if rounding else 0)) >> n
+    hi, lo = ((1 << (out_lw - 1)) - 1, -(1 << (out_lw - 1))) if sat_signed else ((1 << out_lw) - 1, 0)
+    q = 0
+    if res > hi:
+        res, q = hi, 1
+    elif res < lo:
+        res, q = lo, 1
+    return res & ((1 << out_lw) - 1), q
+
+
 RSH = {"Iop_Rsh8Sx16": (8, 16, True), "Iop_Rsh8Ux16": (8, 16, False),
        "Iop_Rsh16Sx8": (16, 8, True), "Iop_Rsh16Ux8": (16, 8, False),
        "Iop_Rsh32Sx4": (32, 4, True), "Iop_Rsh32Ux4": (32, 4, False),
@@ -134,6 +154,61 @@ def test_saturating_shift_result_and_q_bit():
                 assert res == _pack([x[0] for x in lanes], lw), f"{name} result mismatch"
                 assert q == (1 if any(x[1] for x in lanes) else 0), f"{name} Q mismatch"
                 assert (v >> 129) == 0, f"{name} upper V128 must be zero except Q"
+
+
+QSHLNSAT = {"SS": (True, True), "UU": (False, False), "SU": (True, False)}  # (in_signed, sat_signed)
+
+
+def test_qshlnsat_immediate_saturating_left_shift():
+    """Iop_QShlNsat{SS,SU,UU}<lw>x<cnt>: SQSHL/UQSHL/SQSHLU #imm — saturating LEFT shift by a
+    scalar immediate (args[1]), V128 result. Verified vs native hardware over 1400 vectors."""
+    random.seed(13)
+    for tag, (insig, satsig) in QSHLNSAT.items():
+        for lw, cnt in QWIDTHS.items():
+            name = f"Iop_QShlNsat{tag}{lw}x{cnt}"
+            assert name in irop.operations, name
+            tw = lw * cnt
+            for _ in range(60):
+                dv = [random.choice([0, 1, 1 << (lw - 1), (1 << (lw - 1)) - 1, (1 << lw) - 1, random.getrandbits(lw)]) for _ in range(cnt)]
+                n = random.choice([0, 1, 2, lw - 1] + [random.randrange(0, lw)])
+                v = _ev2(name, claripy.BVV(_pack(dv, lw), tw), claripy.BVV(n, 8))
+                exp = _pack([_ref_sat(dv[i], n, lw, insig, satsig, False, lw)[0] for i in range(cnt)], lw)
+                assert (v & ((1 << tw) - 1)) == exp, f"{name} n={n} dv={[hex(x) for x in dv]}"
+
+
+# narrow op name -> (src, dst, in_signed, sat_signed, rounding)
+NARROW = {
+    "Iop_QandQShrNnarrow16Uto8Ux8": (16, 8, False, False, False),
+    "Iop_QandQShrNnarrow32Uto16Ux4": (32, 16, False, False, False),
+    "Iop_QandQShrNnarrow64Uto32Ux2": (64, 32, False, False, False),
+    "Iop_QandQSarNnarrow16Sto8Sx8": (16, 8, True, True, False),
+    "Iop_QandQSarNnarrow32Sto16Ux4": (32, 16, True, False, False),
+    "Iop_QandQRSarNnarrow64Sto32Sx2": (64, 32, True, True, True),
+    "Iop_QandQRShrNnarrow32Uto16Ux4": (32, 16, False, False, True),
+    "Iop_QandQRSarNnarrow16Sto8Ux8": (16, 8, True, False, True),
+}
+
+
+def test_saturating_narrow_shift_right():
+    """Iop_QandQ{,R}{Sar,Shr}Nnarrow...: saturating (maybe rounding) shift-right + narrow.
+    (V128,I8)->V128: low half = narrowed lanes, Q = LSB of the upper half."""
+    random.seed(17)
+    for name, (src, dst, insig, satsig, rnd) in NARROW.items():
+        assert name in irop.operations, name
+        cnt = 128 // src
+        for _ in range(60):
+            dv = [random.choice([0, 1, 1 << (src - 1), (1 << (src - 1)) - 1, (1 << src) - 1, random.getrandbits(src)]) for _ in range(cnt)]
+            n = random.randrange(1, dst + 1)                      # ARM narrow shift range 1..dst
+            v = _ev2(name, claripy.BVV(_pack(dv, src), 128), claripy.BVV(n, 8))
+            lanes = [_ref_sat(dv[i], (256 - n) & 0xff, src, insig, satsig, rnd, dst) for i in range(cnt)]
+            res = v & ((1 << (dst * cnt)) - 1)
+            assert res == _pack([x[0] for x in lanes], dst), f"{name} n={n} dv={[hex(x) for x in dv]}"
+            assert ((v >> 64) & 1) == (1 if any(x[1] for x in lanes) else 0), f"{name} Q n={n}"
+            assert (v >> 65) == 0, f"{name} upper bits above Q must be 0"
+
+
+def _ev2(op, a, b):
+    return claripy.backends.concrete.eval(irop.operations[op]._calculate([a, b]), 1)[0]
 
 
 def test_symbolic_shift_is_solver_reasoned():

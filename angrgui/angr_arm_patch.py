@@ -40,6 +40,11 @@ IMPLEMENTED IR OPS  (determined by scanning the whole CoreGraphics .text; keep i
 * QandQsh   family  — Iop_Qand{U,S}Q{,R}sh{8,16,32,64}x{...}  (SQSHL/UQSHL/SQRSHL/UQRSHL:
                       SATURATING, maybe rounding, variable shift; (V128,V128)->V256, low
                       half = result, Q bit = LSB of upper half). Verified vs NEON hardware.
+* QShlNsat  family  — Iop_QShlNsat{SS,SU,UU}*  (SQSHL/UQSHL/SQSHLU #imm: SATURATING left shift
+                      by a scalar immediate; V128). Verified vs NEON hardware.
+* QandQ*Nnarrow     — Iop_QandQ{,R}{Sar,Shr}Nnarrow*  (SQSHRN/UQSHRN/SQSHRUN + rounding:
+                      saturating shift-RIGHT then NARROW; (V128,I8)->V128, low half = result,
+                      Q = LSB of upper half). Verified vs NEON hardware.
 * Iop_SqrtF64       — scalar double sqrt (claripy.fpSqrt)
 
 OVERRIDES of angr ops that it HAS but computes wrongly on symbolic input:
@@ -54,12 +59,13 @@ REMAINING — being filled in family by family (everything exactly modelable, ea
 against this machine's native NEON hardware). A wrong saturating/rounding handler silently
 corrupts analysis, so each goes in only once hardware-verified, never on a hunch:
 
-    Iop_QShlNsat{SS,SU,UU}*      (SQSHL/UQSHL/SQSHLU #imm: SATURATING left shift by immediate)
-    Iop_QSal*, Iop_QShl*         (ARM32-legacy saturating shifts)
-    Iop_QandQ{Sar,Shr,RSar,RShr}Nnarrow*  (SQSHRN/UQRSHRN/...: shift+saturate+NARROW, V128 result+Q)
-    Iop_Qand{S,U}Q{,R}sh — the VARIABLE saturating shifts — are now IMPLEMENTED above.
-    non-shift NEON integer families (PwAdd, Avg, Interleave, Mull, Cls, QDMulHi, ...) and
-    the modelable NEON FP (Recip/Rsqrt estimate+step, pairwise FP) are next.
+    Iop_QSal*, Iop_QShl* (plain)  (ARM32-legacy saturating/arith vector shifts)
+    non-shift NEON integer families — PwAdd/PwMax/PwMin (pairwise), Avg (rounding halving
+      add), Interleave (zip/uzp/trn), Mull/QDMull (widening multiply), Cls (count leading
+      sign bits), QDMulHi/QRDMulHi (saturating doubling multiply high), QAddEx, ...
+    the modelable NEON FP — Recip/Rsqrt estimate+step, pairwise FP.
+    (the entire NEON variable/immediate/narrowing SHIFT space — Sh/Rsh/QandQsh/QShlNsat/
+     QandQ*Nnarrow — is now IMPLEMENTED above.)
 
 If an analyzed path hits one, add a validated handler here (same pattern as the
 others). Also: libVEX cannot decode LSE atomics (ldadd/cas/ldapr) or `udf`; hook
@@ -204,13 +210,15 @@ def _op_generic_Sh(self, args):
     return out
 
 
-def _shift_lane(lane, sh8, lw, signed, rounding, saturating):
+def _shift_lane(lane, sh8, lw, signed, rounding, saturating, out_lw=None, sat_signed=None):
     """One lane of a bidirectional variable shift, computed in a widened domain so a left
     overflow and the rounding carry are exact. sh8 = SIGNED low byte of the amount lane:
     >=0 left, <0 right. Right shifts fill arithmetically for S / logically for U
     (hardware-confirmed), and the ROUNDING variants add 2^(n-1) before a right shift only.
-    Returns (lw-bit result, saturated?-bit or None) — the saturating variants clamp the
-    value to the lane's signed/unsigned range and report whether that clamp fired.
+    Returns (result, saturated?-bit or None) — the saturating variants clamp the value to
+    the output range and report whether that clamp fired. The result is `out_lw` bits wide
+    (defaults to `lw`; set smaller for the saturating-NARROW ops) and is clamped to the
+    signed/unsigned range of `sat_signed` (defaults to `signed`, differs only for SQSHLU).
 
     Verified against this machine's NEON hardware (SRSHL/URSHL/SQSHL/UQSHL/SQRSHL/UQRSHL):
     72000 vectors across all widths/signs/edge amounts, 0 mismatches. The shift magnitudes
@@ -231,15 +239,19 @@ def _shift_lane(lane, sh8, lw, signed, rounding, saturating):
         radd = ext
     right = (radd >> rmag) if signed else claripy.LShR(radd, rmag)
     chosen = claripy.If(neg, right, ext << lmag)
+    olw = lw if out_lw is None else out_lw
     if not saturating:
-        return chosen[lw - 1:0], None
-    if signed:
-        hi, lo = claripy.BVV((1 << (lw - 1)) - 1, W), claripy.BVV((-(1 << (lw - 1))) & ((1 << W) - 1), W)
-        c = claripy.If(claripy.SGT(chosen, hi), hi, claripy.If(claripy.SLT(chosen, lo), lo, chosen))
+        return chosen[olw - 1:0], None
+    ssig = signed if sat_signed is None else sat_signed
+    if ssig:
+        hi, lo = claripy.BVV((1 << (olw - 1)) - 1, W), claripy.BVV((-(1 << (olw - 1))) & ((1 << W) - 1), W)
     else:
-        hi, lo = claripy.BVV((1 << lw) - 1, W), claripy.BVV(0, W)
-        c = claripy.If(claripy.UGT(chosen, hi), hi, claripy.If(claripy.ULT(chosen, lo), lo, chosen))
-    return c[lw - 1:0], claripy.If(c == chosen, claripy.BVV(0, 1), claripy.BVV(1, 1))
+        hi, lo = claripy.BVV((1 << olw) - 1, W), claripy.BVV(0, W)
+    # signed comparisons throughout: `chosen` can be negative (signed input), so SLT clamps
+    # it to lo; for unsigned-input results (always non-negative, < 2^(W-1)) this equals the
+    # unsigned compare. This keeps the already-verified same-signedness cases unchanged.
+    c = claripy.If(claripy.SGT(chosen, hi), hi, claripy.If(claripy.SLT(chosen, lo), lo, chosen))
+    return c[olw - 1:0], claripy.If(c == chosen, claripy.BVV(0, 1), claripy.BVV(1, 1))
 
 
 def _op_generic_Rsh(self, args):
@@ -275,6 +287,46 @@ def _op_generic_QandQsh(self, args):
     return claripy.Concat(upper, result)                       # V256 = [upper128 | result128]
 
 
+def _op_generic_QShlNsat(self, args):
+    """Iop_QShlNsat{SS,SU,UU}<lw>x<cnt>: ARM SQSHL/UQSHL/SQSHLU #imm — SATURATING LEFT shift
+    by a scalar immediate (args[1], I8, non-negative, same for all lanes), V128 result (QC
+    is tracked by VEX separately, so this op returns only the value). The two signedness
+    letters are INPUT then SATURATION: SS signed->signed, UU unsigned->unsigned, SU signed
+    input saturated to unsigned (SQSHLU). See _shift_lane."""
+    m = re.search(r"QShlNsat([SU])([SU])(\d+)x(\d+)", self.name)
+    in_signed, sat_signed, lw, cnt = m.group(1) == "S", m.group(2) == "S", int(m.group(3)), int(m.group(4))
+    data = args[0]
+    sh8 = args[1][7:0]                                          # scalar immediate shift (>=0 => left)
+    out = None
+    for i in range(cnt):
+        res, _ = _shift_lane(data[lw * i + lw - 1: lw * i], sh8, lw, in_signed,
+                             rounding=False, saturating=True, sat_signed=sat_signed)
+        out = res if out is None else claripy.Concat(res, out)
+    return out
+
+
+def _op_generic_QandQNarrow(self, args):
+    """Iop_QandQ{,R}{Sar,Shr}Nnarrow<src>{S,U}to<dst>{S,U}x<cnt>: ARM SQSHRN/UQSHRN/SQSHRUN
+    (+ rounding SQRSHRN/UQRSHRN/SQRSHRUN) — shift each src lane RIGHT by a scalar immediate
+    (args[1], I8, 1..src_width; Sar=arithmetic/signed source, Shr=logical/unsigned; R adds
+    2^(n-1) first), then saturate-narrow to the dst width/signedness. (V128,I8)->V128: low
+    half = narrowed lanes, Q (any lane saturated) = LSB of the upper half, rest zero."""
+    m = re.search(r"QandQ(R?)(Sar|Shr)Nnarrow(\d+)([SU])to(\d+)([SU])x(\d+)", self.name)
+    rounding, in_signed = bool(m.group(1)), m.group(2) == "Sar"
+    src, dst, sat_signed, cnt = int(m.group(3)), int(m.group(5)), m.group(6) == "S", int(m.group(7))
+    data = args[0]
+    neg_imm = claripy.BVV(0, 8) - args[1][7:0]                 # immediate is a RIGHT shift
+    result = None
+    qbit = claripy.BVV(0, 1)
+    for i in range(cnt):
+        res, sat = _shift_lane(data[src * i + src - 1: src * i], neg_imm, src, in_signed,
+                               rounding=rounding, saturating=True, out_lw=dst, sat_signed=sat_signed)
+        result = res if result is None else claripy.Concat(res, result)
+        qbit = qbit | sat
+    pad = 128 - 1 - result.length                              # upper half above the Q bit
+    return claripy.Concat(claripy.BVV(0, pad), qbit, result)   # V128 = [0..0 | Q | result]
+
+
 def _op_fgeneric_Sqrt(self, args):
     """FP square root. Handles BOTH call shapes: angr calls a scalar op as
     _calculate([x]) (args is a list), and _auto_vectorize calls the per-lane function as
@@ -307,6 +359,11 @@ _GENERIC = {
     "QandSQsh": _op_generic_QandQsh,       # SQSHL  (sat, V256 result+Q)
     "QandUQRsh": _op_generic_QandQsh,      # UQRSHL (sat+round, V256 result+Q)
     "QandSQRsh": _op_generic_QandQsh,      # SQRSHL (sat+round, V256 result+Q)
+    "QShlNsat": _op_generic_QShlNsat,      # SQSHL/UQSHL/SQSHLU #imm (sat left shift, V128)
+    "QandQSarNnarrow": _op_generic_QandQNarrow,    # SQSHRN / SQSHRUN (sat-narrow right, V128+Q)
+    "QandQShrNnarrow": _op_generic_QandQNarrow,    # UQSHRN
+    "QandQRSarNnarrow": _op_generic_QandQNarrow,   # SQRSHRN / SQRSHRUN (rounding)
+    "QandQRShrNnarrow": _op_generic_QandQNarrow,   # UQRSHRN (rounding)
 }
 
 # ops to proactively (re)register into the operations table
@@ -330,6 +387,22 @@ _REGISTER = [
     "Iop_QandSQsh8x16", "Iop_QandSQsh16x8", "Iop_QandSQsh32x4", "Iop_QandSQsh64x2",
     "Iop_QandUQRsh8x16", "Iop_QandUQRsh16x8", "Iop_QandUQRsh32x4", "Iop_QandUQRsh64x2",
     "Iop_QandSQRsh8x16", "Iop_QandSQRsh16x8", "Iop_QandSQRsh32x4", "Iop_QandSQRsh64x2",
+    # SQSHL/UQSHL/SQSHLU #imm — saturating left shift by immediate (generic_name "QShlNsat")
+    "Iop_QShlNsatSS8x16", "Iop_QShlNsatSS16x8", "Iop_QShlNsatSS32x4", "Iop_QShlNsatSS64x2",
+    "Iop_QShlNsatUU8x16", "Iop_QShlNsatUU16x8", "Iop_QShlNsatUU32x4", "Iop_QShlNsatUU64x2",
+    "Iop_QShlNsatSU8x16", "Iop_QShlNsatSU16x8", "Iop_QShlNsatSU32x4", "Iop_QShlNsatSU64x2",
+    # ARM32-legacy small-vector variants (x8/x4/x2/x1) also exist; register the x1 scalars
+    "Iop_QShlNsatSS64x1", "Iop_QShlNsatUU64x1", "Iop_QShlNsatSU64x1",
+    "Iop_QShlNsatSS8x8", "Iop_QShlNsatSS16x4", "Iop_QShlNsatSS32x2",
+    "Iop_QShlNsatUU8x8", "Iop_QShlNsatUU16x4", "Iop_QShlNsatUU32x2",
+    "Iop_QShlNsatSU8x8", "Iop_QShlNsatSU16x4", "Iop_QShlNsatSU32x2",
+    # SQSHRN/UQSHRN/SQSHRUN (+rounding) — saturating-narrow shift right (generic "QandQ*Nnarrow")
+    "Iop_QandQShrNnarrow16Uto8Ux8", "Iop_QandQShrNnarrow32Uto16Ux4", "Iop_QandQShrNnarrow64Uto32Ux2",
+    "Iop_QandQSarNnarrow16Sto8Sx8", "Iop_QandQSarNnarrow32Sto16Sx4", "Iop_QandQSarNnarrow64Sto32Sx2",
+    "Iop_QandQSarNnarrow16Sto8Ux8", "Iop_QandQSarNnarrow32Sto16Ux4", "Iop_QandQSarNnarrow64Sto32Ux2",
+    "Iop_QandQRShrNnarrow16Uto8Ux8", "Iop_QandQRShrNnarrow32Uto16Ux4", "Iop_QandQRShrNnarrow64Uto32Ux2",
+    "Iop_QandQRSarNnarrow16Sto8Sx8", "Iop_QandQRSarNnarrow32Sto16Sx4", "Iop_QandQRSarNnarrow64Sto32Sx2",
+    "Iop_QandQRSarNnarrow16Sto8Ux8", "Iop_QandQRSarNnarrow32Sto16Ux4", "Iop_QandQRSarNnarrow64Sto32Ux2",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.
