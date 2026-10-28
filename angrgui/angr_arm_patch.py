@@ -639,6 +639,29 @@ def _op_generic_Fixed32ToF(self, args):
     return _fp_concat(out)
 
 
+def _op_slice64(self, args):
+    """Iop_Slice64 (I64,I64,I8)->I64: EXT. Concatenate arg1(high):arg2(low) and extract the
+    64-bit field starting at byte arg3. arg3==0 -> arg2, arg3==8 -> arg1."""
+    full = claripy.Concat(args[0], args[1])                # 128 bits, arg1 high
+    sh = (args[2][7:0].zero_extend(120)) * claripy.BVV(8, 128)
+    return claripy.LShR(full, sh)[63:0]
+
+
+def _op_pwbitmtx(self, args):
+    """Iop_PwBitMtxXpose64x2: per 64-bit doubleword, transpose the 8x8 bit matrix:
+    result.bit[8*i + j] = src.bit[8*j + i]."""
+    src = args[0]
+    out_dws = []
+    for dw in range(2):
+        base = 64 * dw
+        bits = [None] * 64
+        for i in range(8):
+            for j in range(8):
+                bits[8 * i + j] = claripy.Extract(base + 8 * j + i, base + 8 * j + i, src)
+        out_dws.append(claripy.Concat(*reversed(bits)))    # bit 0 is low
+    return claripy.Concat(out_dws[1], out_dws[0])
+
+
 def _op_generic_FSqrt(self, args):
     """Iop_Sqrt{32,64}Fx<cnt>: vector FSQRT (round to nearest-even)."""
     lw, cnt = int(self._vector_size), int(self._vector_count)
@@ -767,6 +790,8 @@ _SPECIFIC = {
     "Iop_F32ToFixed32Sx2_RZ": _op_generic_F32ToFixed, "Iop_F32ToFixed32Ux2_RZ": _op_generic_F32ToFixed,
     "Iop_Fixed32SToF32x4_RN": _op_generic_Fixed32ToF, "Iop_Fixed32UToF32x4_RN": _op_generic_Fixed32ToF,
     "Iop_Fixed32SToF32x2_RN": _op_generic_Fixed32ToF, "Iop_Fixed32UToF32x2_RN": _op_generic_Fixed32ToF,
+    "Iop_Slice64": _op_slice64,
+    "Iop_PwBitMtxXpose64x2": _op_pwbitmtx,
 }
 _GENERIC = {
     "NarrowUn": _op_generic_NarrowUn,
@@ -895,6 +920,8 @@ _REGISTER = [
     "Iop_QFtoI32Sx4_RZ", "Iop_QFtoI32Ux4_RZ",
     "Iop_F32ToFixed32Sx4_RZ", "Iop_F32ToFixed32Ux4_RZ", "Iop_F32ToFixed32Sx2_RZ", "Iop_F32ToFixed32Ux2_RZ",
     "Iop_Fixed32SToF32x4_RN", "Iop_Fixed32UToF32x4_RN", "Iop_Fixed32SToF32x2_RN", "Iop_Fixed32UToF32x2_RN",
+    # --- misc ---
+    "Iop_Slice64", "Iop_PwBitMtxXpose64x2",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.

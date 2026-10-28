@@ -389,3 +389,32 @@ def test_fixed_point_roundtrip():
     x2f = irop.operations["Iop_Fixed32SToF32x4_RN"]
     got = _lanes(claripy.backends.concrete.eval(x2f._calculate([claripy.BVV(_pack([384, 256, 0, 128], 32), 128), claripy.BVV(8, 8)]), 1)[0], 32, 4)
     assert [_f32(g) for g in got] == [1.5, 1.0, 0.0, 0.5]
+
+
+# ---------------- misc: Slice64 (EXT), PwBitMtxXpose ----------------
+
+def test_slice64_ext():
+    op = "Iop_Slice64"
+    assert op in irop.operations
+    a1, a2 = 0x1122334455667788, 0x99aabbccddeeff00
+    for idx in range(9):
+        got = _ev(op, claripy.BVV(a1, 64), claripy.BVV(a2, 64), claripy.BVV(idx, 8))
+        full = (a1 << 64) | a2
+        assert got == (full >> (idx * 8)) & ((1 << 64) - 1)
+
+
+def test_pwbitmtx_transpose():
+    op = "Iop_PwBitMtxXpose64x2"
+    assert op in irop.operations
+    random.seed(1)
+    for _ in range(200):
+        dws = [random.getrandbits(64) for _ in range(2)]
+        got = _ev(op, claripy.BVV((dws[1] << 64) | dws[0], 128))
+        exp = 0
+        for dw in range(2):
+            v, r = dws[dw], 0
+            for i in range(8):
+                for j in range(8):
+                    r |= ((v >> (8 * j + i)) & 1) << (8 * i + j)
+            exp |= r << (64 * dw)
+        assert got == exp
