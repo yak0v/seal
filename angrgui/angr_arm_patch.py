@@ -639,6 +639,54 @@ def _op_generic_Fixed32ToF(self, args):
     return _fp_concat(out)
 
 
+def _recip_estimate_bv(a9):
+    """ARM RecipEstimate(a), a a 9-bit value in [256,512) -> 9-bit result in [256,512).
+    r = ((2^19 DIV (2a+1)) + 1) DIV 2. Verified vs hardware URECPE."""
+    W = 24
+    a = a9.zero_extend(W - 9)
+    a2 = a * claripy.BVV(2, W) + claripy.BVV(1, W)
+    b = claripy.BVV(1 << 19, W) // a2                   # claripy // is unsigned division
+    return claripy.LShR(b + claripy.BVV(1, W), 1)[8:0]
+
+
+def _recip_sqrt_estimate_bv(a9):
+    """ARM RecipSqrtEstimate(a), a a 9-bit value in [128,512) -> 9-bit result. The spec's
+    `while a*(b+1)^2 < 2^28` search is expressed as a sum of constant-coefficient
+    comparisons (t and t*t are loop constants), so it stays cheap and symbolic. Verified
+    exhaustively vs the hardware-validated model over all 384 inputs."""
+    W = 40
+    a = a9.zero_extend(W - 9)
+    lt256 = claripy.ULT(a, claripy.BVV(256, W))
+    a_t = claripy.If(lt256,
+                     a * claripy.BVV(2, W) + claripy.BVV(1, W),
+                     ((claripy.LShR(a, 1) << 1) + claripy.BVV(1, W)) * claripy.BVV(2, W))
+    acc = claripy.BVV(512, W)
+    thresh = claripy.BVV(1 << 28, W)
+    for t in range(513, 1024):
+        acc = acc + claripy.If(claripy.ULT(a_t * claripy.BVV(t * t, W), thresh), claripy.BVV(1, W), claripy.BVV(0, W))
+    return claripy.LShR(acc + claripy.BVV(1, W), 1)[8:0]
+
+
+def _op_generic_UIntEst(self, args):
+    """Iop_{RecipEst,RSqrtEst}32Ux<cnt>: URECPE / URSQRTE — unsigned integer reciprocal /
+    reciprocal-sqrt estimate. operand is a Q0.32 fixed-point value; the top bit(s) must be
+    set (else the estimate is all-ones). Result = estimate<8:0> : zeros(23)."""
+    rsqrt = "RSqrt" in self.name
+    cnt = int(self._vector_count)
+    out = []
+    for i in range(cnt):
+        x = args[0][32 * i + 31:32 * i]
+        if rsqrt:
+            guard = claripy.Extract(31, 30, x) == 0            # <31:30> == 00 -> all-ones
+            est = _recip_sqrt_estimate_bv(x[31:23])
+        else:
+            guard = claripy.Extract(31, 31, x) == 0            # <31> == 0 -> all-ones
+            est = _recip_estimate_bv(x[31:23])
+        res = claripy.Concat(est, claripy.BVV(0, 23))          # 9-bit estimate in the top, rest 0
+        out.append(claripy.If(guard, claripy.BVV(0xFFFFFFFF, 32), res))
+    return _fp_concat(out)
+
+
 def _op_slice64(self, args):
     """Iop_Slice64 (I64,I64,I8)->I64: EXT. Concatenate arg1(high):arg2(low) and extract the
     64-bit field starting at byte arg3. arg3==0 -> arg2, arg3==8 -> arg1."""
@@ -792,6 +840,8 @@ _SPECIFIC = {
     "Iop_Fixed32SToF32x2_RN": _op_generic_Fixed32ToF, "Iop_Fixed32UToF32x2_RN": _op_generic_Fixed32ToF,
     "Iop_Slice64": _op_slice64,
     "Iop_PwBitMtxXpose64x2": _op_pwbitmtx,
+    "Iop_RecipEst32Ux2": _op_generic_UIntEst, "Iop_RecipEst32Ux4": _op_generic_UIntEst,
+    "Iop_RSqrtEst32Ux2": _op_generic_UIntEst, "Iop_RSqrtEst32Ux4": _op_generic_UIntEst,
 }
 _GENERIC = {
     "NarrowUn": _op_generic_NarrowUn,
@@ -922,6 +972,8 @@ _REGISTER = [
     "Iop_Fixed32SToF32x4_RN", "Iop_Fixed32UToF32x4_RN", "Iop_Fixed32SToF32x2_RN", "Iop_Fixed32UToF32x2_RN",
     # --- misc ---
     "Iop_Slice64", "Iop_PwBitMtxXpose64x2",
+    # --- integer reciprocal / rsqrt estimate (URECPE / URSQRTE) ---
+    "Iop_RecipEst32Ux2", "Iop_RecipEst32Ux4", "Iop_RSqrtEst32Ux2", "Iop_RSqrtEst32Ux4",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.

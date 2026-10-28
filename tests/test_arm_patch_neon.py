@@ -418,3 +418,45 @@ def test_pwbitmtx_transpose():
                     r |= ((v >> (8 * j + i)) & 1) << (8 * i + j)
             exp |= r << (64 * dw)
         assert got == exp
+
+
+# ---------------- integer reciprocal / rsqrt estimate (URECPE / URSQRTE) ----------------
+
+def _recip_estimate(a):
+    a = a * 2 + 1
+    return ((1 << 19) // a + 1) // 2
+
+
+def _recip_sqrt_estimate(a):
+    if a < 256:
+        a = a * 2 + 1
+    else:
+        a = (a >> 1) << 1
+        a = (a + 1) * 2
+    b = 512
+    while a * (b + 1) * (b + 1) < (1 << 28):
+        b += 1
+    return (b + 1) // 2
+
+
+def test_uint_recip_estimate():
+    for name in ("Iop_RecipEst32Ux4", "Iop_RSqrtEst32Ux4"):
+        assert name in irop.operations
+    rc, rs = irop.operations["Iop_RecipEst32Ux4"], irop.operations["Iop_RSqrtEst32Ux4"]
+
+    def urecpe(op):
+        return 0xffffffff if not (op >> 31) & 1 else ((_recip_estimate((op >> 23) & 0x1ff) & 0x1ff) << 23)
+
+    def ursqrte(op):
+        return 0xffffffff if (op >> 30) == 0 else ((_recip_sqrt_estimate((op >> 23) & 0x1ff) & 0x1ff) << 23)
+
+    random.seed(0)
+    tests = [(top << 23) | random.getrandbits(23) for top in range(512)] + \
+            [random.getrandbits(32) for _ in range(400)] + [0, 0x80000000, 0x40000000, 0xffffffff]
+    for k in range(0, len(tests), 4):
+        grp = (tests[k:k + 4] + [0, 0, 0, 0])[:4]
+        bv = claripy.BVV(_pack(grp, 32), 128)
+        gotc = _lanes(claripy.backends.concrete.eval(rc._calculate([bv]), 1)[0], 32, 4)
+        gots = _lanes(claripy.backends.concrete.eval(rs._calculate([bv]), 1)[0], 32, 4)
+        assert gotc == [urecpe(x) for x in grp]
+        assert gots == [ursqrte(x) for x in grp]
