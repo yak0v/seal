@@ -651,20 +651,96 @@ def _recip_estimate_bv(a9):
 
 def _recip_sqrt_estimate_bv(a9):
     """ARM RecipSqrtEstimate(a), a a 9-bit value in [128,512) -> 9-bit result. The spec's
-    `while a*(b+1)^2 < 2^28` search is expressed as a sum of constant-coefficient
-    comparisons (t and t*t are loop constants), so it stays cheap and symbolic. Verified
-    exhaustively vs the hardware-validated model over all 384 inputs."""
+    `b=512; while a*(b+1)^2 < 2^28: b+=1` loop is monotonic in b, so it's done as a 9-bit
+    binary search (greedy high-to-low bit set) — a small AST that stays cheap and symbolic.
+    Verified exhaustively vs the hardware-validated model over all 384 inputs."""
     W = 40
     a = a9.zero_extend(W - 9)
     lt256 = claripy.ULT(a, claripy.BVV(256, W))
     a_t = claripy.If(lt256,
                      a * claripy.BVV(2, W) + claripy.BVV(1, W),
                      ((claripy.LShR(a, 1) << 1) + claripy.BVV(1, W)) * claripy.BVV(2, W))
-    acc = claripy.BVV(512, W)
     thresh = claripy.BVV(1 << 28, W)
-    for t in range(513, 1024):
-        acc = acc + claripy.If(claripy.ULT(a_t * claripy.BVV(t * t, W), thresh), claripy.BVV(1, W), claripy.BVV(0, W))
-    return claripy.LShR(acc + claripy.BVV(1, W), 1)[8:0]
+    # the loop stops at the largest b>=512 with a*b^2 < 2^28 (it increments while the NEXT
+    # value still passes, leaving b itself passing); find it by greedy high-to-low bit set.
+    b = claripy.BVV(512, W)                                    # final b in [512,1023]
+    for k in range(8, -1, -1):
+        cand = b + claripy.BVV(1 << k, W)
+        passes = claripy.ULE(cand, claripy.BVV(1023, W)) & claripy.ULT(a_t * cand * cand, thresh)
+        b = claripy.If(passes, cand, b)
+    return claripy.LShR(b + claripy.BVV(1, W), 1)[8:0]
+
+
+def _fp32_estimate_lane(x, rsqrt):
+    """One f32 lane of FRECPE (rsqrt=False) / FRSQRTE (rsqrt=True). Ports the models that
+    were validated bit-exact vs native hardware over ~7000 inputs (all exponents, heavy
+    denormals, specials). Denormal inputs are normalized (FPCR.FZ=0 semantics)."""
+    EW = 16                                                   # signed working width for exponents
+    s = claripy.Extract(31, 31, x)
+    E = claripy.Extract(30, 23, x)
+    F = claripy.Extract(22, 0, x)
+    e_is_255 = E == claripy.BVV(255, 8)
+    e_is_0 = E == claripy.BVV(0, 8)
+    f_zero = F == claripy.BVV(0, 23)
+    neg = s == claripy.BVV(1, 1)
+    qnan = claripy.BVV(0x7FC00000, 32)
+    sbit = s.zero_extend(31) << 31
+
+    # --- denormal normalization (E==0, F!=0): E_eff = -clz(F), F_eff = F << (clz+1) ---
+    lz = _clz(F, 23)                                          # 0..22 (F!=0 in this branch)
+    lzp1 = (lz + claripy.BVV(1, 23))
+    F_norm = (F << lzp1)[22:0]
+    lz16 = lz[EW - 1:0]                                        # lz <= 22, fits
+    E_eff = claripy.If(e_is_0, claripy.BVV(0, EW) - lz16, E.zero_extend(EW - 8))
+    F_eff = claripy.If(e_is_0, F_norm, F)
+    top8 = lambda bv, sh: claripy.LShR(bv, sh)[7:0].zero_extend(8)   # top 8 bits of a lane as 16-bit
+
+    if not rsqrt:
+        a = claripy.BVV(256, 16) + top8(F_eff, 15)           # 256 + (F>>15)
+        est = _recip_estimate_bv(a[8:0])                     # 9-bit -> take low 8
+        rexp = claripy.BVV(253, EW) - E_eff                  # signed
+        frac_norm = (est[7:0].zero_extend(24) << 15)         # 32-bit
+        normal = sbit | (rexp[7:0].zero_extend(24) << 23) | frac_norm
+        frac_full = (claripy.BVV(1 << 23, 32) | (est[7:0].zero_extend(24) << 15))
+        shift = (claripy.BVV(1, EW) - rexp)                  # 1 or 2 (rexp 0 or -1)
+        denU = sbit | claripy.LShR(frac_full, shift[4:0].zero_extend(27))
+        over = claripy.SGT(rexp, claripy.BVV(254, EW))
+        main = claripy.If(over, sbit | claripy.BVV(0x7F800000, 32),
+                          claripy.If(claripy.SGE(rexp, claripy.BVV(1, EW)), normal, denU))
+        # specials
+        res = claripy.If(e_is_255, claripy.If(f_zero, sbit, qnan),
+                         claripy.If(e_is_0 & f_zero, sbit | claripy.BVV(0x7F800000, 32), main))
+        return res
+    else:
+        parity = claripy.Extract(0, 0, E_eff) == 1
+        a = claripy.If(parity,
+                       claripy.BVV(128, 16) + top8(F_eff, 16),      # odd: 128 + (F>>16)
+                       claripy.BVV(256, 16) + top8(F_eff, 15))      # even: 256 + (F>>15)
+        est = _recip_sqrt_estimate_bv(a[8:0])
+        rexp = claripy.LShR(claripy.BVV(380, EW) - E_eff, 1)
+        normal = (rexp[7:0].zero_extend(24) << 23) | (est[7:0].zero_extend(24) << 15)
+        pinf, ninf = claripy.BVV(0x7F800000, 32), claripy.BVV(0xFF800000, 32)
+        res = claripy.If(e_is_255, claripy.If(f_zero, claripy.If(neg, qnan, claripy.BVV(0, 32)), qnan),
+                         claripy.If(e_is_0 & f_zero, claripy.If(neg, ninf, pinf),
+                                    claripy.If(neg, qnan, normal)))
+        return res
+
+
+def _op_generic_FPEst(self, args):
+    """Iop_RecipEst32F*/RSqrtEst32F*: FRECPE / FRSQRTE. The F0x4 form is scalar — only lane
+    0 is computed, the upper lanes pass through from the operand."""
+    rsqrt = "RSqrt" in self.name
+    scalar = "F0x" in self.name
+    cnt = int(self._vector_count)
+    x = args[0]
+    out = []
+    for i in range(cnt):
+        lane = x[32 * i + 31:32 * i]
+        if scalar and i > 0:
+            out.append(lane)                                 # pass-through upper lanes
+        else:
+            out.append(_fp32_estimate_lane(lane, rsqrt))
+    return _fp_concat(out)
 
 
 def _op_generic_UIntEst(self, args):
@@ -842,6 +918,9 @@ _SPECIFIC = {
     "Iop_PwBitMtxXpose64x2": _op_pwbitmtx,
     "Iop_RecipEst32Ux2": _op_generic_UIntEst, "Iop_RecipEst32Ux4": _op_generic_UIntEst,
     "Iop_RSqrtEst32Ux2": _op_generic_UIntEst, "Iop_RSqrtEst32Ux4": _op_generic_UIntEst,
+    "Iop_RecipEst32Fx2": _op_generic_FPEst, "Iop_RecipEst32Fx4": _op_generic_FPEst,
+    "Iop_RecipEst32Fx8": _op_generic_FPEst,
+    "Iop_RSqrtEst32Fx2": _op_generic_FPEst, "Iop_RSqrtEst32Fx4": _op_generic_FPEst,
 }
 _GENERIC = {
     "NarrowUn": _op_generic_NarrowUn,
@@ -974,6 +1053,9 @@ _REGISTER = [
     "Iop_Slice64", "Iop_PwBitMtxXpose64x2",
     # --- integer reciprocal / rsqrt estimate (URECPE / URSQRTE) ---
     "Iop_RecipEst32Ux2", "Iop_RecipEst32Ux4", "Iop_RSqrtEst32Ux2", "Iop_RSqrtEst32Ux4",
+    # --- FP reciprocal / rsqrt estimate (FRECPE / FRSQRTE) ---
+    "Iop_RecipEst32Fx2", "Iop_RecipEst32Fx4", "Iop_RecipEst32Fx8",
+    "Iop_RSqrtEst32Fx2", "Iop_RSqrtEst32Fx4",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.
@@ -1173,7 +1255,15 @@ def apply() -> dict:
             if attrs is None:
                 status[nm] = "unparseable (no explicit attrs)"
                 continue
-            irop.operations[nm] = SimIROp(nm, **attrs)
+            op = SimIROp(nm, **attrs)
+            # FORCE our implementation: patched_init only installs on UnsupportedIROpError,
+            # but angr "supports" some of these with a broken default (e.g. a symbolic
+            # placeholder for RSqrtEst), so orig_init doesn't raise and our handler would be
+            # skipped. Since _REGISTER lists only ops we implement, install ours outright.
+            fn = _SPECIFIC.get(nm) or _GENERIC.get(getattr(op, "_generic_name", None))
+            if fn is not None:
+                op._calculate = types.MethodType(fn, op)
+            irop.operations[nm] = op
             status[nm] = "ok"
         except Exception as e:                       # noqa: BLE001 - report, don't crash import
             status[nm] = f"{type(e).__name__}: {e}"

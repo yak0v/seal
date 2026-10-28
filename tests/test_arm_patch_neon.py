@@ -460,3 +460,71 @@ def test_uint_recip_estimate():
         gots = _lanes(claripy.backends.concrete.eval(rs._calculate([bv]), 1)[0], 32, 4)
         assert gotc == [urecpe(x) for x in grp]
         assert gots == [ursqrte(x) for x in grp]
+
+
+# ---------------- FP reciprocal / rsqrt estimate (FRECPE / FRSQRTE) ----------------
+
+def _frecpe(op):
+    s = (op >> 31) & 1; E = (op >> 23) & 0xff; F = op & 0x7fffff
+    if E == 255:
+        return 0x7fc00000 if F else (s << 31)
+    if E == 0 and F == 0:
+        return (s << 31) | 0x7f800000
+    if E == 0:
+        lz = 0
+        while not (F >> (22 - lz)) & 1:
+            lz += 1
+        E = -lz
+        F = (F << (lz + 1)) & 0x7fffff
+    rexp = 253 - E
+    a = 256 + (F >> 15)
+    est = _recip_estimate(a) & 0xff
+    if rexp > 254:
+        return (s << 31) | 0x7f800000
+    if rexp >= 1:
+        return (s << 31) | (rexp << 23) | (est << 15)
+    return (s << 31) | (((1 << 23) | (est << 15)) >> (1 - rexp))
+
+
+def _frsqrte(op):
+    s = (op >> 31) & 1; E = (op >> 23) & 0xff; F = op & 0x7fffff
+    if E == 255:
+        return 0x7fc00000 if F else (0 if s == 0 else 0x7fc00000)
+    if E == 0 and F == 0:
+        return 0x7f800000 if s == 0 else 0xff800000
+    if s == 1:
+        return 0x7fc00000
+    if E == 0:
+        lz = 0
+        while not (F >> (22 - lz)) & 1:
+            lz += 1
+        E = -lz
+        F = (F << (lz + 1)) & 0x7fffff
+    a = (128 + (F >> 16)) if (E & 1) else (256 + (F >> 15))
+    est = _recip_sqrt_estimate(a) & 0xff
+    return (((380 - E) // 2) << 23) | (est << 15)
+
+
+def _isnan32(x):
+    return ((x >> 23) & 0xff) == 255 and (x & 0x7fffff) != 0
+
+
+def test_fp_recip_rsqrt_estimate():
+    rc, rs = irop.operations["Iop_RecipEst32Fx4"], irop.operations["Iop_RSqrtEst32Fx4"]
+    random.seed(0)
+    tests = []
+    for E in range(256):
+        for _ in range(4):
+            tests.append((E << 23) | random.getrandbits(23) | (random.randint(0, 1) << 31))
+    for _ in range(300):
+        tests.append(random.getrandbits(23) | (random.randint(0, 1) << 31))     # denormals
+    tests += [0, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000, 0xbf800000, 0x3f800000, 0x40000000, 1, 0x7fffff]
+    for k in range(0, len(tests), 4):
+        grp = (tests[k:k + 4] + [0, 0, 0, 0])[:4]
+        bv = claripy.BVV(_pack(grp, 32), 128)
+        gc = _lanes(claripy.backends.concrete.eval(rc._calculate([bv]), 1)[0], 32, 4)
+        gs = _lanes(claripy.backends.concrete.eval(rs._calculate([bv]), 1)[0], 32, 4)
+        for i, x in enumerate(grp):
+            ec, es = _frecpe(x), _frsqrte(x)
+            assert gc[i] == ec or (_isnan32(gc[i]) and _isnan32(ec)), f"FRECPE {hex(x)} {hex(gc[i])} != {hex(ec)}"
+            assert gs[i] == es or (_isnan32(gs[i]) and _isnan32(es)), f"FRSQRTE {hex(x)} {hex(gs[i])} != {hex(es)}"
