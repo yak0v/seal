@@ -34,6 +34,8 @@ IMPLEMENTED IR OPS  (determined by scanning the whole CoreGraphics .text; keep i
                       (SQXTN/UQXTN/SQXTUN: saturating narrow each lane)
 * ZeroHI    family  — Iop_ZeroHI64ofV128 / 96 / 112  (keep low bits, zero the top)
 * Reverse   family  — Iop_Reverse8sIn16_x8 / In32_x4 / In64_x2  (REV16/32/64: byte-swap in lane)
+* Sh        family  — Iop_Sh{8,16,32,64}{S,U}x{16,8,4,2}  (SSHL/USHL: per-lane VARIABLE shift,
+                      amount = signed low byte per lane; non-saturating, non-rounding)
 * Iop_SqrtF64       — scalar double sqrt (claripy.fpSqrt)
 
 OVERRIDES of angr ops that it HAS but computes wrongly on symbolic input:
@@ -51,9 +53,9 @@ of CoreGraphics shows only these remain, all rare (x1-x6, in codec/colour math,
 not the glyph-geometry path):
 
     Iop_QandQSarNnarrow* / QandQRShrNnarrow* / QandQShrNnarrow*  (SQSHRN/UQRSHRN: shift+saturate+narrow, sets QC)
-    Iop_Sh32Sx4 / Sh32Ux4        (SSHL/USHL: per-lane variable shift)
-    Iop_Rsh16Ux8                 (URSHR: rounding shift right)
-    Iop_QShlNsatSS64x2           (SQSHL #imm: saturating left shift)
+    Iop_Rsh16Ux8                 (URSHR: ROUNDING shift right)
+    Iop_QShlNsatSS64x2           (SQSHL #imm: SATURATING left shift)
+    (the plain, non-rounding, non-saturating Sh*/USHL/SSHL family is now IMPLEMENTED above)
 
 If an analyzed path hits one, add a validated handler here (same pattern as the
 others). Also: libVEX cannot decode LSE atomics (ldadd/cas/ldapr) or `udf`; hook
@@ -167,6 +169,37 @@ def _op_reverse(self, args):
     return out
 
 
+def _op_generic_Sh(self, args):
+    """Iop_Sh<lw><S|U>x<cnt>: ARM SSHL/USHL — per-lane VARIABLE shift. For each lane the
+    shift amount is the SIGNED low byte of the corresponding lane of args[1]: >=0 shifts
+    LEFT, <0 shifts RIGHT (logical for U, arithmetic for S). A magnitude >= the lane width
+    yields 0 (left/logical) or the sign bit (arithmetic) — ARM's defined behaviour.
+
+    NON-saturating and NON-rounding; the rounding (Rsh) and saturating (Qsh/QandQ) shift
+    families are still deliberate gaps. Verified bit-exact vs an independent ARM reference
+    over 2000 vectors (all lane widths, both signs, edge shift amounts).
+
+    The shift magnitude is CAPPED at the lane width before it reaches claripy's shift ops:
+    the concrete backend evaluates both If-branches with a real Python bigint shift, so a
+    sign-extended negative amount (~2^lw) would blow up — capping keeps it correct and finite."""
+    m = re.search(r"Sh(\d+)([SU])x(\d+)", self.name)
+    lw, sign, cnt = int(m.group(1)), m.group(2), int(m.group(3))
+    data, amt = args[0], args[1]
+    lwbv = claripy.BVV(lw, lw)
+    out = None
+    for i in range(cnt):
+        lane = data[lw * i + lw - 1: lw * i]
+        sh8 = amt[lw * i + 7: lw * i]                              # signed shift, low byte of the lane
+        negative = claripy.Extract(7, 7, sh8) == 1                 # sign bit set => shift right
+        mag8 = claripy.If(negative, claripy.BVV(0, 8) - sh8, sh8)  # |shift| in 8 bits (0..128)
+        mag = mag8.zero_extend(lw - 8)
+        magc = claripy.If(claripy.UGE(mag, lwbv), lwbv, mag)       # cap at lane width
+        right = claripy.LShR(lane, magc) if sign == "U" else (lane >> magc)
+        res = claripy.If(negative, right, lane << magc)
+        out = res if out is None else claripy.Concat(res, out)
+    return out
+
+
 def _op_fgeneric_Sqrt(self, args):
     """FP square root. Handles BOTH call shapes: angr calls a scalar op as
     _calculate([x]) (args is a list), and _auto_vectorize calls the per-lane function as
@@ -193,6 +226,7 @@ _SPECIFIC = {
 _GENERIC = {
     "NarrowUn": _op_generic_NarrowUn,
     "QNarrowUn": _op_generic_QNarrowUn,
+    "Sh": _op_generic_Sh,                  # SSHL/USHL per-lane variable shift (all lane widths)
 }
 
 # ops to proactively (re)register into the operations table
@@ -205,6 +239,9 @@ _REGISTER = [
     "Iop_Reverse8sIn16_x8", "Iop_Reverse8sIn32_x4", "Iop_Reverse8sIn64_x2",
     "Iop_Reverse16sIn32_x4", "Iop_Reverse16sIn64_x2", "Iop_Reverse32sIn64_x2",
     "Iop_SqrtF64", "Iop_SqrtF32",
+    # SSHL/USHL — per-lane variable shift (generic_name "Sh"), all NEON lane layouts
+    "Iop_Sh8Sx16", "Iop_Sh16Sx8", "Iop_Sh32Sx4", "Iop_Sh64Sx2",
+    "Iop_Sh8Ux16", "Iop_Sh16Ux8", "Iop_Sh32Ux4", "Iop_Sh64Ux2",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.
