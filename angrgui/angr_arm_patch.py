@@ -570,6 +570,75 @@ def _fminnum(a, b):
     return claripy.If(claripy.fpIsNaN(a), b, claripy.If(claripy.fpIsNaN(b), a, claripy.If(claripy.fpLT(a, b), a, b)))
 
 
+def _fp_to_int_sat(f, bits, signed, rm, sort):
+    """FCVTZS/FCVTZU-style convert with ARM saturation: NaN -> 0, out-of-range -> the range
+    end. claripy's fpToSBV/UBV CRASH (not clamp) on an out-of-range value, and the concrete
+    backend evaluates both If-branches eagerly, so the value handed to the converter must be
+    pre-clamped into range; the saturated ends are selected separately."""
+    if signed:
+        hi, lo = (1 << (bits - 1)) - 1, -(1 << (bits - 1))
+    else:
+        hi, lo = (1 << bits) - 1, 0
+    hi_f = claripy.FPV(float(hi + 1), sort)        # first float at/above the top of range (a power of two -> exact)
+    lo_f = claripy.FPV(float(lo), sort)
+    over = claripy.fpGEQ(f, hi_f)
+    under = claripy.fpLT(f, lo_f)
+    nan = claripy.fpIsNaN(f)
+    safe = claripy.If(nan | over | under, claripy.FPV(0.0, sort), f)   # always in range for the converter
+    conv = claripy.fpToSBV(rm, safe, bits) if signed else claripy.fpToUBV(rm, safe, bits)
+    res = claripy.If(over, claripy.BVV(hi & ((1 << bits) - 1), bits),
+                     claripy.If(under, claripy.BVV(lo & ((1 << bits) - 1), bits), conv))
+    return claripy.If(nan, claripy.BVV(0, bits), res)
+
+
+def _op_generic_IntToFP(self, args):
+    """Iop_I32{S,U}toFx<cnt>: SCVTF/UCVTF — per-lane 32-bit int -> f32 (round to nearest)."""
+    m = re.search(r"I32([SU])toFx(\d+)", self.name)
+    signed, cnt = m.group(1) == "S", int(m.group(2))
+    rm = claripy.fp.RM.RM_NearestTiesEven
+    conv = (lambda bv: claripy.fpToFP(rm, bv, claripy.FSORT_FLOAT)) if signed \
+        else (lambda bv: claripy.fpToFPUnsigned(rm, bv, claripy.FSORT_FLOAT))
+    x = args[0]
+    return _fp_concat([conv(x[(i + 1) * 32 - 1:i * 32]).raw_to_bv() for i in range(cnt)])
+
+
+def _op_generic_QFtoI(self, args):
+    """Iop_QFtoI32{S,U}x<cnt>_RZ: FCVTZS/FCVTZU — saturating f32 -> int32, round to zero."""
+    m = re.search(r"QFtoI32([SU])x(\d+)_RZ", self.name)
+    signed, cnt = m.group(1) == "S", int(m.group(2))
+    rm = claripy.fp.RM.RM_TowardsZero
+    x = args[0]
+    out = [_fp_to_int_sat(_fp_lane(x, 32, i), 32, signed, rm, claripy.FSORT_FLOAT) for i in range(cnt)]
+    return _fp_concat(out)
+
+
+def _op_generic_F32ToFixed(self, args):
+    """Iop_F32ToFixed32{S,U}x<cnt>_RZ: f32 -> 32-bit fixed-point (round to zero, saturating).
+    The I8 second arg is the number of fraction bits: result = sat_int32(RZ(f * 2^fbits))."""
+    m = re.search(r"F32ToFixed32([SU])x(\d+)_RZ", self.name)
+    signed, cnt = m.group(1) == "S", int(m.group(2))
+    rm = claripy.fp.RM.RM_TowardsZero
+    scale = claripy.fpToFP(rm, (claripy.BVV(1, 64) << args[1][7:0].zero_extend(56)), claripy.FSORT_FLOAT)
+    x = args[0]
+    out = [_fp_to_int_sat(claripy.fpMul(rm, _fp_lane(x, 32, i), scale), 32, signed, rm, claripy.FSORT_FLOAT)
+           for i in range(cnt)]
+    return _fp_concat(out)
+
+
+def _op_generic_Fixed32ToF(self, args):
+    """Iop_Fixed32{S,U}ToF32x<cnt>_RN: 32-bit fixed-point -> f32 (round to nearest).
+    result = (int / 2^fbits), fbits = I8 second arg."""
+    m = re.search(r"Fixed32([SU])ToF32x(\d+)_RN", self.name)
+    signed, cnt = m.group(1) == "S", int(m.group(2))
+    rm = claripy.fp.RM.RM_NearestTiesEven
+    scale = claripy.fpToFP(rm, (claripy.BVV(1, 64) << args[1][7:0].zero_extend(56)), claripy.FSORT_FLOAT)
+    conv = (lambda bv: claripy.fpToFP(rm, bv, claripy.FSORT_FLOAT)) if signed \
+        else (lambda bv: claripy.fpToFPUnsigned(rm, bv, claripy.FSORT_FLOAT))
+    x = args[0]
+    out = [claripy.fpDiv(rm, conv(x[(i + 1) * 32 - 1:i * 32]), scale).raw_to_bv() for i in range(cnt)]
+    return _fp_concat(out)
+
+
 def _op_generic_FSqrt(self, args):
     """Iop_Sqrt{32,64}Fx<cnt>: vector FSQRT (round to nearest-even)."""
     lw, cnt = int(self._vector_size), int(self._vector_count)
@@ -690,6 +759,14 @@ _SPECIFIC = {
     "Iop_Reverse16sIn32_x2": _op_reverse,
     "Iop_Reverse16sIn64_x1": _op_reverse,
     "Iop_Reverse32sIn64_x1": _op_reverse,
+    # FP conversions (kept out of _GENERIC: 'Q'/None generic names would collide / fail)
+    "Iop_I32StoFx4": _op_generic_IntToFP, "Iop_I32UtoFx4": _op_generic_IntToFP,
+    "Iop_I32StoFx2": _op_generic_IntToFP, "Iop_I32UtoFx2": _op_generic_IntToFP,
+    "Iop_QFtoI32Sx4_RZ": _op_generic_QFtoI, "Iop_QFtoI32Ux4_RZ": _op_generic_QFtoI,
+    "Iop_F32ToFixed32Sx4_RZ": _op_generic_F32ToFixed, "Iop_F32ToFixed32Ux4_RZ": _op_generic_F32ToFixed,
+    "Iop_F32ToFixed32Sx2_RZ": _op_generic_F32ToFixed, "Iop_F32ToFixed32Ux2_RZ": _op_generic_F32ToFixed,
+    "Iop_Fixed32SToF32x4_RN": _op_generic_Fixed32ToF, "Iop_Fixed32UToF32x4_RN": _op_generic_Fixed32ToF,
+    "Iop_Fixed32SToF32x2_RN": _op_generic_Fixed32ToF, "Iop_Fixed32UToF32x2_RN": _op_generic_Fixed32ToF,
 }
 _GENERIC = {
     "NarrowUn": _op_generic_NarrowUn,
@@ -813,6 +890,11 @@ _REGISTER = [
     "Iop_RSqrtStep32Fx2", "Iop_RSqrtStep32Fx4", "Iop_RSqrtStep64Fx2",
     "Iop_MaxNumF32", "Iop_MaxNumF64", "Iop_MinNumF32", "Iop_MinNumF64",
     "Iop_PwAdd32Fx2", "Iop_PwMax32Fx2", "Iop_PwMin32Fx2", "Iop_PwMax32Fx4", "Iop_PwMin32Fx4",
+    # --- NEON FP conversions ---
+    "Iop_I32StoFx4", "Iop_I32UtoFx4", "Iop_I32StoFx2", "Iop_I32UtoFx2",
+    "Iop_QFtoI32Sx4_RZ", "Iop_QFtoI32Ux4_RZ",
+    "Iop_F32ToFixed32Sx4_RZ", "Iop_F32ToFixed32Ux4_RZ", "Iop_F32ToFixed32Sx2_RZ", "Iop_F32ToFixed32Ux2_RZ",
+    "Iop_Fixed32SToF32x4_RN", "Iop_Fixed32UToF32x4_RN", "Iop_Fixed32SToF32x2_RN", "Iop_Fixed32UToF32x2_RN",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.
@@ -846,6 +928,16 @@ _EXPLICIT_ATTRS = {
     "Iop_Reverse16sIn32_x2": _explicit(generic_name="Reverse16sIn32"),
     "Iop_Reverse16sIn64_x1": _explicit(generic_name="Reverse16sIn64"),
     "Iop_Reverse32sIn64_x1": _explicit(generic_name="Reverse32sIn64"),
+    "Iop_I32StoFx4": _explicit(generic_name="I32StoFx4"), "Iop_I32UtoFx4": _explicit(generic_name="I32UtoFx4"),
+    "Iop_I32StoFx2": _explicit(generic_name="I32StoFx2"), "Iop_I32UtoFx2": _explicit(generic_name="I32UtoFx2"),
+    "Iop_F32ToFixed32Sx4_RZ": _explicit(generic_name="F32ToFixed32Sx4_RZ"),
+    "Iop_F32ToFixed32Ux4_RZ": _explicit(generic_name="F32ToFixed32Ux4_RZ"),
+    "Iop_F32ToFixed32Sx2_RZ": _explicit(generic_name="F32ToFixed32Sx2_RZ"),
+    "Iop_F32ToFixed32Ux2_RZ": _explicit(generic_name="F32ToFixed32Ux2_RZ"),
+    "Iop_Fixed32SToF32x4_RN": _explicit(generic_name="Fixed32SToF32x4_RN"),
+    "Iop_Fixed32UToF32x4_RN": _explicit(generic_name="Fixed32UToF32x4_RN"),
+    "Iop_Fixed32SToF32x2_RN": _explicit(generic_name="Fixed32SToF32x2_RN"),
+    "Iop_Fixed32UToF32x2_RN": _explicit(generic_name="Fixed32UToF32x2_RN"),
 }
 
 _applied = False

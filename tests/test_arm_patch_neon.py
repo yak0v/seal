@@ -354,3 +354,38 @@ def test_fp_pairwise():
     b = claripy.BVV(_pack([_f32b(3.0), _f32b(4.0)], 32), 64)
     got = _lanes(claripy.backends.concrete.eval(pa._calculate([a, b]), 1)[0], 32, 2)
     assert abs(_f32(got[0]) - 3.0) < 1e-6 and abs(_f32(got[1]) - 7.0) < 1e-6
+
+
+# ---------------- NEON FP conversions ----------------
+
+def test_int_to_float():
+    s = irop.operations["Iop_I32StoFx4"]
+    got = _lanes(claripy.backends.concrete.eval(s._calculate([claripy.BVV(_pack([5, (-5) & 0xffffffff, 0, 100], 32), 128)]), 1)[0], 32, 4)
+    assert [_f32(g) for g in got] == [5.0, -5.0, 0.0, 100.0]
+    u = irop.operations["Iop_I32UtoFx4"]
+    got = _lanes(claripy.backends.concrete.eval(u._calculate([claripy.BVV(_pack([0xffffffff, 1, 0, 2], 32), 128)]), 1)[0], 32, 4)
+    assert _f32(got[0]) == 4294967296.0 and _f32(got[1]) == 1.0
+
+
+def test_float_to_int_saturating():
+    s = irop.operations["Iop_QFtoI32Sx4_RZ"]
+    inp = [_f32b(3.9), _f32b(-3.9), _f32b(1e30), _f32b(float("nan"))]
+    got = _lanes(claripy.backends.concrete.eval(s._calculate([claripy.BVV(_pack(inp, 32), 128)]), 1)[0], 32, 4)
+    assert got[0] == 3                              # round toward zero
+    assert got[1] == (-3) & 0xffffffff
+    assert got[2] == 0x7fffffff                     # saturate to INT_MAX
+    assert got[3] == 0                              # NaN -> 0
+    u = irop.operations["Iop_QFtoI32Ux4_RZ"]
+    inp = [_f32b(2.5), _f32b(-1.0), _f32b(1e30), _f32b(5.0)]
+    got = _lanes(claripy.backends.concrete.eval(u._calculate([claripy.BVV(_pack(inp, 32), 128)]), 1)[0], 32, 4)
+    assert got == [2, 0, 0xffffffff, 5]             # neg -> 0, overflow -> UINT_MAX
+
+
+def test_fixed_point_roundtrip():
+    f2x = irop.operations["Iop_F32ToFixed32Sx4_RZ"]
+    # 1.5 with 8 fraction bits -> 1.5 * 256 = 384
+    got = _lanes(claripy.backends.concrete.eval(f2x._calculate([claripy.BVV(_pack([_f32b(1.5), _f32b(-2.0), _f32b(0.0), _f32b(1.0)], 32), 128), claripy.BVV(8, 8)]), 1)[0], 32, 4)
+    assert got[0] == 384 and got[1] == ((-512) & 0xffffffff) and got[3] == 256
+    x2f = irop.operations["Iop_Fixed32SToF32x4_RN"]
+    got = _lanes(claripy.backends.concrete.eval(x2f._calculate([claripy.BVV(_pack([384, 256, 0, 128], 32), 128), claripy.BVV(8, 8)]), 1)[0], 32, 4)
+    assert [_f32(g) for g in got] == [1.5, 1.0, 0.0, 0.5]
