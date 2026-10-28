@@ -516,6 +516,29 @@ def _op_generic_PolynomialMull(self, args):
     return _concat_lanes([_poly_mul(a[i], b[i], lw, lw)[2 * lw - 1:0] for i in range(cnt)])
 
 
+def _op_generic_QAddExt(self, args):
+    """Iop_QAddExt{US,SU}sat{SS,UU}<lw>x<cnt>: ARM64 SUQADD / USQADD. The first two letters
+    give how the left/right args are widened before the add; the sat letters give the output
+    saturation. US+SS (SUQADD): sat_s(zext(L) + sext(R)). SU+UU (USQADD): sat_u(sext(L) +
+    zext(R))."""
+    m = re.search(r"QAddExt([US])([US])sat([SU])([SU])(\d+)x(\d+)", self.name)
+    lsig, rsig, ssig, lw, cnt = m.group(1) == "S", m.group(2) == "S", m.group(3) == "S", int(m.group(5)), int(m.group(6))
+    W = lw + 2
+    a, b = _lanes(args[0], lw, cnt), _lanes(args[1], lw, cnt)
+    if ssig:
+        hi, lo = claripy.BVV((1 << (lw - 1)) - 1, W), claripy.BVV((-(1 << (lw - 1))) & ((1 << W) - 1), W)
+    else:
+        hi, lo = claripy.BVV((1 << lw) - 1, W), claripy.BVV(0, W)
+    out = []
+    for i in range(cnt):
+        la = a[i].sign_extend(W - lw) if lsig else a[i].zero_extend(W - lw)
+        rb = b[i].sign_extend(W - lw) if rsig else b[i].zero_extend(W - lw)
+        s = la + rb
+        c = claripy.If(claripy.SGT(s, hi), hi, claripy.If(claripy.SLT(s, lo), lo, s))
+        out.append(c[lw - 1:0])
+    return _concat_lanes(out)
+
+
 def _op_generic_PwFP(self, args):
     """FP pairwise (PwAdd/PwMax/PwMin 32Fx*). Implemented+verified in the NEON-FP batch;
     until then a CLEAN error (never a guessed FP result, which would be worse than a gap)."""
@@ -586,6 +609,8 @@ _GENERIC = {
     "NarrowBin": _op_generic_NarrowBin,    # XTN/XTN2 (truncating narrow of two vectors)
     "PolynomialMul": _op_generic_PolynomialMul,    # PMUL
     "PolynomialMull": _op_generic_PolynomialMull,  # PMULL
+    "QAddExtUSsat": _op_generic_QAddExt,   # SUQADD
+    "QAddExtSUsat": _op_generic_QAddExt,   # USQADD
     "Sh": _op_generic_Sh,                  # SSHL/USHL per-lane variable shift (all lane widths)
     "Rsh": _op_generic_Rsh,                # SRSHL/URSHL rounding variable shift
     "QandUQsh": _op_generic_QandQsh,       # UQSHL  (sat, V256 result+Q)
@@ -666,6 +691,9 @@ _REGISTER = [
     "Iop_NarrowBin16to8x16", "Iop_NarrowBin16to8x8", "Iop_NarrowBin32to16x4",
     "Iop_NarrowBin32to16x8", "Iop_NarrowBin64to32x4",
     "Iop_PolynomialMul8x16", "Iop_PolynomialMull8x8",
+    # --- Batch D: ARM64 saturating add extensions (SUQADD / USQADD) ---
+    "Iop_QAddExtUSsatSS8x16", "Iop_QAddExtUSsatSS16x8", "Iop_QAddExtUSsatSS32x4", "Iop_QAddExtUSsatSS64x2",
+    "Iop_QAddExtSUsatUU8x16", "Iop_QAddExtSUsatUU16x8", "Iop_QAddExtSUsatUU32x4", "Iop_QAddExtSUsatUU64x2",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.

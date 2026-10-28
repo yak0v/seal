@@ -268,3 +268,29 @@ def test_polynomial_mul():
         b = [random.getrandbits(8) for _ in range(8)]
         got = _lanes(_ev("Iop_PolynomialMull8x8", claripy.BVV(_pack(a, 8), 64), claripy.BVV(_pack(b, 8), 64)), 16, 8)
         assert got == [_polymul(a[i], b[i], 8) & 0xffff for i in range(8)]
+
+
+# ---------------- Batch D: QAddExt (SUQADD / USQADD) ----------------
+
+def test_qaddext_suqadd_usqadd():
+    random.seed(31)
+    for lw, cnt in [(8, 16), (16, 8), (32, 4), (64, 2)]:
+        # (name, left_signed, right_signed, sat_signed)
+        for name, lsig, rsig, ssig in [(f"Iop_QAddExtUSsatSS{lw}x{cnt}", False, True, True),
+                                       (f"Iop_QAddExtSUsatUU{lw}x{cnt}", True, False, False)]:
+            assert name in irop.operations, name
+            for _ in range(40):
+                L = [random.choice([0, 1, 1 << (lw - 1), (1 << lw) - 1, random.getrandbits(lw)]) for _ in range(cnt)]
+                R = [random.choice([0, 1, 1 << (lw - 1), (1 << lw) - 1, random.getrandbits(lw)]) for _ in range(cnt)]
+                got = _lanes(_ev(name, claripy.BVV(_pack(L, lw), lw * cnt), claripy.BVV(_pack(R, lw), lw * cnt)), lw, cnt)
+                exp = []
+                for i in range(cnt):
+                    la = _sq(L[i], lw) if lsig else L[i]
+                    rb = _sq(R[i], lw) if rsig else R[i]
+                    s = la + rb
+                    if ssig:
+                        s = _sat_s(s, lw)
+                    else:
+                        s = max(0, min((1 << lw) - 1, s)) & ((1 << lw) - 1)
+                    exp.append(s & ((1 << lw) - 1))
+                assert got == exp, f"{name} L={L} R={R} got={got} exp={exp}"
