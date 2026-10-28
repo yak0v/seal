@@ -220,6 +220,38 @@ def test_auto_pointers_reaches_pointee_gated_code(trust):
     assert any("auto_pointers backed" in n for n in on["summary"].get("notes", []))
 
 
+def _at_index_spec(trust, size_from):
+    # at_index(buf, n, i): returns buf[i] under a buggy `i <= n` bound (off-by-one at i==n).
+    buf = {"arg": "buf", "size": 4096}
+    if size_from:
+        buf["size_from"] = "n"
+    return {
+        "func_addr": _addr(trust, "at_index"),
+        "args": [{"name": "buf", "mode": "symbolic", "size": 8},
+                 {"name": "n", "mode": "symbolic", "size": 4},
+                 {"name": "i", "mode": "symbolic", "size": 4}],
+        "buffers": [buf],
+        "assumptions": ["n < 10"],        # a SMALL length, well inside the 4096 physical buffer
+        "checks": [{"id": "r", "kind": "oob_read", "enabled": True}],
+        "limits": {"steps": 40, "active": 80, "seconds": 30, "skip_calls": True},
+    }
+
+
+def test_symbolic_size_finds_off_by_one_that_fixed_size_misses(trust):
+    """Tying the buffer's logical size to the symbolic length the code trusts (size_from)
+    catches a size-dependent off-by-one (buf[n] with a `i<=n` bound) even for a tiny length;
+    a fixed buffer size misses it because buf[n] is well inside the physical buffer. This is
+    the 'only breaks at a specific size' class that single-fixed-size exploration can't see."""
+    fixed = _run(trust, _at_index_spec(trust, size_from=False))
+    sized = _run(trust, _at_index_spec(trust, size_from=True))
+    assert not [h for h in fixed["hits"] if h["kind"] == "oob_read"], \
+        "a fixed size should NOT flag buf[n] for n<10 inside a 4096-byte buffer"
+    hits = [h for h in sized["hits"] if h["kind"] == "oob_read"]
+    assert hits, "size_from=n should catch the off-by-one at buf[n]"
+    w = hits[0].get("witness", {})
+    assert w.get("n", {}).get("u") == w.get("i", {}).get("u")   # the trigger is i == n (one past)
+
+
 def test_auto_pointers_off_by_default(trust):
     """The capability must be opt-in: a default run does not auto-back, so nothing changes
     for existing scenarios/tests."""

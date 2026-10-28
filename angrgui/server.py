@@ -1894,6 +1894,14 @@ pointer itself is a concrete scratch address). {"arg","size","layout"}.
          {"offset":0,"size":8,"mode":"pointer","name":"data","target":{"size":64}},
          {"offset":0,"size":8,"mode":"pointer","name":"next","target":{"size":16,"layout":[
             {"offset":8,"size":4,"mode":"sym","name":"val"}]}}]}]}  # nested sub-struct
+  • SYMBOLIC SIZE (find size-dependent bugs): add "size_from":"<length arg>" to a buffer.
+    Then `size` is just the PHYSICAL backing and the buffer's LOGICAL size is the symbolic
+    value of that length arg — so an oob_read/oob_write (NO base — it stays in modeled mode)
+    solves "can an access exceed the length?" over ALL lengths. This finds the length-
+    underflow / off-by-one / "only breaks at a specific size" class that a single fixed size
+    misses (e.g. `if (i<=n) buf[i]` is OOB at i==n for EVERY n, not just when n hits the
+    physical size). The length must be the value the code actually bounds by (so it's sound).
+      {"buffers":[{"arg":"buf","size":65536,"size_from":"n"}]}   # logical size = the arg n
 
 STDIN / FILES — for programs that read input:
   • Symbolic stdin: {"stdin":{"mode":"symbolic","size":32}}.

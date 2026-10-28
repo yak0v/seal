@@ -444,9 +444,12 @@ class Run:
                 return args[i].get("name") or f"arg{i}"
             return str(ref)        # always a string: it becomes a BVS name/prefix
         buffers = {}
+        sized_bufs = {}             # argname -> the arg whose SYMBOLIC value is this buffer's length
         for b in self.spec.get("buffers", []):
             argname = _resolve_argname(b["arg"])
             buffers[argname] = (int(b.get("size", 64)), b.get("layout") or [])
+            if b.get("size_from"):  # buffer's logical size = a symbolic length the code trusts
+                sized_bufs[argname] = _resolve_argname(b["size_from"])
 
         # Opt-in (limits.auto_pointers): auto-back every symbolic pointer-sized arg that
         # has no explicit buffer with a symbolic region, so a function that dereferences a
@@ -501,6 +504,7 @@ class Run:
         # real memory behind each pointer instead of a wild symbolic address.
         self._scratch_next = self.binary.scratch_base()
         self._member_maps = {}                      # region-name -> [[off,size,name],...] for display
+        sym_allocs = []                             # (base, symbolic_len, physical_end) for the oob check
         for argname, (size, layout) in buffers.items():
             addr = self._alloc_region(size)
             self._fill_region(state, addr, size, layout, named, argname, 0)
@@ -509,6 +513,20 @@ class Run:
             idx = next((i for i, a in enumerate(args) if a.get("name") == argname), None)
             if idx is not None:
                 self._set_arg(state, idx, claripy.BVV(addr, self.arch.bits), prototype)
+            # SYMBOLIC-SIZE buffer: its logical size is the SYMBOLIC length the code trusts (a
+            # length arg), not the fixed `size` (which is just the physical backing). Register it
+            # as a TRACKED allocation whose size is that symbolic length, so an oob_read/oob_write
+            # (no base, modeled mode) solves "can an access exceed the length?" over ALL lengths —
+            # catching the length-underflow / off-by-one / only-breaks-at-a-specific-size class that
+            # a single fixed size misses. Tying the size to the length the code ACTUALLY uses (not a
+            # fresh var) is what keeps it sound: the OOB fires only where the code's size handling
+            # is genuinely wrong. The triggering length shows up in the witness as that arg.
+            if argname in sized_bufs:
+                lenv = named.get(sized_bufs[argname])
+                if isinstance(lenv, claripy.ast.BV):
+                    sym_allocs.append((addr, lenv, addr + size))
+        if sym_allocs:
+            state.globals["angrgui_allocs"] = tuple(sym_allocs)
 
         state.globals["angrgui_vars"] = named
         state.globals["angrgui_argv"] = arg_asts    # ordered, for the a1.. / arg0.. aliases
@@ -893,8 +911,13 @@ class Run:
         repeat base+size on the check. Ambiguous (multiple buffers) is left alone."""
         if cspec.get("kind") not in ("oob_read", "oob_write") or cspec.get("base"):
             return cspec
-        has_alloc = any(m.get("kind") == "alloc" for m in (self.spec.get("models") or []))
-        bufs = [b for b in (self.spec.get("buffers") or []) if b.get("arg") and b.get("size")]
+        all_bufs = self.spec.get("buffers") or []
+        # A size_from buffer is a TRACKED allocation with a SYMBOLIC length — the oob check must
+        # stay in modeled mode so it tests against that symbolic size (anchoring it to the fixed
+        # physical size would defeat the whole point). Treat it like an alloc model.
+        has_alloc = (any(m.get("kind") == "alloc" for m in (self.spec.get("models") or []))
+                     or any(b.get("size_from") for b in all_bufs))
+        bufs = [b for b in all_bufs if b.get("arg") and b.get("size") and not b.get("size_from")]
         if has_alloc:
             return cspec                       # modeled mode is intended; don't override
         if len(bufs) == 1:

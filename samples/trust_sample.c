@@ -49,4 +49,15 @@ int by_pointee(const int *p) {
     return 0;
 }
 
+/* Size-dependent off-by-one: trusts `n` as the length but the bound uses <= instead of <,
+ * so buf[n] is read one past the end of a size-n buffer. Only findable if the buffer's size
+ * is modeled as the SYMBOLIC n (size_from), not a fixed number — with a fixed size the off-by-
+ * one at buf[n] (n < fixed) looks in-bounds. The triggering length shows up as n in the witness. */
+char at_index(const char *buf, unsigned n, unsigned i) {
+    if (i <= n) {
+        return buf[i];
+    }
+    return 0;
+}
+
 int main(void) { return 0; }

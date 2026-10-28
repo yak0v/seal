@@ -1003,12 +1003,23 @@ function sectionState() {
           onchange: e => { a.float = e.target.checked; if (a.float && ![4, 8].includes(a.size)) a.size = 8; scheduleSave(); renderRight(); } }),
         "floating-point ", a.float ? el("span", { class: "faint" }, a.size === 4 ? "(float)" : "(double)") : el("span", { class: "faint" }, "(for float-point checks)")));
     }
-    // buffer details: size + struct-layout editor (only in buffer mode)
+    // buffer details: size + symbolic-size + struct-layout editor (only in buffer mode)
     if (bufr) {
+      // symbolic size: tie the buffer's LOGICAL size to a length arg, so oob/overflow checks
+      // solve over ALL sizes — finds off-by-one / underflow bugs that only break at a specific
+      // size. The size field then means the physical max. Needs an oob check with no base.
+      const otherArgs = (A.config.args || []).filter(x => x.name !== a.name);
+      const sizeFromSel = el("select", { style: "font-size:11px",
+        title: "Symbolic size: treat this buffer's size as a length argument (attacker-controlled), not a fixed number. Finds size-dependent bugs (off-by-one / underflow) a single fixed size misses. Add an oob_read/oob_write with NO base to use it; the 'size' field becomes the physical max." },
+        el("option", { value: "" }, "fixed size"),
+        ...otherArgs.map(x => el("option", { value: x.name, selected: bufr.size_from === x.name ? "" : null }, "size = " + x.name)));
+      sizeFromSel.onchange = e => { if (e.target.value) bufr.size_from = e.target.value; else delete bufr.size_from; scheduleSave(); renderRight(); };
       b.append(el("div", { class: "row", style: "font-size:11px;color:var(--faint);margin:-2px 0 8px 2px;gap:4px;flex-wrap:wrap" },
         el("span", {}, "buffer"),
-        el("input", { value: bufr.size || 64, style: "width:52px", oninput: e => { bufr.size = +e.target.value; scheduleSave(); } }),
-        el("span", {}, "bytes · pointer is concrete, contents symbolic"),
+        el("input", { value: bufr.size || 64, style: "width:60px", oninput: e => { bufr.size = +e.target.value; scheduleSave(); } }),
+        el("span", {}, bufr.size_from ? "max bytes · " : "bytes · "),
+        otherArgs.length ? sizeFromSel : null,
+        el("span", {}, bufr.size_from ? " (symbolic)" : "· contents symbolic"),
         el("button", { class: "tiny", style: "margin-left:4px", title: "define struct members (from IDA or custom)",
           onclick: () => openStructEditor(a.name) },
           (bufr.layout && bufr.layout.length) ? `⚙ struct (${bufr.layout.length})` : "⚙ as struct")));
