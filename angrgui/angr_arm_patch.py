@@ -440,6 +440,82 @@ def _op_generic_Pw(self, args):
     return _concat_lanes(out)
 
 
+def _op_generic_QDMulHi(self, args):
+    """Iop_Q{,R}DMulHi<lw>Sx<cnt>: SQDMULH / SQRDMULH — saturating doubling multiply, high
+    half. Per lane: sat_s( hi_half( 2 * sext(a)*sext(b) [+ 2^(lw-1) for the rounding R] ) ).
+    Only a==b==INT_MIN overflows (-> saturates to max)."""
+    rounding = "QRDMulHi" in self.name
+    lw, cnt = int(self._vector_size), int(self._vector_count)
+    W = 2 * lw + 2
+    a, b = _lanes(args[0], lw, cnt), _lanes(args[1], lw, cnt)
+    hi_bv, lo_bv = claripy.BVV((1 << (lw - 1)) - 1, W), claripy.BVV((-(1 << (lw - 1))) & ((1 << W) - 1), W)
+    out = []
+    for i in range(cnt):
+        doubled = (a[i].sign_extend(W - lw) * b[i].sign_extend(W - lw)) << 1
+        if rounding:
+            doubled = doubled + claripy.BVV(1 << (lw - 1), W)
+        hi = doubled >> lw                                  # arithmetic
+        c = claripy.If(claripy.SGT(hi, hi_bv), hi_bv, claripy.If(claripy.SLT(hi, lo_bv), lo_bv, hi))
+        out.append(c[lw - 1:0])
+    return _concat_lanes(out)
+
+
+def _op_generic_QDMull(self, args):
+    """Iop_QDMull<lw>Sx<cnt>: SQDMULL — signed doubling saturating WIDENING multiply,
+    (I64,I64)->V128. Per lane: sat to signed 2*lw of 2 * sext(a)*sext(b) (only min*min sats)."""
+    lw, cnt = int(self._vector_size), int(self._vector_count)   # lw = source lane width
+    dw = 2 * lw
+    W = dw + 2
+    a, b = _lanes(args[0], lw, cnt), _lanes(args[1], lw, cnt)
+    hi_bv, lo_bv = claripy.BVV((1 << (dw - 1)) - 1, W), claripy.BVV((-(1 << (dw - 1))) & ((1 << W) - 1), W)
+    out = []
+    for i in range(cnt):
+        d = (a[i].sign_extend(W - lw) * b[i].sign_extend(W - lw)) << 1
+        c = claripy.If(claripy.SGT(d, hi_bv), hi_bv, claripy.If(claripy.SLT(d, lo_bv), lo_bv, d))
+        out.append(c[dw - 1:0])
+    return _concat_lanes(out)
+
+
+def _op_generic_NarrowBin(self, args):
+    """Iop_NarrowBin<src>to<dst>x<cnt>: truncating narrow of TWO vectors into one. Each
+    source lane is truncated to its low half; the LEFT arg fills the high result lanes,
+    the right arg the low ones (matches VEX's QNarrowBin 'hi half from left arg')."""
+    m = re.search(r"NarrowBin(\d+)to(\d+)x(\d+)", self.name)
+    src, dst, cnt = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    half = cnt // 2
+    a1 = _lanes(args[0], src, half)
+    a2 = _lanes(args[1], src, half)
+    out = [ln[dst - 1:0] for ln in a2] + [ln[dst - 1:0] for ln in a1]   # low = right, high = left
+    return _concat_lanes(out)
+
+
+def _poly_mul(a, b, aw, bw):
+    """Carryless (GF(2)) multiply of an aw-bit by a bw-bit value -> (aw+bw-1..) bits; we
+    return the full (aw+bw)-bit product (caller truncates as the op needs)."""
+    ow = aw + bw
+    ae = a.zero_extend(ow - aw)
+    acc = claripy.BVV(0, ow)
+    for i in range(bw):
+        bit = claripy.Extract(i, i, b)
+        acc = acc ^ claripy.If(bit == 1, ae << i, claripy.BVV(0, ow))
+    return acc
+
+
+def _op_generic_PolynomialMul(self, args):
+    """Iop_PolynomialMul8x16: PMUL — per-byte carryless multiply, low 8 bits of each product."""
+    lw, cnt = int(self._vector_size), int(self._vector_count)
+    a, b = _lanes(args[0], lw, cnt), _lanes(args[1], lw, cnt)
+    return _concat_lanes([_poly_mul(a[i], b[i], lw, lw)[lw - 1:0] for i in range(cnt)])
+
+
+def _op_generic_PolynomialMull(self, args):
+    """Iop_PolynomialMull8x8: PMULL — per-byte carryless multiply of the low 8 lanes,
+    widening to 16-bit results (I64,I64)->V128."""
+    lw, cnt = int(self._vector_size), int(self._vector_count)   # 8, 8
+    a, b = _lanes(args[0], lw, cnt), _lanes(args[1], lw, cnt)
+    return _concat_lanes([_poly_mul(a[i], b[i], lw, lw)[2 * lw - 1:0] for i in range(cnt)])
+
+
 def _op_generic_PwFP(self, args):
     """FP pairwise (PwAdd/PwMax/PwMin 32Fx*). Implemented+verified in the NEON-FP batch;
     until then a CLEAN error (never a guessed FP result, which would be worse than a gap)."""
@@ -504,6 +580,12 @@ _GENERIC = {
     "PwMax": _op_generic_Pw,               # SMAXP/UMAXP (integer)
     "PwMin": _op_generic_Pw,               # SMINP/UMINP (integer)
     "PwAddL": _op_generic_PwAddL,          # SADDLP/UADDLP (pairwise add long)
+    "QDMulHi": _op_generic_QDMulHi,        # SQDMULH
+    "QRDMulHi": _op_generic_QDMulHi,       # SQRDMULH (rounding)
+    "QDMull": _op_generic_QDMull,          # SQDMULL (doubling widening)
+    "NarrowBin": _op_generic_NarrowBin,    # XTN/XTN2 (truncating narrow of two vectors)
+    "PolynomialMul": _op_generic_PolynomialMul,    # PMUL
+    "PolynomialMull": _op_generic_PolynomialMull,  # PMULL
     "Sh": _op_generic_Sh,                  # SSHL/USHL per-lane variable shift (all lane widths)
     "Rsh": _op_generic_Rsh,                # SRSHL/URSHL rounding variable shift
     "QandUQsh": _op_generic_QandQsh,       # UQSHL  (sat, V256 result+Q)
@@ -577,6 +659,13 @@ _REGISTER = [
     "Iop_PwAddL8Ux8", "Iop_PwAddL16Ux4", "Iop_PwAddL32Ux2", "Iop_PwAddL8Sx8", "Iop_PwAddL16Sx4", "Iop_PwAddL32Sx2",
     "Iop_PwAddL8Ux16", "Iop_PwAddL16Ux8", "Iop_PwAddL32Ux4", "Iop_PwAddL8Sx16", "Iop_PwAddL16Sx8", "Iop_PwAddL32Sx4",
     "Iop_PwAddL64Ux2",
+    # --- Batch C: multiply / narrow ---
+    "Iop_QDMulHi16Sx4", "Iop_QDMulHi32Sx2", "Iop_QDMulHi16Sx8", "Iop_QDMulHi32Sx4",
+    "Iop_QRDMulHi16Sx4", "Iop_QRDMulHi32Sx2", "Iop_QRDMulHi16Sx8", "Iop_QRDMulHi32Sx4",
+    "Iop_QDMull16Sx4", "Iop_QDMull32Sx2",
+    "Iop_NarrowBin16to8x16", "Iop_NarrowBin16to8x8", "Iop_NarrowBin32to16x4",
+    "Iop_NarrowBin32to16x8", "Iop_NarrowBin64to32x4",
+    "Iop_PolynomialMul8x16", "Iop_PolynomialMull8x8",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.

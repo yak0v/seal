@@ -187,3 +187,84 @@ def test_pairwise_add_long():
                     y = y - (1 << sw) if (y >> (sw - 1)) & 1 else y
                 exp.append((x + y) & ((1 << dw) - 1))
             assert got == exp, f"{name}"
+
+
+# ---------------- Batch C: QDMulHi / QRDMulHi / QDMull / NarrowBin / Polynomial ----------------
+
+def _sq(x, lw):
+    return x - (1 << lw) if (x >> (lw - 1)) & 1 else x
+
+
+def _sat_s(v, w):
+    hi, lo = (1 << (w - 1)) - 1, -(1 << (w - 1))
+    return (hi if v > hi else lo if v < lo else v) & ((1 << w) - 1)
+
+
+def test_qdmulhi_qrdmulhi():
+    random.seed(21)
+    for lw, cnt in [(16, 8), (32, 4), (16, 4), (32, 2)]:
+        for rnd in (False, True):
+            name = f"Iop_{'QRDMulHi' if rnd else 'QDMulHi'}{lw}Sx{cnt}"
+            assert name in irop.operations, name
+            for _ in range(50):
+                a = [random.choice([0, 1, (1 << (lw - 1)), (1 << (lw - 1)) - 1, (1 << lw) - 1, random.getrandbits(lw)]) for _ in range(cnt)]
+                b = [random.choice([0, 1, (1 << (lw - 1)), (1 << (lw - 1)) - 1, (1 << lw) - 1, random.getrandbits(lw)]) for _ in range(cnt)]
+                got = _lanes(_ev(name, claripy.BVV(_pack(a, lw), lw * cnt), claripy.BVV(_pack(b, lw), lw * cnt)), lw, cnt)
+                exp = []
+                for i in range(cnt):
+                    d = _sq(a[i], lw) * _sq(b[i], lw) * 2
+                    if rnd:
+                        d += 1 << (lw - 1)
+                    exp.append(_sat_s(d >> lw, lw))
+                assert got == exp, f"{name} a={a} b={b}"
+
+
+def test_qdmull():
+    random.seed(22)
+    for lw, cnt in [(16, 4), (32, 2)]:
+        name = f"Iop_QDMull{lw}Sx{cnt}"
+        dw = 2 * lw
+        assert name in irop.operations
+        for _ in range(50):
+            a = [random.choice([0, 1, 1 << (lw - 1), (1 << lw) - 1, random.getrandbits(lw)]) for _ in range(cnt)]
+            b = [random.choice([0, 1, 1 << (lw - 1), (1 << lw) - 1, random.getrandbits(lw)]) for _ in range(cnt)]
+            got = _lanes(_ev(name, claripy.BVV(_pack(a, lw), lw * cnt), claripy.BVV(_pack(b, lw), lw * cnt)), dw, cnt)
+            exp = [_sat_s(_sq(a[i], lw) * _sq(b[i], lw) * 2, dw) for i in range(cnt)]
+            assert got == exp, f"{name}"
+
+
+def test_narrowbin_truncating():
+    random.seed(23)
+    for name, src, dst, cnt in [("Iop_NarrowBin16to8x16", 16, 8, 16), ("Iop_NarrowBin16to8x8", 16, 8, 8),
+                                ("Iop_NarrowBin32to16x4", 32, 16, 4), ("Iop_NarrowBin32to16x8", 32, 16, 8),
+                                ("Iop_NarrowBin64to32x4", 64, 32, 4)]:
+        assert name in irop.operations, name
+        half = cnt // 2
+        for _ in range(30):
+            a1 = [random.getrandbits(src) for _ in range(half)]
+            a2 = [random.getrandbits(src) for _ in range(half)]
+            got = _lanes(_ev(name, claripy.BVV(_pack(a1, src), src * half), claripy.BVV(_pack(a2, src), src * half)), dst, cnt)
+            exp = [x & ((1 << dst) - 1) for x in a2] + [x & ((1 << dst) - 1) for x in a1]
+            assert got == exp, f"{name}"
+
+
+def _polymul(a, b, bw):
+    r = 0
+    for i in range(bw):
+        if (b >> i) & 1:
+            r ^= a << i
+    return r
+
+
+def test_polynomial_mul():
+    random.seed(24)
+    for _ in range(40):
+        a = [random.getrandbits(8) for _ in range(16)]
+        b = [random.getrandbits(8) for _ in range(16)]
+        got = _lanes(_ev("Iop_PolynomialMul8x16", claripy.BVV(_pack(a, 8), 128), claripy.BVV(_pack(b, 8), 128)), 8, 16)
+        assert got == [_polymul(a[i], b[i], 8) & 0xff for i in range(16)]
+    for _ in range(40):
+        a = [random.getrandbits(8) for _ in range(8)]
+        b = [random.getrandbits(8) for _ in range(8)]
+        got = _lanes(_ev("Iop_PolynomialMull8x8", claripy.BVV(_pack(a, 8), 64), claripy.BVV(_pack(b, 8), 64)), 16, 8)
+        assert got == [_polymul(a[i], b[i], 8) & 0xffff for i in range(8)]
