@@ -327,6 +327,98 @@ def _op_generic_QandQNarrow(self, args):
     return claripy.Concat(claripy.BVV(0, pad), qbit, result)   # V128 = [0..0 | Q | result]
 
 
+def _lanes(arg, lw, cnt):
+    return [arg[lw * i + lw - 1: lw * i] for i in range(cnt)]
+
+
+def _concat_lanes(lanes):
+    """Concat lane 0 (low) .. lane n-1 (high) into one BV (lane 0 occupies the low bits)."""
+    out = None
+    for ln in lanes:
+        out = ln if out is None else claripy.Concat(ln, out)
+    return out
+
+
+def _popcount(x, n):
+    return sum((claripy.Extract(i, i, x).zero_extend(n - 1) for i in range(n)), claripy.BVV(0, n))
+
+
+def _clz(x, n):
+    """Count leading zeros of an n-bit value, as an n-bit result (n for x==0)."""
+    count = claripy.BVV(0, n)
+    still = claripy.BVV(1, 1)                       # 1 while still inside the leading-zero run
+    for i in range(n - 1, -1, -1):
+        still = still & ~claripy.Extract(i, i, x)   # a set bit ends the run (and keeps it ended)
+        count = count + still.zero_extend(n - 1)
+    return count
+
+
+def _op_generic_Cnt(self, args):
+    """Iop_Cnt8x16/8x8: CNT — population count of each byte lane."""
+    lw, cnt = int(self._vector_size), int(self._vector_count)
+    return _concat_lanes([_popcount(ln, lw) for ln in _lanes(args[0], lw, cnt)])
+
+
+def _op_generic_Cls(self, args):
+    """Iop_Cls{8,16,32}x*: CLS — count leading SIGN bits (bits after the MSB equal to it).
+    cls(x) = clz(x ^ (x >>a (lw-1))) - 1  (the sign-run length minus one)."""
+    lw, cnt = int(self._vector_size), int(self._vector_count)
+    out = []
+    for ln in _lanes(args[0], lw, cnt):
+        sign = ln >> (lw - 1)                      # arithmetic: all-0s or all-1s
+        out.append((_clz(ln ^ sign, lw) - claripy.BVV(1, lw)))
+    return _concat_lanes(out)
+
+
+def _op_generic_Left(self, args):
+    """Iop_Left{8,16,32,64}: x -> x | -x (a Memcheck helper), applied to the whole word."""
+    x = args[0]
+    return x | (claripy.BVV(0, x.length) - x)
+
+
+def _op_generic_Widen(self, args):
+    """Iop_Widen<s>{S,U}to<2s>x<cnt>: widen each lane of the LOW half of the source to double
+    width (SXTL/UXTL). Iop_Widen32Sto64x2([a,b,*,*]) = [sx(a), sx(b)]."""
+    m = re.search(r"Widen(\d+)([SU])to(\d+)x(\d+)", self.name)
+    sw, signed, dw, cnt = int(m.group(1)), m.group(2) == "S", int(m.group(3)), int(m.group(4))
+    src = args[0]
+    out = []
+    for i in range(cnt):                           # only the low cnt lanes are used
+        lane = src[sw * i + sw - 1: sw * i]
+        out.append(lane.sign_extend(dw - sw) if signed else lane.zero_extend(dw - sw))
+    return _concat_lanes(out)
+
+
+def _op_generic_Interleave(self, args):
+    """Iop_Interleave{Odd,Even}Lanes<lw>x<cnt>: take even (or odd) lanes from each operand and
+    interleave them, result[2k]=arg2 lane, result[2k+1]=arg1 lane; MSB result lane from the
+    left arg (arg1). ZIP/UZP/TRN building block."""
+    m = re.search(r"Interleave(Odd|Even)Lanes(\d+)x(\d+)", self.name)
+    odd, lw, cnt = m.group(1) == "Odd", int(m.group(2)), int(m.group(3))
+    a1, a2 = _lanes(args[0], lw, cnt), _lanes(args[1], lw, cnt)
+    base = 1 if odd else 0
+    picks = [i for i in range(cnt) if i % 2 == base]   # even or odd source indices
+    out = []
+    for p in picks:                                    # low..high result lanes: (arg2, arg1) pairs
+        out.append(a2[p])
+        out.append(a1[p])
+    return _concat_lanes(out)
+
+
+def _op_generic_Avg(self, args):
+    """Iop_Avg<lw>{S,U}x<cnt>: rounding halving add, (a + b + 1) >> 1 (URHADD/SRHADD). No
+    overflow because the add is done one bit wider than the lane."""
+    m = re.search(r"Avg(\d+)([SU])x(\d+)", self.name)
+    lw, signed, cnt = int(m.group(1)), m.group(2) == "S", int(m.group(3))
+    a, b = _lanes(args[0], lw, cnt), _lanes(args[1], lw, cnt)
+    out = []
+    for i in range(cnt):
+        ext = (lambda v: v.sign_extend(2)) if signed else (lambda v: v.zero_extend(2))
+        s = ext(a[i]) + ext(b[i]) + claripy.BVV(1, lw + 2)
+        out.append((s >> 1)[lw - 1:0] if signed else claripy.LShR(s, 1)[lw - 1:0])
+    return _concat_lanes(out)
+
+
 def _op_fgeneric_Sqrt(self, args):
     """FP square root. Handles BOTH call shapes: angr calls a scalar op as
     _calculate([x]) (args is a list), and _auto_vectorize calls the per-lane function as
@@ -349,10 +441,25 @@ _SPECIFIC = {
     "Iop_Reverse16sIn32_x4": _op_reverse,
     "Iop_Reverse16sIn64_x2": _op_reverse,
     "Iop_Reverse32sIn64_x2": _op_reverse,
+    "Iop_ZeroHI120ofV128": _op_zerohi,
+    "Iop_Reverse1sIn8_x16": _op_reverse,       # RBIT (reverse bits in each byte)
+    "Iop_Reverse8sIn16_x4": _op_reverse,
+    "Iop_Reverse8sIn32_x2": _op_reverse,
+    "Iop_Reverse8sIn64_x1": _op_reverse,
+    "Iop_Reverse16sIn32_x2": _op_reverse,
+    "Iop_Reverse16sIn64_x1": _op_reverse,
+    "Iop_Reverse32sIn64_x1": _op_reverse,
 }
 _GENERIC = {
     "NarrowUn": _op_generic_NarrowUn,
     "QNarrowUn": _op_generic_QNarrowUn,
+    "Cnt": _op_generic_Cnt,                # CNT (popcount per byte)
+    "Cls": _op_generic_Cls,                # CLS (count leading sign bits)
+    "Left": _op_generic_Left,              # x | -x (Memcheck helper)
+    "Widen": _op_generic_Widen,            # SXTL/UXTL (widen low-half lanes)
+    "InterleaveOddLanes": _op_generic_Interleave,
+    "InterleaveEvenLanes": _op_generic_Interleave,
+    "Avg": _op_generic_Avg,                # URHADD/SRHADD ((a+b+1)>>1)
     "Sh": _op_generic_Sh,                  # SSHL/USHL per-lane variable shift (all lane widths)
     "Rsh": _op_generic_Rsh,                # SRSHL/URSHL rounding variable shift
     "QandUQsh": _op_generic_QandQsh,       # UQSHL  (sat, V256 result+Q)
@@ -403,6 +510,21 @@ _REGISTER = [
     "Iop_QandQRShrNnarrow16Uto8Ux8", "Iop_QandQRShrNnarrow32Uto16Ux4", "Iop_QandQRShrNnarrow64Uto32Ux2",
     "Iop_QandQRSarNnarrow16Sto8Sx8", "Iop_QandQRSarNnarrow32Sto16Sx4", "Iop_QandQRSarNnarrow64Sto32Sx2",
     "Iop_QandQRSarNnarrow16Sto8Ux8", "Iop_QandQRSarNnarrow32Sto16Ux4", "Iop_QandQRSarNnarrow64Sto32Ux2",
+    # --- Batch A: exact integer elementwise / shuffle ---
+    "Iop_Cnt8x16", "Iop_Cnt8x8",
+    "Iop_Cls8x16", "Iop_Cls16x8", "Iop_Cls32x4", "Iop_Cls8x8", "Iop_Cls16x4", "Iop_Cls32x2",
+    "Iop_Left8", "Iop_Left16", "Iop_Left32", "Iop_Left64",
+    "Iop_Widen8Sto16x8", "Iop_Widen16Sto32x4", "Iop_Widen32Sto64x2",
+    "Iop_Widen8Uto16x8", "Iop_Widen16Uto32x4", "Iop_Widen32Uto64x2",
+    "Iop_InterleaveOddLanes8x8", "Iop_InterleaveEvenLanes8x8", "Iop_InterleaveOddLanes16x4", "Iop_InterleaveEvenLanes16x4",
+    "Iop_InterleaveOddLanes8x16", "Iop_InterleaveEvenLanes8x16", "Iop_InterleaveOddLanes16x8", "Iop_InterleaveEvenLanes16x8",
+    "Iop_InterleaveOddLanes32x4", "Iop_InterleaveEvenLanes32x4",
+    "Iop_Avg8Ux16", "Iop_Avg16Ux8", "Iop_Avg32Ux4", "Iop_Avg64Ux2",
+    "Iop_Avg8Sx16", "Iop_Avg16Sx8", "Iop_Avg32Sx4", "Iop_Avg64Sx2",
+    "Iop_Avg8Ux8", "Iop_Avg16Ux4", "Iop_Avg8Ux32", "Iop_Avg16Ux16",
+    "Iop_ZeroHI120ofV128",
+    "Iop_Reverse1sIn8_x16", "Iop_Reverse8sIn16_x4", "Iop_Reverse8sIn32_x2", "Iop_Reverse8sIn64_x1",
+    "Iop_Reverse16sIn32_x2", "Iop_Reverse16sIn64_x1", "Iop_Reverse32sIn64_x1",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.
@@ -428,6 +550,14 @@ _EXPLICIT_ATTRS = {
     "Iop_Reverse16sIn32_x4": _explicit(generic_name="Reverse16sIn32"),
     "Iop_Reverse16sIn64_x2": _explicit(generic_name="Reverse16sIn64"),
     "Iop_Reverse32sIn64_x2": _explicit(generic_name="Reverse32sIn64"),
+    "Iop_ZeroHI120ofV128": _explicit(generic_name="ZeroHI120ofV128"),
+    "Iop_Reverse1sIn8_x16": _explicit(generic_name="Reverse1sIn8"),
+    "Iop_Reverse8sIn16_x4": _explicit(generic_name="Reverse8sIn16"),
+    "Iop_Reverse8sIn32_x2": _explicit(generic_name="Reverse8sIn32"),
+    "Iop_Reverse8sIn64_x1": _explicit(generic_name="Reverse8sIn64"),
+    "Iop_Reverse16sIn32_x2": _explicit(generic_name="Reverse16sIn32"),
+    "Iop_Reverse16sIn64_x1": _explicit(generic_name="Reverse16sIn64"),
+    "Iop_Reverse32sIn64_x1": _explicit(generic_name="Reverse32sIn64"),
 }
 
 _applied = False
