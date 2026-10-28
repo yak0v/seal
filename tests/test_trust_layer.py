@@ -281,6 +281,38 @@ def test_symbolic_addrs_unmasks_oob_write(trust):
     assert any("under-report" in n.lower() or "pinned" in n.lower() for n in off["summary"].get("notes", []))
 
 
+def _fill_n_spec(trust, loop_bound):
+    # fill_n(dst, n): for k<n: dst[k]=k  — OOB write once k>=4 (dst is a 4-int buffer).
+    # The overflow is only reachable after >4 loop iterations.
+    return {
+        "func_addr": _addr(trust, "fill_n"),
+        "args": [{"name": "dst", "mode": "symbolic", "size": 8},
+                 {"name": "n", "mode": "symbolic", "size": 4}],
+        "buffers": [{"arg": "dst", "size": 16}],
+        "checks": [{"id": "w", "kind": "oob_write", "enabled": True}],
+        "limits": {"steps": 120, "active": 200, "seconds": 40, "skip_calls": True, "loop_bound": loop_bound},
+    }
+
+
+def test_loop_bound_truncation_is_surfaced_and_raising_it_finds_the_oob(trust):
+    """A low loop_bound cuts the input-driven loop BEFORE the OOB write is reached: the run
+    is clean, but summary.truncation flags that it stopped unrolling (so '0 findings' is not
+    'safe'). Raising loop_bound past the overflow index surfaces the OOB write."""
+    low = _run(trust, _fill_n_spec(trust, loop_bound=3))
+    high = _run(trust, _fill_n_spec(trust, loop_bound=8))
+
+    assert not [h for h in low["hits"] if h["kind"] == "oob_write"], \
+        "a loop_bound below the overflow index should NOT reach the OOB write"
+    trunc = low["summary"].get("truncation")
+    assert trunc, "summary must carry a structured truncation signal when a loop was cut"
+    assert trunc["bound"] == 3 and trunc["paths_cut"] >= 1
+    assert any("bounded" in n.lower() and "loop bound" in n.lower()
+               for n in low["summary"].get("notes", [])), "the bounded blind spot must be noted"
+
+    assert [h for h in high["hits"] if h["kind"] == "oob_write"], \
+        "raising loop_bound past the overflow index must surface the OOB write"
+
+
 def test_auto_pointers_off_by_default(trust):
     """The capability must be opt-in: a default run does not auto-back, so nothing changes
     for existing scenarios/tests."""

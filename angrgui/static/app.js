@@ -1926,6 +1926,8 @@ function renderTree(force) {
     notes.forEach(n => box.append(el("div", { class: "rnote" }, n)));
     pane.append(box);
   }
+  const truncBox = renderTruncation(snap);
+  if (truncBox) pane.append(truncBox);
   const gatesBox = renderGates(snap);
   if (gatesBox) pane.append(gatesBox);
   if (view === "tree") {
@@ -2249,13 +2251,19 @@ function pathsSummary(T, snap) {
           + (cov.pct < 100 ? " — a 0-finding result at <100% is 'didn't look', not 'safe'" : "") },
         `${cov.pct}% explored`)
     : null;
+  const trunc = snap.summary?.truncation;
+  const truncPill = trunc
+    ? el("span", { class: "pill warn",
+        title: `a loop with an input-dependent trip count was cut at ${trunc.bound} iterations on ${trunc.paths_cut} path(s) — bugs needing more iterations are NOT covered; raise the loop bound` },
+        `bounded @ ${trunc.bound} loops`)
+    : null;
   const confPills = [
     conf.confirmed ? el("span", { class: "pill ok", title: "findings driven only by your symbolic inputs" }, `${conf.confirmed} confirmed`) : null,
     conf.conditional ? el("span", { class: "pill warn", title: "findings that depend on a skipped call's return — leads to resolve with a return bound" }, `${conf.conditional} conditional`) : null,
   ].filter(Boolean);
   return el("div", { class: "psum" },
     el("b", {}, `${leaves.length} path${leaves.length === 1 ? "" : "s"}:`), ...parts,
-    covPill,
+    covPill, truncPill,
     el("span", { class: "grow" }),
     ...confPills,
     hits ? el("span", { class: "pill bad" }, `${hits} finding${hits > 1 ? "s" : ""}`) : el("span", { class: "faint" }, "no findings"));
@@ -2289,6 +2297,31 @@ function renderGates(snap) {
     box.append(row);
   });
   return box;
+}
+// Boundedness: a loop with an input-dependent trip count was cut at loop_bound. Show where,
+// and offer to raise the bound and re-run — the one actionable fix for the blind spot.
+function renderTruncation(snap) {
+  const t = snap.summary?.truncation;
+  if (!t) return null;
+  const box = el("div", { class: "gatesbox" });
+  box.append(el("b", {}, `✂ bounded: ${t.paths_cut} path${t.paths_cut > 1 ? "s" : ""} cut at loop bound ${t.bound} — iterations beyond ${t.bound} were NOT explored (a bug needing more, e.g. a copy sized by an attacker-controlled count, is not covered)`));
+  (t.sites || []).forEach(s => {
+    const row = el("div", { class: "gaterow" });
+    const where = s.line ? `${s.file || ""}:${s.line}` : "";
+    row.append(el("span", { class: "mono", style: "font-size:11px", title: "the loop whose trip count the inputs drive" }, s.addr),
+      where ? el("span", { class: "gtest mono" }, where) : null);
+    box.append(row);
+  });
+  const next = t.bound * 2;
+  box.append(el("div", { class: "gaterow" },
+    el("button", { class: "tiny primary", title: `raise limits.loop_bound to ${next} and re-run to explore deeper`,
+      onclick: () => raiseLoopBound(next) }, `raise loop bound to ${next} & re-run`)));
+  return box;
+}
+function raiseLoopBound(n) {
+  A.config.limits = A.config.limits || {};
+  A.config.limits.loop_bound = n;
+  saveConfig().then(() => { renderState(); toast(`loop bound raised to ${n} — Explore to re-run`); });
 }
 function addGateField(f) {
   const init = A.config.initial_state;

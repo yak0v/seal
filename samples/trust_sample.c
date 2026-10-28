@@ -71,4 +71,18 @@ int rw_mask(int *buf, unsigned r) {
     return x;
 }
 
+/* A fill loop whose length n is attacker-controlled, into a fixed 4-int (16-byte) buffer.
+ * dst[k] is an OOB WRITE once k >= 4 (n > 4). Reaching that write takes MORE than 4 loop
+ * iterations, so a low loop_bound cuts the loop BEFORE the overflow — the run comes back
+ * clean, but ONLY because angr stopped unrolling (summary.truncation flags that the loop
+ * was bounded). Raising loop_bound past the overflow index surfaces the write. This is the
+ * bounded-symbolic-execution blind spot #3 targets: "0 findings" that is really "didn't
+ * look far enough into the loop." */
+int fill_n(int *dst, unsigned n) {
+    for (unsigned k = 0; k < n; k++) {
+        dst[k] = (int)k;
+    }
+    return dst[0];
+}
+
 int main(void) { return 0; }

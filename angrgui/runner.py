@@ -1617,6 +1617,9 @@ class Run:
             "elapsed": self.progress["elapsed"],
         })
         self.summary["coverage"] = self._coverage()
+        trunc = self._truncation()
+        if trunc:
+            self.summary["truncation"] = trunc
         covered = set()
         for n in self.nodes.values():
             covered |= set(n.block_addrs)
@@ -1819,6 +1822,33 @@ class Run:
             "unreached_total": len(unreached),
         }
 
+    def _truncation(self) -> dict | None:
+        """The boundedness blind spot, made first-class: loops whose iteration count the
+        inputs drive were cut at loop_bound, so iterations BEYOND the bound — where a copy
+        sized by an attacker-controlled count tends to overflow — were never explored.
+
+        This is sound to report as input-dependent: LoopSeer runs with
+        limit_concrete_loops=False, so a concrete-trip loop is NOT bounded; every path that
+        ends in a loop_bound leaf is therefore a loop whose trip count isn't concrete. A
+        0-finding run with truncation is 'didn't look past N iterations', not 'safe'."""
+        sites: dict = {}
+        cut = 0
+        for n in self.nodes.values():
+            if (n.end or {}).get("reason") != "loop_bound":
+                continue
+            cut += 1
+            body = n.block_addrs[-1] if n.block_addrs else n.addr
+            if body not in sites:
+                sites[body] = {"addr": hex(body), **(self.binary.source_at(body) or {})}
+        if not cut:
+            return None
+        return {
+            "bound": self._loop_bound,
+            "paths_cut": cut,
+            "sites": list(sites.values())[:10],
+            "loops": len(sites),
+        }
+
     def _diagnose(self, simgr) -> list[str]:
         """Human-readable hints about why a run turned out the way it did — so a
         run that finds nothing explains itself instead of leaving the agent guessing."""
@@ -1932,6 +1962,25 @@ class Run:
                         "assumptions, or make a gating input symbolic to reach them).")
             notes.append(f"explored {cov['pct']}% of the function "
                          f"({cov['blocks_covered']}/{cov['blocks_total']} blocks){tail}")
+        # Boundedness: a loop with an input-dependent trip count was cut at loop_bound, so
+        # iterations beyond the bound were never explored. This is the exact gap bounded
+        # symbolic execution has that formal methods don't — a bug that needs > bound
+        # iterations (a copy sized by an attacker-controlled count) is NOT covered here.
+        trunc = self.summary.get("truncation")
+        if trunc:
+            where = ""
+            s0 = (trunc.get("sites") or [{}])[0]
+            if s0.get("line"):
+                where = f" (first at {s0.get('addr')}, line {s0['line']})"
+            elif s0.get("addr"):
+                where = f" (first at {s0['addr']})"
+            notes.append(
+                f"BOUNDED: {trunc['paths_cut']} path(s) hit the loop bound — a loop whose "
+                f"iteration count the inputs drive was cut at {trunc['bound']} iterations{where}. "
+                f"angr only unrolled it {trunc['bound']} times, so a bug that needs MORE iterations "
+                f"(e.g. a copy/write sized by an attacker-controlled count) is NOT covered. Raise "
+                f"limits.loop_bound to probe deeper (costs more paths/time); a 0-finding result here "
+                f"is 'didn't look past {trunc['bound']} iterations', not 'safe'.")
         if len(self.hits) == 0 and enabled_checks and not self._setup_notes:
             # a setup note already names a concrete cause; only guess further when there isn't one.
             sym_args = any(a.get("mode", "symbolic") == "symbolic" for a in self.spec.get("args", []))

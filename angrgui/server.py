@@ -2018,6 +2018,12 @@ get_run(run_id) returns:
         the bug may be in an unreached block. Raise steps/loop_bound, relax assumptions,
         or make a gating input symbolic to reach the rest.
       confidence {confirmed, conditional} — the finding tally by trust level.
+      truncation {bound, paths_cut, loops, sites[{addr,file,line}]} — the BOUNDEDNESS blind
+        spot, made explicit. A loop whose iteration count the inputs drive was cut at
+        loop_bound (concrete-trip loops are NOT cut, so this is always an input-dependent
+        loop), so iterations BEYOND the bound were never explored — exactly where a copy or
+        write sized by an attacker-controlled count overflows. Present => a 0-finding run is
+        "didn't look past `bound` iterations", not safe. Raise limits.loop_bound and re-run.
       concrete_gates[] — branches the inputs could NOT steer: a fixed value (usually a
         snapshot field) sent every path down one side, so the other side was never
         explored. Each {at, test, always_went, never_reached, make_symbolic[{base,offset,
