@@ -129,3 +129,61 @@ def test_avg_rounding_halving_add():
                     bv = b[i] - (1 << lw) if (signed and (b[i] >> (lw - 1)) & 1) else b[i]
                     exp.append(((av + bv + 1) >> 1) & ((1 << lw) - 1))
                 assert got == exp, f"{name} -> {got} exp {exp}"
+
+
+# ---------------- Batch B: pairwise (PwAdd / PwMax / PwMin / PwAddL) ----------------
+
+def _pw(a, b, lw, cnt, kind, signed):
+    def foo(x, y):
+        if kind == "Add":
+            return (x + y) & ((1 << lw) - 1)
+        if signed:
+            x = x - (1 << lw) if (x >> (lw - 1)) & 1 else x
+            y = y - (1 << lw) if (y >> (lw - 1)) & 1 else y
+        return (max(x, y) if kind == "Max" else min(x, y)) & ((1 << lw) - 1)
+    out = []
+    for src in (a, b):
+        for k in range(0, cnt, 2):
+            out.append(foo(src[k], src[k + 1]))
+    return out
+
+
+def test_pairwise_add_max_min():
+    random.seed(11)
+    specs = [("Iop_PwAdd8x16", 8, 16, "Add", None), ("Iop_PwAdd16x8", 16, 8, "Add", None),
+             ("Iop_PwAdd32x4", 32, 4, "Add", None), ("Iop_PwAdd8x8", 8, 8, "Add", None),
+             ("Iop_PwAdd16x4", 16, 4, "Add", None), ("Iop_PwAdd32x2", 32, 2, "Add", None)]
+    for lw, cnt in [(8, 8), (16, 4), (32, 2)]:
+        for k in ("Max", "Min"):
+            for s in (True, False):
+                specs.append((f"Iop_Pw{k}{lw}{'S' if s else 'U'}x{cnt}", lw, cnt, k, s))
+    for name, lw, cnt, kind, signed in specs:
+        assert name in irop.operations, name
+        for _ in range(40):
+            a = [random.getrandbits(lw) for _ in range(cnt)]
+            b = [random.getrandbits(lw) for _ in range(cnt)]
+            got = _lanes(_ev(name, claripy.BVV(_pack(a, lw), lw * cnt), claripy.BVV(_pack(b, lw), lw * cnt)), lw, cnt)
+            assert got == _pw(a, b, lw, cnt, kind, bool(signed)), f"{name}"
+
+
+def test_pairwise_add_long():
+    random.seed(12)
+    specs = []
+    for sw, cnt in [(8, 16), (16, 8), (32, 4), (8, 8), (16, 4), (32, 2)]:
+        for s in (True, False):
+            specs.append((f"Iop_PwAddL{sw}{'S' if s else 'U'}x{cnt}", sw, cnt, s))
+    specs.append(("Iop_PwAddL64Ux2", 64, 2, False))
+    for name, sw, cnt, signed in specs:
+        assert name in irop.operations, name
+        dw = 2 * sw
+        for _ in range(40):
+            a = [random.getrandbits(sw) for _ in range(cnt)]
+            got = _lanes(_ev(name, claripy.BVV(_pack(a, sw), sw * cnt)), dw, cnt // 2)
+            exp = []
+            for k in range(0, cnt, 2):
+                x, y = a[k], a[k + 1]
+                if signed:
+                    x = x - (1 << sw) if (x >> (sw - 1)) & 1 else x
+                    y = y - (1 << sw) if (y >> (sw - 1)) & 1 else y
+                exp.append((x + y) & ((1 << dw) - 1))
+            assert got == exp, f"{name}"

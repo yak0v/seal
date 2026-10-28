@@ -419,6 +419,46 @@ def _op_generic_Avg(self, args):
     return _concat_lanes(out)
 
 
+def _op_generic_Pw(self, args):
+    """Iop_PwAdd<lw>x<cnt> / Iop_Pw{Max,Min}<lw>{S,U}x<cnt>: pairwise reduce. Binary —
+    PwFoo([a,b,c,d],[e,f,g,h]) = [Foo(a,b),Foo(c,d),Foo(e,f),Foo(g,h)]: arg1's adjacent
+    pairs fill the low result lanes, arg2's the high ones (ADDP/SMAXP/UMAXP/SMINP/UMINP)."""
+    if "F" in self.name.split("Pw", 1)[1]:         # FP pairwise (PwAdd32Fx2, PwMax32Fx4, ...)
+        return _op_generic_PwFP(self, args)
+    m = re.search(r"Pw(Add|Max|Min)(\d+)([SU]?)x(\d+)", self.name)
+    kind, lw, sign, cnt = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+    def foo(a, b):
+        if kind == "Add":
+            return (a + b)
+        gt = claripy.SGT if sign == "S" else claripy.UGT
+        return claripy.If(gt(a, b), a, b) if kind == "Max" else claripy.If(gt(a, b), b, a)
+    out = []
+    for arg in (args[0], args[1]):
+        ln = _lanes(arg, lw, cnt)
+        for k in range(0, cnt, 2):
+            out.append(foo(ln[k], ln[k + 1]))
+    return _concat_lanes(out)
+
+
+def _op_generic_PwFP(self, args):
+    """FP pairwise (PwAdd/PwMax/PwMin 32Fx*). Implemented+verified in the NEON-FP batch;
+    until then a CLEAN error (never a guessed FP result, which would be worse than a gap)."""
+    from angr.errors import UnsupportedIROpError
+    raise UnsupportedIROpError(f"{self.name}: FP pairwise not yet modeled (coming in the NEON-FP batch)")
+
+
+def _op_generic_PwAddL(self, args):
+    """Iop_PwAddL<sw>{S,U}x<cnt>: UNARY pairwise add LONG (SADDLP/UADDLP) — sum adjacent
+    lane pairs into lanes of DOUBLE the width. PwAddL16Ux4([a,b,c,d]) = [a+b, c+d]."""
+    m = re.search(r"PwAddL(\d+)([SU])x(\d+)", self.name)
+    sw, signed, cnt = int(m.group(1)), m.group(2) == "S", int(m.group(3))
+    dw = 2 * sw
+    ln = _lanes(args[0], sw, cnt)
+    ext = (lambda v: v.sign_extend(dw - sw)) if signed else (lambda v: v.zero_extend(dw - sw))
+    out = [ext(ln[k]) + ext(ln[k + 1]) for k in range(0, cnt, 2)]
+    return _concat_lanes(out)
+
+
 def _op_fgeneric_Sqrt(self, args):
     """FP square root. Handles BOTH call shapes: angr calls a scalar op as
     _calculate([x]) (args is a list), and _auto_vectorize calls the per-lane function as
@@ -460,6 +500,10 @@ _GENERIC = {
     "InterleaveOddLanes": _op_generic_Interleave,
     "InterleaveEvenLanes": _op_generic_Interleave,
     "Avg": _op_generic_Avg,                # URHADD/SRHADD ((a+b+1)>>1)
+    "PwAdd": _op_generic_Pw,               # ADDP (integer; FP PwAdd handled separately)
+    "PwMax": _op_generic_Pw,               # SMAXP/UMAXP (integer)
+    "PwMin": _op_generic_Pw,               # SMINP/UMINP (integer)
+    "PwAddL": _op_generic_PwAddL,          # SADDLP/UADDLP (pairwise add long)
     "Sh": _op_generic_Sh,                  # SSHL/USHL per-lane variable shift (all lane widths)
     "Rsh": _op_generic_Rsh,                # SRSHL/URSHL rounding variable shift
     "QandUQsh": _op_generic_QandQsh,       # UQSHL  (sat, V256 result+Q)
@@ -525,6 +569,14 @@ _REGISTER = [
     "Iop_ZeroHI120ofV128",
     "Iop_Reverse1sIn8_x16", "Iop_Reverse8sIn16_x4", "Iop_Reverse8sIn32_x2", "Iop_Reverse8sIn64_x1",
     "Iop_Reverse16sIn32_x2", "Iop_Reverse16sIn64_x1", "Iop_Reverse32sIn64_x1",
+    # --- Batch B: pairwise (integer) ---
+    "Iop_PwAdd8x16", "Iop_PwAdd16x8", "Iop_PwAdd32x4",
+    "Iop_PwAdd8x8", "Iop_PwAdd16x4", "Iop_PwAdd32x2",
+    "Iop_PwMax8Sx8", "Iop_PwMax16Sx4", "Iop_PwMax32Sx2", "Iop_PwMax8Ux8", "Iop_PwMax16Ux4", "Iop_PwMax32Ux2",
+    "Iop_PwMin8Sx8", "Iop_PwMin16Sx4", "Iop_PwMin32Sx2", "Iop_PwMin8Ux8", "Iop_PwMin16Ux4", "Iop_PwMin32Ux2",
+    "Iop_PwAddL8Ux8", "Iop_PwAddL16Ux4", "Iop_PwAddL32Ux2", "Iop_PwAddL8Sx8", "Iop_PwAddL16Sx4", "Iop_PwAddL32Sx2",
+    "Iop_PwAddL8Ux16", "Iop_PwAddL16Ux8", "Iop_PwAddL32Ux4", "Iop_PwAddL8Sx16", "Iop_PwAddL16Sx8", "Iop_PwAddL32Sx4",
+    "Iop_PwAddL64Ux2",
 ]
 
 # angr's op_attrs regex can't parse some names (returns None); supply attrs by hand.
