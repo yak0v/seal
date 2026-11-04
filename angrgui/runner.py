@@ -92,6 +92,24 @@ from .pretty import printer_for_state
 log = logging.getLogger("angrgui.runner")
 
 
+def _json_safe(obj):
+    """Recursively replace non-finite floats (±inf / nan) with string tags so a run
+    snapshot — the neutral contract the GUI (REST) and the agent (MCP) both read — can
+    always be JSON-encoded. A single ±inf float witness (e.g. a symbolic coordinate)
+    otherwise 500s the REST result and makes the MCP result invalid JSON, hiding EVERY
+    finding in the run. Defense-in-depth behind the per-lane fix in checks.witness_of."""
+    import math
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            return "-inf" if obj == float("-inf") else ("inf" if obj == float("inf") else "nan")
+        return obj
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 @dataclass
 class PathNode:
     """One stretch of execution between two branch points.
@@ -2033,14 +2051,14 @@ class Run:
 
     def snapshot(self):
         with self._lock:
-            return {
+            return _json_safe({
                 "status": self.status,
                 "error": self.error,
                 "progress": dict(self.progress),
                 "summary": self.summary,
                 "hits": [h.to_json() for h in self.hits],
                 "tree": [self._node_json(n) for n in list(self.nodes.values())],
-            }
+            })
 
 
 def trace_assignments(binary, spec: dict, example: dict, max_steps: int = 6000,

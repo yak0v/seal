@@ -261,7 +261,12 @@ def witness_of(state) -> dict:
             if fspec:
                 fl = _decode_floats(int(v), bits, fspec)
                 if fl is not None:
-                    cell["floats"] = fl          # list of float lanes, shown instead of raw bytes
+                    # A symbolic coordinate can solve to a non-finite IEEE value (±inf / nan
+                    # — e.g. the CoreGraphics aa_lineto coordinate). Those are not JSON
+                    # compliant: starlette's encoder (allow_nan=False) 500s the whole run
+                    # result, and json.dumps's default emits bare Infinity (invalid JSON a
+                    # JS/strict client rejects). Keep the lane legible by tagging it.
+                    cell["floats"] = [_json_safe_float(x) for x in fl]
             out[key] = cell
 
     # byte inputs (stdin / files) — evaluated separately; these are independent of the
@@ -290,6 +295,16 @@ def witness_of(state) -> dict:
 def _fmt(v: int, bits: int) -> dict:
     signed = v if v < (1 << (bits - 1)) else v - (1 << bits)
     return {"u": v, "s": signed, "hex": hex(v), "bits": bits}
+
+
+def _json_safe_float(x):
+    """A finite float passes through; a non-finite one (±inf / nan) becomes a string tag
+    so the value survives JSON on both surfaces. The GUI's fmtFloat already renders a
+    non-numeric lane as-is, so this stays legible."""
+    import math
+    if isinstance(x, float) and not math.isfinite(x):
+        return "-inf" if x == float("-inf") else ("inf" if x == float("inf") else "nan")
+    return x
 
 
 # --------------------------------------------------------------------------- int_overflow
