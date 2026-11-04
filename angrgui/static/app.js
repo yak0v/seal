@@ -1984,7 +1984,7 @@ function renderTree(force) {
     const box = el("div", { class: "runnotes" });
     box.append(el("b", {}, "⚠ why this run turned out this way"));
     notes.forEach(n => box.append(el("div", { class: "rnote" }, n)));
-    pane.append(box);
+    pane.append(makeCollapsible(box, "coll:runnotes", true));
   }
   const truncBox = renderTruncation(snap);
   if (truncBox) pane.append(truncBox);
@@ -2330,6 +2330,33 @@ function pathsSummary(T, snap) {
 }
 const leafReason = (n, snap) => n.end?.reason || (["running", "pending"].includes(snap.status) ? "running" : "unfinished");
 
+// Make a diagnostics box collapsible by clicking its header. The box's first child is
+// the <b> header; everything after it is the body. Open/closed state persists per key so
+// these notes don't permanently crowd out the path view.
+function makeCollapsible(box, key, defaultOpen) {
+  const head = box.firstChild;
+  if (!head) return box;
+  let open;
+  try { const v = localStorage.getItem(key); open = v == null ? defaultOpen : v === "1"; }
+  catch (e) { open = defaultOpen; }
+  const body = Array.from(box.childNodes).slice(1);
+  const chev = el("span", { class: "collchev" });
+  head.insertBefore(chev, head.firstChild);
+  head.classList.add("collhead");
+  const apply = () => {
+    chev.textContent = open ? "▾ " : "▸ ";
+    body.forEach(n => { if (n.style) n.style.display = open ? "" : "none"; });
+    box.classList.toggle("collapsed", !open);
+  };
+  head.onclick = () => {
+    open = !open;
+    try { localStorage.setItem(key, open ? "1" : "0"); } catch (e) {}
+    apply();
+  };
+  apply();
+  return box;
+}
+
 // Concrete gates: branches a fixed value steered one way, whose other side was never
 // explored. Show each with its test + the exact field to make symbolic, and (for a
 // snapshot-seeded scenario) a one-click button to add that field to the symbolic overlay.
@@ -2356,7 +2383,7 @@ function renderGates(snap) {
       row.append(el("span", { class: "faint", style: "font-size:11px" }, "(deciding value is computed/loaded upstream — read the test + decompilation at " + g.at + ")"));
     box.append(row);
   });
-  return box;
+  return makeCollapsible(box, "coll:gates", true);
 }
 // Boundedness: a loop with an input-dependent trip count was cut at loop_bound. Show where,
 // and offer to raise the bound and re-run — the one actionable fix for the blind spot.
@@ -2376,7 +2403,7 @@ function renderTruncation(snap) {
   box.append(el("div", { class: "gaterow" },
     el("button", { class: "tiny primary", title: `raise limits.loop_bound to ${next} and re-run to explore deeper`,
       onclick: () => raiseLoopBound(next) }, `raise loop bound to ${next} & re-run`)));
-  return box;
+  return makeCollapsible(box, "coll:truncation", true);
 }
 function raiseLoopBound(n) {
   A.config.limits = A.config.limits || {};
