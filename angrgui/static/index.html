@@ -407,6 +407,13 @@ body.paths #dockGraph{flex:1 1 auto;height:auto}                 /* CFG graph fi
 #actBtn.live{border-color:var(--ok)}
 #actBtn.live::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);margin-right:5px;vertical-align:middle}
 .actbadge{display:none;background:var(--bad);color:#fff;border-radius:9px;padding:0 5px;font-size:10px;margin-left:2px}
+#runsBtn.runsind{align-items:center;gap:6px;border-color:var(--accent);color:var(--accent)}
+#runsBtn.runsind{display:none}
+#runsBtn.runsind.on{display:inline-flex}
+#runsMenu{position:fixed;z-index:70;min-width:240px;background:var(--panel,#111);border:1px solid var(--line,#333);border-radius:8px;padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+#runsMenu .runrow{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;font-size:12px}
+#runsMenu .runrow:hover{background:var(--hover,#1d2330)}
+#runsMenu .runrow .who{opacity:.65;font-size:10px;margin-left:auto}
 #actPanel{position:fixed;right:12px;bottom:12px;width:420px;max-width:92vw;max-height:60vh;z-index:60;
   background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 16px 50px rgba(0,0,0,.5);
   display:none;flex-direction:column;overflow:hidden}
@@ -654,6 +661,7 @@ kbd{background:#0b0f16;border:1px solid var(--line);border-bottom-width:2px;bord
   <button id="sessionBtn" class="tiny ghost" title="Save or load a .sdb session — the whole analysis of a binary (every function setup, every run with its findings and paths, targets). Auto-saves; a restart keeps it all.">Session ▾</button>
   <button id="idaBtn" class="tiny" title="Connect to an IDA MCP server for real names + decompilation">IDA: off</button>
   <button id="actBtn" class="tiny" title="Live activity — actions from you and from agents (MCP)">Activity <span id="actBadge" class="actbadge"></span></button>
+  <button id="runsBtn" class="tiny runsind" title="Runs in progress — yours and agents' (MCP). Click to watch one."><span class="busyspin"></span><span id="runsLabel"></span></button>
   <span id="busyInd" title="working…"><span class="busyspin"></span>working…</span>
   <div class="binfo" id="binfo">no binary loaded</div>
   <div class="grow"></div>

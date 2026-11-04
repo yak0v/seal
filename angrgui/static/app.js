@@ -71,6 +71,9 @@ const A = {
   _assume: null,
   activity: [],
   actOpen: false,
+  inflight: {},                 // run_id -> {func, run_id, active, step, hits, by, status}: every run
+                                // currently exploring (yours AND agents'), for the top-bar indicator
+  _runsMenu: null,
   // Default OFF: don't auto-jump to an agent's runs — many agents work concurrently, so
   // the view would thrash. An agent that WANTS to show you a function calls show_function
   // (a "focus" event), which overrides this. Remembered per browser.
@@ -102,6 +105,7 @@ async function init() {
   $("#fnSearch").addEventListener("input", renderFunctions);
   $("#onlyNamed").addEventListener("change", renderFunctions);
   $$(".tab").forEach(t => t.addEventListener("click", () => selectTab(t.dataset.tab)));
+  $("#runsBtn")?.addEventListener("click", (e) => { e.stopPropagation(); toggleRunsMenu(); });
   $("#idaBtn").addEventListener("click", openIdaModal);
   $("#actBtn").addEventListener("click", toggleActivity);
   $("#themeBtn").addEventListener("click", openThemeMenu);
@@ -639,8 +643,14 @@ function activeScenario() {
 }
 function renderState() {
   const pane = $("#pane-state"); if (!pane) return;
-  if (!A.fn || !A.func) { pane.replaceChildren(el("div", { class: "empty" }, "Select a function.")); return; }
+  // Three distinct situations, not one: no function picked, a function picked whose
+  // detail is still loading (A.fn set but A.func not yet — a slow/stuck /api/function
+  // on a lazy dyld-cache binary), and a loaded function. Collapsing them all into
+  // "Select a function." made the State tab look broken while a function was open.
+  if (!A.fn) { pane.replaceChildren(el("div", { class: "empty" }, "Select a function.")); return; }
+  if (!A.func) { pane.replaceChildren(el("div", { class: "empty" }, "Loading " + (A.fn.name || "function") + "…")); return; }
   const sc = activeScenario();
+  if (!sc) { pane.replaceChildren(el("div", { class: "empty" }, "This function has no scenario configured — add one in the right panel.")); return; }
   const init = sc && sc.initial_state;
   const wrap = el("div", { class: "statewrap" });
 
@@ -2549,7 +2559,7 @@ function fmtOne(name, v) {
   }
   if (typeof v.f === "number") return fmtFloat(v.f);           // legacy single-float field
   if (v.bits > 64) return bytesPretty(BigInt(v.hex).toString(16).padStart(v.bits / 4, "0"));
-  const arg = A.config?.args.find(a => a.name === name);
+  const arg = A.config?.args?.find(a => a.name === name);
   const signed = arg ? arg.signed !== false : false;
   const u = BigInt(v.hex), top = 1n << BigInt(v.bits - 1);
   const s = signed && u >= top ? u - (1n << BigInt(v.bits)) : u;
@@ -3498,6 +3508,10 @@ function connectEvents() {
       // function list; the server may now have a different binary than this tab last saw.
       if (A._everConnected) { refreshState(); loadFunctions(); }
       A._everConnected = true;
+      // A run already in flight before this tab connected isn't in the event stream, so
+      // pull the currently-running ones. Reset first so a run that finished while we were
+      // disconnected doesn't linger in the indicator.
+      A.inflight = {}; seedInflight();
     };
     es.onerror = () => setLiveDot(false);
     es.onmessage = (m) => { try { handleEvent(JSON.parse(m.data)); } catch (e) {} };
@@ -3507,6 +3521,7 @@ function connectEvents() {
 function setLiveDot(on) { const b = $("#actBtn"); if (b) b.classList.toggle("live", on); }
 
 function handleEvent(ev) {
+  trackInflight(ev);            // keep the top-bar "runs in progress" indicator current
   // run_progress fires ~every 0.7s during a run; collapse it to ONE rolling entry so the
   // feed shows live exploration without flooding (#6).
   if (ev.type === "run_progress") {
@@ -3563,6 +3578,97 @@ async function onAgentRun(ev) {
   A.run = { id: ev.run_id, snapshot: { status: "pending", progress: { message: "agent run" } } };
   A.selNode = null; A.pathHighlight = null; A.collapsed.clear(); A.loopCollapsed.clear();
   renderRight(); startPolling(); selectTab("paths");
+}
+
+// ---- Runs-in-progress indicator -------------------------------------------------
+// Every run — yours from the Run button, or an agent's over MCP — publishes `run` /
+// `run_progress` / `run_status` events. We keep the set of still-exploring runs here so
+// a persistent top-bar indicator shows them even when NOT following the agent (the
+// default), which is the only signal a human otherwise gets that an agent is working.
+function trackInflight(ev) {
+  const rid = ev.run_id;
+  if (!rid) return;
+  if (ev.type === "run" || ev.type === "run_progress" || ev.type === "finding") {
+    const cur = A.inflight[rid] || { run_id: rid, func: ev.func, active: 0, step: 0, hits: 0 };
+    if (ev.func != null) cur.func = ev.func;
+    if (ev.active != null) cur.active = ev.active;
+    if (ev.step != null) cur.step = ev.step;
+    if (ev.hits != null) cur.hits = ev.hits;
+    cur.status = "running";
+    if (ev.type === "run") cur.by = (ev.message || "").split(" ")[0] || "someone";   // "agent"/"gui"/"you"
+    A.inflight[rid] = cur;
+    renderRunsIndicator();
+  } else if (ev.type === "run_status" && ["done", "cancelled", "error"].includes(ev.status)) {
+    delete A.inflight[rid];
+    renderRunsIndicator();
+  }
+}
+
+function renderRunsIndicator() {
+  const btn = $("#runsBtn"), lbl = $("#runsLabel");
+  if (!btn || !lbl) return;
+  const runs = Object.values(A.inflight);
+  if (!runs.length) { btn.classList.remove("on"); closeRunsMenu(); return; }
+  const agentN = runs.filter(r => r.by === "agent").length;
+  lbl.textContent = runs.length === 1
+    ? ((runs[0].by === "agent" ? "agent run" : "run") + (runs[0].active ? " · " + runs[0].active + " paths" : ""))
+    : (runs.length + " runs" + (agentN ? " (" + agentN + " agent)" : ""));
+  btn.classList.add("on");
+}
+
+// Attach the main view to a run and watch it live — regardless of followAgent. This is
+// how a human opens an agent's in-progress run from the indicator.
+async function watchRun(rid, func) {
+  closeRunsMenu();
+  if (func != null) {
+    const f = (A.functions || []).find(x => x.addr === func);
+    if (f && (!A.fn || A.fn.addr !== func)) await selectFunction(f);
+  }
+  const known = A.inflight[rid];
+  A.run = { id: rid, snapshot: { status: "pending", progress: { message: "watching run" }, summary: known ? { active: known.active } : {} } };
+  A.selNode = null; A.pathHighlight = null;
+  renderRight(); startPolling(); selectTab("paths");
+}
+
+function closeRunsMenu() { if (A._runsMenu) { A._runsMenu.remove(); A._runsMenu = null; } }
+
+function toggleRunsMenu() {
+  if (A._runsMenu) { closeRunsMenu(); return; }
+  const runs = Object.values(A.inflight);
+  if (runs.length === 1) { watchRun(runs[0].run_id, runs[0].func); return; }
+  const btn = $("#runsBtn"); if (!btn) return;
+  const r = btn.getBoundingClientRect();
+  const menu = el("div", { id: "runsMenu" });
+  runs.forEach(run => {
+    const name = (A.functions || []).find(x => x.addr === run.func)?.name || ("0x" + (run.func >>> 0).toString(16));
+    menu.append(el("div", { class: "runrow", onclick: () => watchRun(run.run_id, run.func) },
+      el("span", { class: "busyspin" }), el("span", {}, name),
+      el("span", { class: "who" }, (run.by === "agent" ? "agent" : "you") + (run.active ? " · " + run.active + "p" : ""))));
+  });
+  document.body.append(menu);
+  menu.style.top = (r.bottom + 4) + "px"; menu.style.left = r.left + "px";
+  A._runsMenu = menu;
+  setTimeout(() => document.addEventListener("click", _runsOutside), 0);
+}
+function _runsOutside(e) {
+  if (A._runsMenu && !A._runsMenu.contains(e.target) && e.target.id !== "runsBtn" && e.target.closest("#runsBtn") == null) {
+    closeRunsMenu(); document.removeEventListener("click", _runsOutside);
+  }
+}
+
+// Seed the indicator on (re)connect: a run an agent started BEFORE this tab opened (or
+// before a reconnect) isn't in the event stream, so pull currently-running runs once.
+async function seedInflight() {
+  try {
+    const d = await api("/api/runs");
+    for (const r of (d.runs || [])) {
+      if (["pending", "running"].includes(r.status) && !A.inflight[r.id]) {
+        A.inflight[r.id] = { run_id: r.id, func: parseInt(r.func, 16) || r.func, active: 0, hits: r.findings || 0,
+                             by: r.by === "agent" ? "agent" : "you", status: "running" };
+      }
+    }
+    renderRunsIndicator();
+  } catch (e) {}
 }
 
 function renderActivity() {
