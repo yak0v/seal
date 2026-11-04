@@ -132,6 +132,15 @@ body.busy{cursor:progress}
 .nbnote{color:var(--dim);font-size:12px;font-style:italic}
 .nbrun{padding:7px 9px;border:1px solid var(--line);border-radius:7px;margin:5px 0;background:var(--chip)}
 .nbrunnote{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--text);padding:2px 6px;font-size:12px}
+.nbstats{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:5px}
+.nbstat{font-size:11px;color:var(--text);white-space:nowrap}
+.nbstat i{font-style:normal;color:var(--faint,#8a93a6);margin-right:4px}
+.nbstat.warnstat{color:var(--warn,#e0a33a)}
+.nbstat.badstat{color:var(--bad,#e0574a)}
+.nbstat.okstat{color:var(--ok,#4ac07a)}
+.nbfindings{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.nbnotes{margin-top:5px}
+.nbnote{font-size:11px;color:var(--faint,#8a93a6);line-height:1.4}
 .runnotes{margin:8px 6px;padding:8px 10px;border:1px solid var(--warn);border-radius:8px;background:rgba(227,179,65,.08)}
 .runnotes>b{display:block;color:var(--warn);font-size:12px;margin-bottom:4px}
 .runnotes .rnote{font-size:12px;color:var(--dim);line-height:1.45;margin:3px 0}

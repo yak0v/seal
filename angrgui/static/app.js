@@ -595,19 +595,69 @@ async function renderNotebook() {
   wrap.append(rsec);
   pane.replaceChildren(wrap);
 }
+// Short "2.3s" / "840ms" for an elapsed-seconds number.
+function fmtElapsed(s) {
+  if (s == null) return null;
+  return s >= 1 ? (+s).toFixed(1) + "s" : Math.round(s * 1000) + "ms";
+}
+// A small faint "label value" stat; omitted when the value is null.
+function nbStat(label, value, cls) {
+  if (value == null || value === "") return null;
+  return el("span", { class: "nbstat " + (cls || "") }, el("i", {}, label), String(value));
+}
 function nbRunRow(r) {
   const when = r.when ? new Date(r.when * 1000).toLocaleString() : "";
   const verdictPill = r.review ? el("span", { class: "pill " + (r.review === "good" ? "ok" : r.review === "bad" ? "bad" : "warn") }, r.review) : null;
   const noteIn = el("input", { class: "nbrunnote", value: r.note || "", placeholder: "note…",
     onchange: async e => { try { await jpost(`/api/runs/${r.id}/note`, { note: e.target.value }); toast("note saved"); } catch (err) { toast("save failed", true); } } });
   const review = async (v) => { try { await jpost(`/api/runs/${r.id}/review`, { verdict: v }); toast("marked " + v); renderNotebook(); } catch (e) { toast("failed", true); } };
-  return el("div", { class: "nbrun" },
-    el("div", { class: "row", style: "gap:8px;align-items:center" },
-      el("a", { href: "#", class: "nbfn", onclick: e => { e.preventDefault(); goToFn(r.func, r.id); } }, r.func_name || r.func),
-      el("span", { class: "pill " + (r.findings ? "bad" : "") }, (r.findings || 0) + " finding" + (r.findings === 1 ? "" : "s")),
-      el("span", { class: "faint mono", style: "font-size:11px" }, (r.by || "") + " · " + (r.checks || []).join(",")),
-      verdictPill, el("span", { class: "grow" }),
-      el("span", { class: "faint", style: "font-size:11px" }, when)),
+
+  // status pill: a cancelled/errored run is NOT the same as a clean 0-finding "done"
+  const st = r.status || "done";
+  const stCls = st === "error" ? "bad" : st === "cancelled" ? "warn" : st === "running" || st === "pending" ? "info" : "";
+  const m = r.metrics || {};
+  const cov = r.coverage || {};
+  const conf = r.confidence || {};
+
+  // header: function · status · findings · scenario · who/checks · verdict · time
+  const header = el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" },
+    el("a", { href: "#", class: "nbfn", onclick: e => { e.preventDefault(); goToFn(r.func, r.id); } }, r.func_name || r.func),
+    el("span", { class: "pill " + stCls, style: "font-size:10px" }, st),
+    el("span", { class: "pill " + (r.findings ? "bad" : "ok") }, (r.findings || 0) + " finding" + (r.findings === 1 ? "" : "s")),
+    r.scenario ? el("span", { class: "pill info", title: r.seeded ? "concolic snapshot seed" : "scenario", style: "font-size:10px" },
+      (r.seeded ? "◆ " : "") + r.scenario) : null,
+    el("span", { class: "faint mono", style: "font-size:11px" }, (r.by || "") + (r.checks && r.checks.length ? " · " + r.checks.join(",") : "")),
+    verdictPill, el("span", { class: "grow" }),
+    el("span", { class: "faint", style: "font-size:11px" }, when));
+
+  // metrics strip: coverage, paths, counts, confidence, gates — only what's present
+  const stats = el("div", { class: "nbstats" },
+    nbStat("coverage", cov.pct != null ? cov.pct + "%" + (cov.blocks_total ? ` (${cov.blocks_covered}/${cov.blocks_total} blk)` : "") : null,
+      cov.pct != null && cov.pct < 60 ? "warnstat" : ""),
+    nbStat("paths", m.nodes),
+    nbStat("ended", m.deadended),
+    nbStat("unconstrained", m.unconstrained, m.unconstrained ? "warnstat" : ""),
+    nbStat("errored", m.errored, m.errored ? "badstat" : ""),
+    nbStat("steps", m.steps),
+    nbStat("time", fmtElapsed(m.elapsed)),
+    conf.confirmed ? nbStat("confirmed", conf.confirmed, "okstat") : null,
+    conf.conditional ? nbStat("conditional", conf.conditional, "warnstat") : null,
+    r.gates ? nbStat("gates", r.gates, "warnstat") : null,
+    r.truncated ? el("span", { class: "nbstat warnstat", title: "a loop bound truncated exploration" }, el("i", {}, "⚠"), "loop-truncated") : null);
+
+  // per-finding chips: kind @addr with a confidence tint — click to open the run there
+  const fl = r.finding_list || [];
+  const findings = fl.length ? el("div", { class: "nbfindings" }, ...fl.map(h =>
+    el("span", { class: "pill " + (h.confidence === "conditional" ? "warn" : "bad"), style: "cursor:pointer;font-size:10px",
+      title: h.message || "", onclick: () => goToFn(r.func, r.id) },
+      h.kind + " @" + (h.addr || "?") + (h.confidence === "conditional" ? " (conditional)" : "")))) : null;
+
+  // diagnostic notes the engine attached (why a run found nothing / what to change)
+  const notes = (r.notes && r.notes.length)
+    ? el("div", { class: "nbnotes" }, ...r.notes.slice(0, 3).map(n => el("div", { class: "nbnote" }, "• " + n)))
+    : null;
+
+  return el("div", { class: "nbrun" }, header, stats, findings, notes,
     el("div", { class: "row", style: "gap:6px;margin-top:4px;align-items:center" },
       el("span", { class: "faint", style: "font-size:11px" }, "review:"),
       btn("✓ good", () => review("good"), "tiny"), btn("↻ refine", () => review("refine"), "tiny"),

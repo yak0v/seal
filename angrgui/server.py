@@ -743,17 +743,37 @@ def _persist_run_record(run_id: str, spec: dict, source: str):
     findings = list((snap or {}).get("hits", []) or [])
     scen_names = spec.get("scenarios") or []
     scen = scen_names[spec["active"]] if (0 <= spec.get("active", 0) < len(scen_names)) else None
+    # Scenario name + whether this run was concolic (snapshot-seeded). An MCP/REST run
+    # spec is usually FLAT (no scenarios[]), so fall back to the function's saved active
+    # scenario, and read the seed from the spec's top-level initial_state.
+    scen_name = scen.get("name") if isinstance(scen, dict) else scen
+    seeded = (spec.get("initial_state") or {}).get("kind") == "snapshot"
+    if (scen_name is None or not seeded) and S.workspace is not None:
+        try:
+            cfg = S.workspace.get_function(spec["func_addr"]) or {}
+            scs = cfg.get("scenarios") or []
+            act = cfg.get("active", 0)
+            if 0 <= act < len(scs):
+                scen_name = scen_name or scs[act].get("name")
+                seeded = seeded or (scs[act].get("initial_state") or {}).get("kind") == "snapshot"
+        except Exception:
+            pass
     rec = {
         "id": run_id,
         "func": spec["func_addr"],
         "func_name": _fname(spec["func_addr"]),
         "when": time.time(),
         "by": source,                       # "gui" (user) or "agent"
-        "scenario": scen,
+        "scenario": scen_name,
+        "seeded": bool(seeded),
         "status": summary.get("status") or (snap or {}).get("status"),
         "summary": {k: summary.get(k) for k in
                     ("hits", "steps", "active", "deadended", "unconstrained", "errored",
-                     "nodes", "elapsed", "found", "notes", "stopped") if k in summary},
+                     "nodes", "elapsed", "found", "notes", "stopped",
+                     # trust/direction signals, so the Notebook history shows WHY a run
+                     # looks the way it does (how much it explored, how sure, what blocked it)
+                     "coverage", "confidence", "concrete_gates", "truncation",
+                     "assumptions_applied") if k in summary},
         "findings": findings,
         "checks": [c.get("name") or c.get("kind") for c in spec.get("checks", []) if c.get("enabled", True)],
         "review": None,                     # user verdict: good | bad | refine (#9)
@@ -1467,13 +1487,51 @@ def _mcp_list_runs(func=None, limit=50):
     fa = _addr(func) if func is not None else None
     recs = S.workspace.runs(fa) if S.workspace else []
     recs = sorted(recs, key=lambda r: r.get("when", 0), reverse=True)[:int(limit)]
-    # a compact view — full findings via get_run(run_id)
-    return [{"id": r.get("id"), "func": hex(r["func"]) if r.get("func") is not None else None,
-             "func_name": r.get("func_name"), "when": r.get("when"), "by": r.get("by"),
-             "scenario": r.get("scenario"), "status": r.get("status"),
-             "findings": (r.get("summary") or {}).get("hits", len(r.get("findings") or [])),
-             "checks": r.get("checks"), "review": r.get("review"), "note": r.get("note")}
-            for r in recs]
+    return [_run_list_entry(r) for r in recs]
+
+
+def _run_list_entry(r: dict) -> dict:
+    """One row for list_runs / the GUI Notebook: identity + a compact but informative
+    digest — status, scenario, how much was explored (coverage), how trustworthy
+    (confidence), what blocked it (concrete-gate count), the run counts, and a brief
+    per-finding list (kind @addr + confidence). Full witnesses stay in get_run(id)."""
+    summ = r.get("summary") or {}
+    cov = summ.get("coverage") or {}
+    findings = r.get("findings") or []
+    brief = [{"kind": h.get("kind"),
+              "addr": (hex(h["addr"]) if isinstance(h.get("addr"), int) else h.get("addr")),
+              "confidence": (h.get("extra") or {}).get("confidence"),
+              "message": h.get("message")}
+             for h in findings[:16]]
+    scen = r.get("scenario")
+    scen_name = scen.get("name") if isinstance(scen, dict) else scen          # older records stored the dict
+    seeded = r.get("seeded")
+    if seeded is None:                                                        # older record: infer from the dict
+        seeded = bool(isinstance(scen, dict) and (scen.get("initial_state") or {}).get("kind") == "snapshot")
+    return {
+        "id": r.get("id"),
+        "func": hex(r["func"]) if r.get("func") is not None else None,
+        "func_name": r.get("func_name"),
+        "when": r.get("when"),
+        "by": r.get("by"),
+        "scenario": scen_name,
+        "seeded": bool(seeded),
+        "status": r.get("status"),
+        "findings": summ.get("hits", len(findings)),
+        "checks": r.get("checks"),
+        "metrics": {k: summ.get(k) for k in
+                    ("steps", "nodes", "active", "deadended", "unconstrained", "errored", "elapsed")
+                    if summ.get(k) is not None},
+        "coverage": ({"pct": cov.get("pct"), "blocks_covered": cov.get("blocks_covered"),
+                      "blocks_total": cov.get("blocks_total")} if cov else None),
+        "confidence": summ.get("confidence"),
+        "gates": len(summ.get("concrete_gates") or []) or None,
+        "truncated": bool(summ.get("truncation")),
+        "finding_list": brief,
+        "notes": summ.get("notes"),
+        "review": r.get("review"),
+        "note": r.get("note"),
+    }
 
 
 def _mcp_review_run(run_id, verdict, note=None):
