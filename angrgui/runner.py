@@ -92,6 +92,34 @@ from .pretty import printer_for_state
 log = logging.getLogger("angrgui.runner")
 
 
+def _SafeLoopSeer():
+    """angr's LoopSeer.successors indexes its per-loop trip-count lists with [-1] for
+    addresses it never seeded — a loop EXIT node that isn't a body node, or a loop first
+    entered mid-body (exactly what a concolic snapshot seed does when `pc` lands inside a
+    loop). The list is empty, `[-1]` raises IndexError, and the exception propagates out
+    of simgr.step() and kills the whole run. Subclass it so a bookkeeping slip degrades to
+    'this one state isn't loop-bounded for this step' instead of aborting the run — we
+    still return real successors, just without the (crashing) trip accounting. Returns the
+    class lazily so the import only happens when loop bounding is requested."""
+    from angr.exploration_techniques import LoopSeer
+
+    class SafeLoopSeer(LoopSeer):
+        glitches = 0
+
+        def successors(self, simgr, state, **kwargs):
+            try:
+                return super().successors(simgr, state, **kwargs)
+            except IndexError:
+                # The partial successors object super() built is discarded; recompute a
+                # clean one (what the simgr would do with no technique on this step).
+                type(self).glitches += 1
+                log.debug("LoopSeer trip-count underflow at %s; stepping unbounded",
+                          hex(getattr(state, "addr", 0) or 0))
+                return simgr.successors(state, **kwargs)
+
+    return SafeLoopSeer
+
+
 def _json_safe(obj):
     """Recursively replace non-finite floats (±inf / nan) with string tags so a run
     snapshot — the neutral contract the GUI (REST) and the agent (MCP) both read — can
@@ -192,6 +220,7 @@ class Run:
         self._printer = str
         self._return_addr = None
         self._loop_bound = 0
+        self._timed_out = False       # set if the run broke on the time budget (-> completion="timeout")
         self._skip_ret_names: dict = {}        # call-site addr -> readable name for its skipped-call return
         self._branches: dict = {}              # branch block addr -> {taken:set, sym:bool}: concrete-gate tracking
         self._concretized: list = []           # lossy symbolic-address concretizations (under-report warning)
@@ -237,6 +266,25 @@ class Run:
             state.regs.eflags = claripy.BVV(val, self.arch.bits)
         else:
             setattr(state.regs, "flags", claripy.BVV(val, self.arch.bits))
+
+    def _apply_assumptions(self, state):
+        """Turn the spec's assumptions into entry constraints on `state`. Shared by the
+        fresh-call and snapshot paths — a snapshot seed must honour assumptions too
+        (they reference its symbolic overlay vars / registers / mem), otherwise a
+        concolic run silently ignores every constraint the caller set."""
+        applied = []
+        for src in self.spec.get("assumptions", []):
+            src = (src or "").strip()
+            if not src:
+                continue
+            try:
+                ast = as_bool(make_evaluator(state)(src))
+                state.add_constraints(ast)
+                applied.append(src)
+            except ExprError as e:
+                raise ValueError(f"assumption {src!r}: {e}")
+        self.summary["assumptions_applied"] = applied
+        return applied
 
     def _build_state_from_snapshot(self, snap: dict, opts: set):
         """Concolic seed: start from a REAL execution state (registers + memory captured
@@ -354,6 +402,9 @@ class Run:
                 self._install_core_paging(state, snap["core"], mem_overlays, img)
             except Exception as e:
                 log.warning("core paging unavailable: %s", e)
+        # Honour assumptions on a concolic seed too (they constrain the symbolic overlay
+        # fields / registers / memory). Done last, after angrgui_vars is populated.
+        self._apply_assumptions(state)
         return state
 
     def _install_core_paging(self, state, core_path, mem_overlays, img):
@@ -570,18 +621,7 @@ class Run:
         state.globals["angrgui_bufmembers"] = bufmembers
 
         # assumptions
-        applied = []
-        for src in self.spec.get("assumptions", []):
-            src = src.strip()
-            if not src:
-                continue
-            try:
-                ast = as_bool(make_evaluator(state)(src))
-                state.add_constraints(ast)
-                applied.append(src)
-            except ExprError as e:
-                raise ValueError(f"assumption {src!r}: {e}")
-        self.summary["assumptions_applied"] = applied
+        self._apply_assumptions(state)
 
         # AUTONOMIC VALIDATION CHECK: if the function dereferences a pointer-width
         # symbolic arg that has NO buffer set up, the reads go to unmapped/zero memory
@@ -1295,8 +1335,7 @@ class Run:
             # forever; over-the-bound states go to the 'spinning' stash.
             if loop_bound > 0 and self.func is not None:
                 try:
-                    from angr.exploration_techniques import LoopSeer
-                    simgr.use_technique(LoopSeer(
+                    simgr.use_technique(_SafeLoopSeer()(
                         cfg=self.binary.cfg_for(self.func_addr), functions=[self.func],
                         bound=loop_bound, limit_concrete_loops=False))
                 except Exception as e:  # best effort
@@ -1309,6 +1348,7 @@ class Run:
                     break
                 if time.time() - self.start_time > max_seconds:
                     self.progress["message"] = "time budget reached"
+                    self._timed_out = True
                     break
 
                 simgr.step()
@@ -1607,23 +1647,31 @@ class Run:
         lim = self.spec.get("limits", {}) or {}
         max_steps = int(lim.get("steps", 200)); max_seconds = float(lim.get("seconds", 30))
         find = lim.get("find")
+        # completion: a MACHINE-READABLE reason the run ended, distinct from `status`
+        # (which stays done/error/cancelled so the agent's "poll until done/error" still
+        # works). A run that hit the time budget or the step limit DID NOT finish exploring
+        # — surfacing it as "timeout"/"bounded" (not "complete") stops a cut-off run from
+        # reading as an exhaustive all-clear. (`stopped` is the human sentence for the GUI.)
         if self.status == "cancelled":
-            stopped = "cancelled"
+            stopped, completion = "cancelled", "cancelled"
         elif self.status == "error":
-            stopped = "errored: " + (self.error or "unknown")[:120]
+            stopped, completion = "errored: " + (self.error or "unknown")[:120], "error"
         elif find and getattr(simgr, "found", []):
-            stopped = "reached the find target"
+            stopped, completion = "reached the find target", "complete"
         elif not simgr.active:
-            stopped = "explored all reachable paths (complete)"
+            stopped, completion = "explored all reachable paths (complete)", "complete"
+        elif self._timed_out or self.progress["elapsed"] >= max_seconds * 0.9:
+            stopped = f"hit the time budget ({max_seconds:g}s) — raise 'seconds'"
+            completion = "timeout"
         elif self.progress["step"] >= max_steps:
             stopped = f"hit the step limit ({max_steps}) — raise 'steps' to explore deeper"
-        elif self.progress["elapsed"] >= max_seconds * 0.9:
-            stopped = f"hit the time budget ({max_seconds:g}s) — raise 'seconds'"
+            completion = "bounded"
         else:
-            stopped = "stopped"
+            stopped, completion = "stopped", "bounded"
         self.summary.update({
             "status": self.status,
             "stopped": stopped,
+            "completion": completion,
             "steps": self.progress["step"],
             "active": len(simgr.active),
             "deadended": len(simgr.deadended),

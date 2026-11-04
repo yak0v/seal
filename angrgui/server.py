@@ -769,7 +769,7 @@ def _persist_run_record(run_id: str, spec: dict, source: str):
         "status": summary.get("status") or (snap or {}).get("status"),
         "summary": {k: summary.get(k) for k in
                     ("hits", "steps", "active", "deadended", "unconstrained", "errored",
-                     "nodes", "elapsed", "found", "notes", "stopped",
+                     "nodes", "elapsed", "found", "notes", "stopped", "completion",
                      # trust/direction signals, so the Notebook history shows WHY a run
                      # looks the way it does (how much it explored, how sure, what blocked it)
                      "coverage", "confidence", "concrete_gates", "truncation",
@@ -1517,6 +1517,8 @@ def _run_list_entry(r: dict) -> dict:
         "scenario": scen_name,
         "seeded": bool(seeded),
         "status": r.get("status"),
+        "completion": summ.get("completion"),      # complete | bounded | timeout | cancelled | error
+        "stopped": summ.get("stopped"),            # the human sentence for why it ended
         "findings": summ.get("hits", len(findings)),
         "checks": r.get("checks"),
         "metrics": {k: summ.get(k) for k in
@@ -1596,6 +1598,19 @@ def _mcp_resolve_target(func, status="done"):
     return {"ok": True, "func": hex(a), "status": status}
 
 
+def _project_path_node(n: dict) -> dict:
+    """One path-tree node for the MCP `get_run` reply. Carries the block addresses on the
+    path and (for a leaf) the `example` inputs the GUIDE promises, so the agent doesn't
+    need a separate path_values round-trip just to see how a path ended and with what."""
+    end = n.get("end") or {}
+    out = {"id": n["id"], "parent": n["parent"], "cond": n.get("cond"), "kind": n.get("kind"),
+           "addr": n.get("addr"), "blocks": n.get("blocks"),
+           "end": end.get("reason"), "detail": end.get("text"), "hits": n.get("hits")}
+    if n.get("example"):                       # inputs for this path (present on classified leaves)
+        out["example"] = n["example"]
+    return out
+
+
 def _mcp_get_run(run_id):
     r = S.runs.get(run_id)
     if r is None:
@@ -1603,9 +1618,7 @@ def _mcp_get_run(run_id):
         # with its paths/findings intact (not just the compact record).
         snap = S.workspace.get_run_snapshot(run_id) if S.workspace else None
         if snap is not None:
-            tree = [{"id": n["id"], "parent": n["parent"], "cond": n["cond"], "kind": n["kind"],
-                     "end": (n.get("end") or {}).get("reason"), "detail": (n.get("end") or {}).get("text"),
-                     "hits": n["hits"]} for n in snap.get("tree", [])]
+            tree = [_project_path_node(n) for n in snap.get("tree", [])]
             return {"status": snap.get("status"), "error": snap.get("error"), "stored": True,
                     "summary": snap.get("summary"), "findings": snap.get("hits"), "paths": tree}
         # else fall back to the lightweight record (its snapshot was pruned)
@@ -1621,9 +1634,7 @@ def _mcp_get_run(run_id):
     # expose the end REASON plus its human text, so an agent can see WHY a path ended —
     # e.g. the exact angr/decode error or the undetermined indirect-call site — not just
     # a bare "error"/"unknown_call" code.
-    tree = [{"id": n["id"], "parent": n["parent"], "cond": n["cond"], "kind": n["kind"],
-             "end": (n["end"] or {}).get("reason"), "detail": (n["end"] or {}).get("text"),
-             "hits": n["hits"]} for n in snap["tree"]]
+    tree = [_project_path_node(n) for n in snap["tree"]]
     return {"status": snap["status"], "error": snap["error"], "summary": snap["summary"],
             "findings": snap["hits"], "paths": tree}
 
@@ -2057,8 +2068,9 @@ PART 6 — READING RESULTS (don't skip this — it's half the job)
 
 get_run(run_id) returns:
   • status: "pending" | "running" | "done" | "error" | "cancelled". POLL until it's
-    not pending/running.
-  • findings: a list. Each: {kind, addr (integer), message, witness, extra, node}.
+    not pending/running. (WHY it ended — exhausted vs cut off — is summary.completion.)
+  • findings: a list. Each: {id, check_id, kind, addr (integer), message, witness, extra}.
+    The path index a finding came from is extra.node (not a top-level field).
     extra.confidence tells you how much to trust it:
       "confirmed"   — the triggering value is driven only by inputs YOU made symbolic.
       "conditional" — it also depends on the unconstrained return of a SKIPPED call
@@ -2067,10 +2079,17 @@ get_run(run_id) returns:
                       it with constrain_return(call=<the depends_on callee>, max=/values=)
                       and re-run: a bound that rules out the triggering value dismisses
                       the finding; one that still allows it confirms the lead is real.
-  • tree: the path tree — nodes with ids, parent links, the block addresses on each
-    path, and per-leaf an "example" (inputs for that path) and a classification
-    (deadended / returned / unconstrained / errored).
+  • paths: the path tree (KEY IS `paths`, not `tree`). Each node:
+    {id, parent, cond, kind, addr (block start), blocks (addresses on the path), end
+    (reason: deadended/returned/unconstrained/errored/…), detail, hits}. A classified
+    LEAF also carries "example" — the concrete inputs for that path. Per-instruction
+    values along a path come from path_values(run_id, node-id).
   • summary: counts, plus:
+      completion — WHY the run ended, machine-readable: "complete" (explored every
+        reachable path), "bounded" (hit the step limit — more to explore), "timeout" (hit
+        the time budget), "cancelled", "error". status stays done/error/cancelled; a
+        "bounded"/"timeout" run with 0 findings is "ran out of budget", NOT an all-clear —
+        raise limits.steps / limits.seconds (or narrow the scope) and re-run.
       coverage {blocks_covered, blocks_total, pct, unreached[]} — how much of the
         function the run actually explored. pct<100 with 0 findings does NOT mean safe;
         the bug may be in an unreached block. Raise steps/loop_bound, relax assumptions,
@@ -2092,9 +2111,10 @@ get_run(run_id) returns:
       notes[] — plain-English hints (why a run was empty, which calls to model, etc.).
 
 THE WITNESS maps each input NAME to its value:
-  • a number → {"hex": "0x..", "s": <signed decimal>, "bits": N}. That is the exact
-    value the solver chose. For a narrowing/overflow finding it's the value that
-    triggers the bug; for a reach it's the input that gets there.
+  • a number → {"hex": "0x..", "s": <signed decimal>, "u": <unsigned decimal>, "bits": N}.
+    That is the exact value the solver chose. For a narrowing/overflow finding it's the
+    value that triggers the bug; for a reach it's the input that gets there. A float/vector
+    field also carries "floats": the lane value(s) (±inf/nan come through as those strings).
   • stdin / a file → a byte string.
 Read it and report it — it is the proof.
 

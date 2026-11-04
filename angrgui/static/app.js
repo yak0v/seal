@@ -615,6 +615,12 @@ function nbRunRow(r) {
   // status pill: a cancelled/errored run is NOT the same as a clean 0-finding "done"
   const st = r.status || "done";
   const stCls = st === "error" ? "bad" : st === "cancelled" ? "warn" : st === "running" || st === "pending" ? "info" : "";
+  // completion: WHY it ended. A "done" run that timed out or hit the step limit didn't
+  // finish — tag it so a 0-finding run isn't mistaken for an all-clear.
+  const compLabels = { timeout: "⏱ timeout", bounded: "✂ bounded" };
+  const compPill = compLabels[r.completion]
+    ? el("span", { class: "pill warn", style: "font-size:10px", title: r.stopped || "ran out of budget — not exhaustive" }, compLabels[r.completion])
+    : null;
   const m = r.metrics || {};
   const cov = r.coverage || {};
   const conf = r.confidence || {};
@@ -623,6 +629,7 @@ function nbRunRow(r) {
   const header = el("div", { class: "row", style: "gap:8px;align-items:center;flex-wrap:wrap" },
     el("a", { href: "#", class: "nbfn", onclick: e => { e.preventDefault(); goToFn(r.func, r.id); } }, r.func_name || r.func),
     el("span", { class: "pill " + stCls, style: "font-size:10px" }, st),
+    compPill,
     el("span", { class: "pill " + (r.findings ? "bad" : "ok") }, (r.findings || 0) + " finding" + (r.findings === 1 ? "" : "s")),
     r.scenario ? el("span", { class: "pill info", title: r.seeded ? "concolic snapshot seed" : "scenario", style: "font-size:10px" },
       (r.seeded ? "◆ " : "") + r.scenario) : null,
@@ -2317,13 +2324,22 @@ function pathsSummary(T, snap) {
         title: `a loop with an input-dependent trip count was cut at ${trunc.bound} iterations on ${trunc.paths_cut} path(s) — bugs needing more iterations are NOT covered; raise the loop bound` },
         `bounded @ ${trunc.bound} loops`)
     : null;
+  // how the run ENDED: "complete" (exhausted) is the happy case; "timeout"/"bounded"
+  // mean it ran out of budget, so a 0-finding result isn't an all-clear. Show it loudly.
+  const completion = snap.summary?.completion;
+  const compLabels = { timeout: "⏱ timed out", bounded: "✂ step-bounded" };
+  const compPill = (completion && compLabels[completion])
+    ? el("span", { class: "pill warn",
+        title: (snap.summary?.stopped || "") + " — a 0-finding result here means 'ran out of budget', not 'safe'" },
+        compLabels[completion])
+    : null;
   const confPills = [
     conf.confirmed ? el("span", { class: "pill ok", title: "findings driven only by your symbolic inputs" }, `${conf.confirmed} confirmed`) : null,
     conf.conditional ? el("span", { class: "pill warn", title: "findings that depend on a skipped call's return — leads to resolve with a return bound" }, `${conf.conditional} conditional`) : null,
   ].filter(Boolean);
   return el("div", { class: "psum" },
     el("b", {}, `${leaves.length} path${leaves.length === 1 ? "" : "s"}:`), ...parts,
-    covPill, truncPill,
+    covPill, truncPill, compPill,
     el("span", { class: "grow" }),
     ...confPills,
     hits ? el("span", { class: "pill bad" }, `${hits} finding${hits > 1 ? "s" : ""}`) : el("span", { class: "faint" }, "no findings"));
