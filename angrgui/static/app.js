@@ -1797,7 +1797,30 @@ function stopPolling() { if (A.pollTimer) { clearInterval(A.pollTimer); A.pollTi
 async function pollRun() {
   if (!A.run) return;
   let snap;
-  try { snap = await api("/api/run/" + A.run.id, undefined, true); } catch (e) { stopPolling(); return; }
+  try {
+    snap = await api("/api/run/" + A.run.id, undefined, true);
+    A._pollFails = 0;
+  } catch (e) {
+    // The backend didn't answer. A solver out-of-memory or native crash (e.g. libz3
+    // small_object_allocator::allocate under heavy constraint load) takes down the whole
+    // server, and silently stopping here left the run spinning "running"/"Exploring…"
+    // forever — the GUI claiming a dead run is still live. Tolerate a couple of transient
+    // misses (a brief network blip), then declare the run lost so the UI stops lying.
+    A._pollFails = (A._pollFails || 0) + 1;
+    if (A._pollFails < 3) return;
+    stopPolling();
+    const cur = A.run.snapshot || {};
+    if (["pending", "running"].includes(cur.status)) {
+      A.run.snapshot = { ...cur, status: "error",
+        error: "backend stopped responding — the run may have crashed (e.g. a solver out-of-memory). Check the SEAL server, then reload.",
+        summary: { ...(cur.summary || {}), status: "error",
+                   stopped: "backend stopped responding (possible crash)", completion: "error" } };
+      if (A.inflight && A.inflight[A.run.id]) { delete A.inflight[A.run.id]; renderRunsIndicator(); }
+      renderRight(); renderTree();
+      toast("backend stopped responding — run marked as crashed", true);
+    }
+    return;
+  }
   A.run.snapshot = snap;
   renderRight();
   renderTree();
