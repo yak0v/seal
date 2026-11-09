@@ -698,6 +698,25 @@ async function goToFn(addr, runId) {
 function activeScenario() {
   return A.func && A.func.scenarios ? A.func.scenarios[A.func.active] : null;
 }
+// Human label for a snapshot symbolic overlay. A field is one of THREE shapes: a whole
+// register {reg}, an absolute address {addr}, or a register-relative field {base, offset}
+// (the documented load_snapshot form, e.g. {base:"x0",offset:"0xb0"}). The last has
+// neither reg nor addr, so the old `s.reg || hx64(s.addr)` fed hx64(undefined) ->
+// BigInt(undefined) and threw, breaking the whole State render.
+function symLoc(s) {
+  if (s.reg) return s.reg;
+  if (s.addr != null) return hx64(s.addr);
+  if (s.base != null) return "[" + s.base + (s.offset != null ? " + " + s.offset : "") + "]";
+  return "mem";
+}
+// Parse-compatible token for the "symbolic fields" text input (reg / 0xaddr / base+offset,
+// matching the reg+offset form the Apply handler re-parses) — NOT the bracketed display form.
+function symTok(s) {
+  if (s.reg) return s.reg;
+  if (s.addr != null) return hx64(s.addr);
+  if (s.base != null) return s.base + "+" + (s.offset != null ? s.offset : "0");
+  return "";
+}
 function renderState() {
   const pane = $("#pane-state"); if (!pane) return;
   // Three distinct situations, not one: no function picked, a function picked whose
@@ -746,7 +765,7 @@ function renderState() {
   // the decompilation. (snapSymbolicForm persists + re-renders.)
   const symBox = el("div", { style: "margin-top:4px" }, el("b", {}, "symbolic (attacker-controlled): "));
   if (sym.length) sym.forEach(s => {
-    const label = (s.reg || hx64(s.addr)) + " = " + (s.name || "sym");
+    const label = symLoc(s) + " = " + (s.name || "sym");
     symBox.append(el("span", { class: "pill bad", style: "margin-right:4px;cursor:pointer",
       title: "click to edit this symbolic field", onclick: (e) => snapSymbolicForm(init, s, e) },
       label, el("span", { style: "margin-left:6px;opacity:.7",
@@ -809,7 +828,7 @@ function openSnapshotLoader() {
   const summary = el("div", { class: "faint mono", style: "font-size:11px;margin-top:4px" }, snapSummary(cur));
   const symIn = el("input", { type: "text", placeholder: "symbolic fields, e.g.  v0:pt:f32x2, 0x16fdff0b0:flags",
     style: "width:100%;font-family:var(--mono)",
-    value: (cur && (cur.symbolic || []).map(s => (s.reg || hx64(s.addr)) + ":" + (s.name || "sym") + (s.float ? ":" + s.float : "")).join(", ")) || "" });
+    value: (cur && (cur.symbolic || []).map(s => symTok(s) + ":" + (s.name || "sym") + (s.float ? ":" + s.float : "")).join(", ")) || "" });
   const loadBtn = el("button", {}, "Load file");
   const applyBtn = el("button", { class: "primary" }, "Apply");
   loadBtn.onclick = async () => {
@@ -3443,8 +3462,10 @@ function snapSymbolicForm(snap, prefill, ev) {
     el("option", { value: "reg", selected: kind === "reg" ? "" : null }, "register"),
     el("option", { value: "addr", selected: kind === "addr" ? "" : null }, "memory address"));
   const bindI = el("input", {
-    value: f.addr != null ? ("0x" + f.addr.toString(16)) : (f.reg || prefill.reg || ""),
-    placeholder: "x1 / v0  ·  or  0x16fdfe670", style: "width:100%;box-sizing:border-box;margin-bottom:6px" });
+    value: f.addr != null ? ("0x" + f.addr.toString(16))
+         : f.base != null ? (f.base + "+" + (f.offset != null ? f.offset : "0"))   // reg+offset field
+         : (f.reg || prefill.reg || ""),
+    placeholder: "x1 / v0  ·  x0+0xb0  ·  or  0x16fdfe670", style: "width:100%;box-sizing:border-box;margin-bottom:6px" });
   m.append(kindS, bindI);
 
   m.append(el("div", { class: "vmlbl" }, "size (bytes)"));
@@ -3457,11 +3478,15 @@ function snapSymbolicForm(snap, prefill, ev) {
     const bind = bindI.value.trim();
     if (!bind) { toast("enter a register or address to bind to", true); return; }
     const nf = { name, size: parseInt(sizeI.value) || 8 };
-    if (kindS.value === "addr") nf.addr = parseInt(bind, 16); else nf.reg = bind;
+    const rel = bind.match(/^([A-Za-z]\w*)\s*\+\s*(0x[0-9a-fA-F]+|\d+)$/);   // reg+offset form
+    if (kindS.value === "addr") nf.addr = parseInt(bind, 16);
+    else if (rel) { nf.base = rel[1]; nf.offset = rel[2]; }                  // register-relative field
+    else nf.reg = bind;
     // drop any prior field this one replaces (same clicked target, same name, or same binding)
     snap.symbolic = (snap.symbolic || []).filter(s =>
       s !== existing && s.name !== name &&
       !(nf.reg && s.reg === nf.reg) && !(nf.addr != null && s.addr === nf.addr) &&
+      !(nf.base && s.base === nf.base && s.offset === nf.offset) &&
       !(prefill.reg && s.reg === prefill.reg) && !(prefill.name && s.name === prefill.name));
     snap.symbolic.push(nf);
     persist("marked " + name + " symbolic");
