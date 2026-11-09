@@ -402,14 +402,22 @@ def make_evaluator(state):
         addr = _bv(addr, arch.bits)
         if isinstance(size, claripy.ast.Base):
             size = state.solver.eval_one(size)
-        return state.memory.load(addr, size, endness=arch.memory_endness)
+        # inspect=False/disable_actions=True: this is a read-only load to EVALUATE an
+        # expression (an assumption, an assert, or an oob check's `base`). The oob checks
+        # observe via mem_read/mem_write inspect breakpoints and call this evaluator from
+        # inside those callbacks; a plain load here re-fires the breakpoint and (for an
+        # oob_read whose base dereferences memory) re-enters the handler unboundedly. These
+        # bookkeeping reads must not participate in the inspect machinery.
+        return state.memory.load(addr, size, endness=arch.memory_endness,
+                                 inspect=False, disable_actions=True)
 
     def resolve(name: str):
         if name in variables:
             return variables[name]
         if name in locals_ and bp is not None:
             off, size = locals_[name]["offset"], locals_[name]["size"]
-            return state.memory.load(bp + off, size, endness=arch.memory_endness)
+            return state.memory.load(bp + off, size, endness=arch.memory_endness,
+                                     inspect=False, disable_actions=True)  # see mem() above
         if name == "ret":
             return getattr(state.regs, arch.register_names[arch.ret_offset])
         if name in arch.registers:

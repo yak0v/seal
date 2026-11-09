@@ -588,7 +588,11 @@ class _CustomAPI:
         return getattr(self.state.regs, name)
 
     def mem(self, addr, size=8):
-        return self.state.memory.load(addr, size, endness=self.state.arch.memory_endness)
+        # Read-only load for a custom check's predicate; suppress inspect/actions so it
+        # can't re-fire the mem_read/mem_write breakpoints a check may run inside (see
+        # exprlang.make_evaluator.mem — same reentrancy hazard).
+        return self.state.memory.load(addr, size, endness=self.state.arch.memory_endness,
+                                      inspect=False, disable_actions=True)
 
 
 # --------------------------------------------------------------------------- narrowing_cast
