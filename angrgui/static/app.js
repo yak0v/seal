@@ -2524,11 +2524,30 @@ function lineRanges(lines) {
     out.map(([a, b]) => a === b ? a : `${a}–${b}`).join(", ");
 }
 
+// The source location to jump to when a flow (path node) is clicked: the finding's line
+// if this branch has a finding, otherwise the last block executed on the branch (its last
+// decompiled line). n.hits holds INDICES into snap.hits.
+function pathNodeAddr(n, snap) {
+  if (n.hits && n.hits.length) {
+    const h = (snap.hits || [])[n.hits[0]];
+    if (h && h.addr != null) return h.addr;
+  }
+  if (n.blocks && n.blocks.length) return n.blocks[n.blocks.length - 1];
+  return n.addr != null ? n.addr : null;
+}
+
 function selectPathNode(id) {
-  A.selNode = A.selNode === id ? null : id;
+  const wasSel = A.selNode === id;
+  A.selNode = wasSel ? null : id;
   A.selectedHit = null;                 // path selection lights the findings ON this path
   updatePathHighlight();
   renderTree(true);
+  if (!wasSel) {                        // newly selected -> jump the code view to this flow's line
+    const snap = A.run?.snapshot;
+    const n = snap && snap.tree && snap.tree.find(x => x.id === id);
+    const addr = n && pathNodeAddr(n, snap);
+    if (addr != null) showAddr(addr);   // prefers the decompilation; falls back to disasm
+  }
 }
 
 function updatePathHighlight() {
@@ -4413,7 +4432,7 @@ function drawCFG(pane, g) {
   window.addEventListener("mousemove", onMove);
   window.addEventListener("mouseup", onUp);
   svg.addEventListener("wheel", onWheel, { passive: false });
-  for (const addr in nodeEls) nodeEls[addr].rect.addEventListener("click", () => { if (!dragged) { selectTab("code"); scrollToAddr(+addr); } });
+  for (const addr in nodeEls) nodeEls[addr].rect.addEventListener("click", () => { if (!dragged) showAddr(+addr); });   // prefer the decompilation; falls back to disasm
 
   pane.replaceChildren(svg);
   pane._cfg = { addr: g.addr, recolor, view,
